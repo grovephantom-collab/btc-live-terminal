@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+  <meta charset="UTF-8">
+  <title>BTCUSDT 24/7 Custom Terminal</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0d1117; color: #c9d1d9; font-family: sans-serif; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+    header { background: #161b22; padding: 12px 20px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #30363d; }
+    .main { display: flex; flex: 1; }
+    canvas { flex: 1; background: #0d1117; cursor: crosshair; }
+    .panel { width: 300px; background: #161b22; border-left: 1px solid #30363d; padding: 20px; display: flex; flex-direction: column; gap: 15px; }
+    .card { background: #21262d; border-radius: 8px; padding: 15px; border: 1px solid #30363d; }
+    .badge { display: inline-block; padding: 6px 12px; border-radius: 6px; font-weight: bold; margin-bottom: 10px; font-size: 14px; }
+    .buy { background: rgba(38,166,154,0.2); color: #26a69a; border: 1px solid #26a69a; }
+    .sell { background: rgba(239,83,80,0.2); color: #ef5350; border: 1px solid #ef5350; }
+    .wait { background: rgba(139,148,158,0.2); color: #8b949e; border: 1px solid #8b949e; }
+    .row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px; }
+    .val { font-weight: bold; }
+  </style>
+</head>
+<body>
+  <header>
+    <div><strong>BTC/USDT Custom Terminal</strong> (1M Live)</div>
+    <div style="font-size: 18px; font-weight: bold;">Price: $<span id="curPrice">--</span></div>
+  </header>
+  <div class="main">
+    <canvas id="chartCanvas"></canvas>
+    <div class="panel">
+      <div class="card">
+        <h3 style="font-size: 13px; color: #8b949e; margin-bottom: 10px;">LATEST SIGNAL</h3>
+        <div id="sigBadge" class="badge wait">WAITING DATA</div>
+        <div class="row"><span>Signal:</span><span id="sigAction" class="val">--</span></div>
+        <div class="row"><span>Entry:</span><span id="sigEntry" class="val" style="color: #58a6ff;">--</span></div>
+        <div class="row"><span>Stop Loss:</span><span id="sigSL" class="val" style="color: #ef5350;">--</span></div>
+        <div class="row"><span>Take Profit:</span><span id="sigTP" class="val" style="color: #26a69a;">--</span></div>
+        <div class="row"><span>Target R:R:</span><span class="val">1 : 1.5</span></div>
+      </div>
+    </div>
+  </div>
+  <script>
+    const canvas = document.getElementById('chartCanvas');
+    const ctx = canvas.getContext('2d');
+    let candles = [];
+    let activeSignal = null;
+
+    function resize() {
+      canvas.width = canvas.parentElement.clientWidth - 300;
+      canvas.height = canvas.parentElement.clientHeight;
+      draw();
+    }
+    window.addEventListener('resize', resize);
+
+    function calcEMA(arr, period) {
+      const k = 2 / (period + 1);
+      let ema = [arr[0]];
+      for (let i = 1; i < arr.length; i++) ema.push(arr[i] * k + ema[i - 1] * (1 - k));
+      return ema;
+    }
+
+    function checkSignal() {
+      if (candles.length < 25) return;
+      const closes = candles.map(c => c.close);
+      const ema9 = calcEMA(closes, 9);
+      const ema21 = calcEMA(closes, 21);
+      const i = closes.length - 1;
+      const price = closes[i];
+
+      let diff = 0;
+      for(let j = i - 14; j <= i; j++) diff += (candles[j].high - candles[j].low);
+      const atr = diff / 14;
+
+      if (ema9[i-1] <= ema21[i-1] && ema9[i] > ema21[i]) {
+        if (!activeSignal || activeSignal.type !== 'BUY') {
+          const sl = +(price - (atr * 1.5)).toFixed(2);
+          const tp = +(price + ((price - sl) * 1.5)).toFixed(2);
+          updateUI('BUY', price, sl, tp);
+        }
+      } else if (ema9[i-1] >= ema21[i-1] && ema9[i] < ema21[i]) {
+        if (!activeSignal || activeSignal.type !== 'SELL') {
+          const sl = +(price + (atr * 1.5)).toFixed(2);
+          const tp = +(price - ((sl - price) * 1.5)).toFixed(2);
+          updateUI('SELL', price, sl, tp);
+        }
+      }
+    }
+
+    function updateUI(type, entry, sl, tp) {
+      activeSignal = { type, entry, sl, tp };
+      const badge = document.getElementById('sigBadge');
+      badge.textContent = type + ' SIGNAL';
+      badge.className = 'badge ' + (type === 'BUY' ? 'buy' : 'sell');
+      document.getElementById('sigAction').textContent = type;
+      document.getElementById('sigEntry').textContent = '$' + entry;
+      document.getElementById('sigSL').textContent = '$' + sl;
+      document.getElementById('sigTP').textContent = '$' + tp;
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (candles.length === 0) return;
+      const pad = 40;
+      const w = canvas.width - 80;
+      const h = canvas.height - pad * 2;
+      const view = candles.slice(-50);
+
+      let min = Math.min(...view.map(c => c.low));
+      let max = Math.max(...view.map(c => c.high));
+      if (activeSignal) {
+        min = Math.min(min, activeSignal.sl, activeSignal.tp);
+        max = Math.max(max, activeSignal.sl, activeSignal.tp);
+      }
+      const range = (max - min) || 1;
+      const getY = val => pad + h - ((val - min) / range) * h;
+
+      ctx.strokeStyle = '#21262d';
+      for (let i = 0; i < 5; i++) {
+        let p = min + (range / 4) * i;
+        let y = getY(p);
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+        ctx.fillStyle = '#8b949e'; ctx.font = '11px Arial';
+        ctx.fillText('$' + p.toFixed(2), w + 8, y + 4);
+      }
+
+      const gap = w / view.length;
+      const cw = gap * 0.7;
+      view.forEach((c, idx) => {
+        const x = idx * gap + gap / 2;
+        const openY = getY(c.open);
+        const closeY = getY(c.close);
+        const highY = getY(c.high);
+        const lowY = getY(c.low);
+        const isGreen = c.close >= c.open;
+        ctx.strokeStyle = isGreen ? '#26a69a' : '#ef5350';
+        ctx.fillStyle = isGreen ? '#26a69a' : '#ef5350';
+        ctx.beginPath(); ctx.moveTo(x, highY); ctx.lineTo(x, lowY); ctx.stroke();
+        ctx.fillRect(x - cw / 2, Math.min(openY, closeY), cw, Math.max(Math.abs(openY - closeY), 2));
+      });
+
+      if (activeSignal) {
+        drawLine(getY(activeSignal.entry), 'ENTRY: $' + activeSignal.entry, '#58a6ff');
+        drawLine(getY(activeSignal.sl), 'SL: $' + activeSignal.sl, '#ef5350');
+        drawLine(getY(activeSignal.tp), 'TP: $' + activeSignal.tp, '#26a69a');
+      }
+    }
+
+    function drawLine(y, txt, col) {
+      if (y < 0 || y > canvas.height) return;
+      ctx.strokeStyle = col;
+      ctx.setLineDash([5, 5]);
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width - 80, y); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = col;
+      ctx.fillRect(canvas.width - 165, y - 10, 80, 18);
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 10px Arial';
+      ctx.fillText(txt, canvas.width - 160, y + 3);
+    }
+
+    const ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@kline_1m');
+    ws.onmessage = e => {
+      const k = JSON.parse(e.data).k;
+      const c = { time: k.t, open: +k.o, high: +k.h, low: +k.l, close: +k.c };
+      document.getElementById('curPrice').textContent = c.close.toFixed(2);
+      if (candles.length && candles[candles.length - 1].time === c.time) candles[candles.length - 1] = c;
+      else { candles.push(c); if (candles.length > 150) candles.shift(); }
+      checkSignal();
+      draw();
+    };
+    setTimeout(resize, 100);
+  </script>
+</body>
+</html>
