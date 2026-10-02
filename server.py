@@ -4,7 +4,7 @@ import pandas as pd
 import requests
 import plotly.graph_objects as go
 import sqlite3
-from datetime import datetime
+import os
 
 st.set_page_config(
     page_title="BTCUSDT RADAR",
@@ -12,10 +12,10 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# Har 3 second me background auto-tick refresh (Zero flick)
-st_autorefresh(interval=3000, limit=None, key="live_market_tick")
+# Har 2.5 second me silent background tick
+st_autorefresh(interval=2500, limit=None, key="market_silent_feed")
 
-# Mobile Viewport & Dark Theme Layout
+# Pure Mobile UI CSS + Real Floating Modal Popup + Zero Flickering
 st.markdown("""
     <style>
         header, footer, #MainMenu { visibility: hidden !important; height: 0 !important; }
@@ -42,8 +42,8 @@ st.markdown("""
         .cell-lbl { font-size: 7px; color: #64748b; font-weight: 700; text-transform: uppercase; }
         .cell-val { font-weight: 800; font-size: 10px; }
 
-        /* Top-Right Vault Toggle */
-        .vault-trigger {
+        /* Vault Trigger Button */
+        .vault-link {
             background: #182232;
             border: 1px solid #28374d;
             color: #38bdf8;
@@ -53,6 +53,48 @@ st.markdown("""
             font-weight: 700;
             text-decoration: none;
             display: inline-block;
+        }
+
+        /* REAL FLOATING POPUP OVERLAY (CHART KO BILKUL NAHI DHAKELEGA) */
+        .modal-overlay {
+            position: fixed !important;
+            top: 0 !important;
+            left: 0 !important;
+            width: 100vw !important;
+            height: 100vh !important;
+            background: rgba(0, 0, 0, 0.78) !important;
+            backdrop-filter: blur(4px) !important;
+            z-index: 999999 !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            padding: 16px !important;
+            box-sizing: border-box !important;
+        }
+        .modal-card {
+            background: #11151f !important;
+            border: 1px solid #1e2838 !important;
+            border-radius: 8px !important;
+            width: 100% !important;
+            max-width: 380px !important;
+            padding: 14px !important;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.9) !important;
+        }
+        .modal-header {
+            display: flex !important;
+            justify-content: space-between !important;
+            align-items: center !important;
+            border-bottom: 1px solid #1a2230 !important;
+            padding-bottom: 8px !important;
+            margin-bottom: 10px !important;
+            font-weight: 800 !important;
+            font-size: 12px !important;
+        }
+        .btn-modal-close {
+            color: #94a3b8;
+            text-decoration: none;
+            font-size: 16px;
+            font-weight: 900;
         }
 
         /* Bottom Controls Row 1 */
@@ -113,9 +155,12 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# --- SQLite Database (NO FAKE / DUMMY SEED TRADES) ---
-conn = sqlite3.connect('trades_vault.db', check_same_thread=False)
+# --- SQLite Database (AUTO RESET OLD DUMMY SEEDS TO EXACT ZERO) ---
+db_path = 'trades_vault.db'
+conn = sqlite3.connect(db_path, check_same_thread=False)
 cur = conn.cursor()
+
+# Check if table has old mock trades, reset if contaminated
 cur.execute('''
     CREATE TABLE IF NOT EXISTS vault (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,67 +174,59 @@ cur.execute('''
 ''')
 conn.commit()
 
-# Current real vault count
+# Agar kisi purane run se dummy 7 data bacha hai toh one-time saaf karein
+if 'cleaned_vault' not in st.session_state:
+    cur.execute("SELECT COUNT(*) FROM vault WHERE result LIKE '%(50%)%'")
+    if cur.fetchone()[0] > 0:
+        cur.execute("DELETE FROM vault")
+        conn.commit()
+    st.session_state['cleaned_vault'] = True
+
 cur.execute("SELECT COUNT(*) FROM vault")
 vault_count = cur.fetchone()[0]
 
-# --- Live Binance Real-Time Ticker & Candlestick Feed ---
+# --- Live Fast Binance Klines ---
 def get_live_market_data():
     headers = {'User-Agent': 'Mozilla/5.0'}
-    
-    # Live Spot Klines
-    try:
-        url = "https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=55"
-        res = requests.get(url, headers=headers, timeout=2.5).json()
-        if isinstance(res, list) and len(res) > 10:
-            df = pd.DataFrame(res, columns=['t', 'o', 'h', 'l', 'c', 'v', 'ct', 'qa', 'tr', 'tb', 'tq', 'i'])
-            df['time'] = pd.to_datetime(df['t'], unit='ms')
-            for col in ['o', 'h', 'l', 'c', 'v']:
-                df[col] = df[col].astype(float)
-            df.rename(columns={'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close', 'v': 'volume'}, inplace=True)
-            return df
-    except Exception:
-        pass
-
-    try:
-        url = "https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=55"
-        res = requests.get(url, headers=headers, timeout=2.5).json()
-        if isinstance(res, list) and len(res) > 10:
-            df = pd.DataFrame(res, columns=['t', 'o', 'h', 'l', 'c', 'v', 'ct', 'qa', 'tr', 'tb', 'tq', 'i'])
-            df['time'] = pd.to_datetime(df['t'], unit='ms')
-            for col in ['o', 'h', 'l', 'c', 'v']:
-                df[col] = df[col].astype(float)
-            df.rename(columns={'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close', 'v': 'volume'}, inplace=True)
-            return df
-    except Exception:
-        pass
-
+    urls = [
+        "https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=55",
+        "https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=55"
+    ]
+    for u in urls:
+        try:
+            res = requests.get(u, headers=headers, timeout=2.0).json()
+            if isinstance(res, list) and len(res) > 10:
+                df = pd.DataFrame(res, columns=['t', 'o', 'h', 'l', 'c', 'v', 'ct', 'qa', 'tr', 'tb', 'tq', 'i'])
+                df['time'] = pd.to_datetime(df['t'], unit='ms')
+                for col in ['o', 'h', 'l', 'c', 'v']:
+                    df[col] = df[col].astype(float)
+                df.rename(columns={'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close'}, inplace=True)
+                return df
+        except Exception:
+            continue
     return pd.DataFrame()
 
 df = get_live_market_data()
 if df.empty:
-    st.info("Reconnecting High-Speed Market Feed...")
     st.stop()
 
-# --- Real Signal Strategy Engine (EMA + High/Low Breakout + ATR Risk) ---
+# --- Signal Strategy Logic (Real-time active signals) ---
 df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
 df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
 
 last = df.iloc[-1]
 prev = df.iloc[-2]
 cur_p = round(float(last['close']), 2)
-high_p = float(last['high'])
-low_p = float(last['low'])
-atr = round(abs(high_p - low_p), 2)
-if atr < 30: atr = 85.0
+atr = round(abs(float(last['high']) - float(last['low'])), 2)
+if atr < 40: atr = 90.0
 
-# Dynamic Triggering: Real Bullish Pullback or Bearish Breakdown
 has_signal = False
 radar_status = "SCANNING"
 entry_txt, sl_txt, tp_txt = "--", "--", "--"
 entry_val, sl_val, tp_val = 0.0, 0.0, 0.0
 
-if last['close'] >= prev['high'] or (last['ema9'] > last['ema21'] and last['close'] > last['open']):
+# Active condition: EMA Momentum check
+if last['ema9'] >= last['ema21']:
     has_signal = True
     radar_status = "PRE-SIGNAL LONG"
     entry_val = cur_p
@@ -198,7 +235,7 @@ if last['close'] >= prev['high'] or (last['ema9'] > last['ema21'] and last['clos
     entry_txt = f"${entry_val}"
     sl_txt = f"${sl_val}"
     tp_txt = f"${tp_val}"
-elif last['close'] <= prev['low'] or (last['ema9'] < last['ema21'] and last['close'] < last['open']):
+else:
     has_signal = True
     radar_status = "PRE-SIGNAL SHORT"
     entry_val = cur_p
@@ -211,8 +248,6 @@ elif last['close'] <= prev['low'] or (last['ema9'] < last['ema21'] and last['clo
 # --- TOP HUD HEADER ---
 query_params = st.query_params
 show_vault = query_params.get("vault", "0") == "1"
-vault_action = "?vault=0" if show_vault else "?vault=1"
-vault_label = "✕ CLOSE" if show_vault else f"📜 VAULT ({vault_count})"
 
 st.markdown(f"""
     <div class="top-radar-bar">
@@ -236,12 +271,12 @@ st.markdown(f"""
             </div>
         </div>
         <div>
-            <a href="{vault_action}" target="_self" class="vault-trigger">{vault_label}</a>
+            <a href="?vault=1" target="_self" class="vault-link">📜 VAULT ({vault_count})</a>
         </div>
     </div>
 """, unsafe_allow_html=True)
 
-# --- Vault View (Opens only when clicked, clean if 0 trades) ---
+# --- REAL POPUP MODAL (Screen Par Floating rahega, Chart niche nahi dabega) ---
 if show_vault:
     cur.execute("SELECT timestamp, direction, entry, result, pnl, is_win FROM vault ORDER BY id DESC")
     rows = cur.fetchall()
@@ -249,34 +284,38 @@ if show_vault:
     wins = sum(1 for r in rows if r[5] == 1)
     rate = int((wins / total) * 100) if total > 0 else 0
 
-    st.markdown(f"""
-        <div style="background:#11151f; border:1px solid #1e2838; border-radius:6px; padding:10px; margin:4px 0;">
-            <div style="display:flex; justify-content:space-between; font-size:11px; font-weight:bold; margin-bottom:6px;">
-                <span>Total Protected Trades: {total}</span>
-                <span>Win Rate: <span class="c-green">{rate}%</span></span>
-            </div>
-    """, unsafe_allow_html=True)
-
+    trade_items_html = ""
     if total == 0:
-        st.markdown("<p style='font-size:10px; color:#64748b; text-align:center; padding:8px 0;'>No trade executed yet. Monitoring active live signals...</p>", unsafe_allow_html=True)
+        trade_items_html = "<div style='font-size:10px; color:#64748b; text-align:center; padding:15px 0;'>No trades yet. Listening for target fills...</div>"
     else:
         for r in rows:
             clr = "#00e676" if r[5] == 1 else "#ff3b30"
-            st.markdown(
-                f"<div style='display:flex; justify-content:space-between; padding:3px 0; border-bottom:1px solid #1a2230; font-size:10px;'>"
-                f"<span>{r[0]} <b style='color:#00e5ff'>{r[1]}</b> @ ${r[2]}</span>"
-                f"<span style='color:{clr}; font-weight:bold;'>{r[3]} {r[4]}</span>"
-                f"</div>",
-                unsafe_allow_html=True
-            )
-        if st.button("🗑️ ONE-CLICK CLEAR VAULT"):
-            cur.execute("DELETE FROM vault")
-            conn.commit()
-            st.query_params.clear()
-            st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
+            trade_items_html += f"""
+                <div style='display:flex; justify-content:space-between; padding:4px 0; border-bottom:1px solid #1a2230; font-size:10px;'>
+                    <span>{r[0]} <b style='color:#00e5ff'>{r[1]}</b> @ ${r[2]}</span>
+                    <span style='color:{clr}; font-weight:bold;'>{r[3]} {r[4]}</span>
+                </div>
+            """
 
-# --- REAL-TIME RESPONSIVE CHART ---
+    st.markdown(f"""
+        <div class="modal-overlay">
+            <div class="modal-card">
+                <div class="modal-header">
+                    <span>🔒 SQLITE VAULT (PROTECTED TRADES)</span>
+                    <a href="?vault=0" target="_self" class="btn-modal-close">✕</a>
+                </div>
+                <div style="display:flex; justify-content:space-between; font-size:10px; font-weight:bold; margin-bottom:8px;">
+                    <span>Total Protected: {total}</span>
+                    <span>Win Rate: <span class="c-green">{rate}%</span></span>
+                </div>
+                <div style="max-height: 200px; overflow-y: auto;">
+                    {trade_items_html}
+                </div>
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+
+# --- CHART VIEW ---
 fig = go.Figure()
 
 # Real candlesticks with thin wicks
@@ -293,7 +332,7 @@ fig.add_trace(go.Candlestick(
     name="BTCUSDT"
 ))
 
-# Active Real Dotted Lines on Signal
+# Exact Target Dotted Lines
 if has_signal:
     fig.add_hline(y=tp_val, line_dash="dash", line_color="#00e676", line_width=1.3,
                   annotation_text=f"PRE-SIGNAL DIRECT TP: {tp_val}", annotation_position="top right",
@@ -307,7 +346,7 @@ if has_signal:
                   annotation_text=f"PRE-SIGNAL SL: {sl_val}", annotation_position="bottom right",
                   annotation_font_color="#ff3b30", annotation_bgcolor="#0c0f14")
 
-# Live red price badge on current tick
+# Right edge live red price tag
 fig.add_hline(y=cur_p, line_dash="dot", line_color="#ff3b30", line_width=1,
               annotation_text=f" {cur_p:.2f} ", annotation_position="right",
               annotation_font_color="#ffffff", annotation_bgcolor="#dc2626")
