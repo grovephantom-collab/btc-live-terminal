@@ -5,14 +5,14 @@ import plotly.graph_objects as go
 import sqlite3
 from datetime import datetime
 
-# Full Viewport Setup (Exact Mobile Fit)
+# Page Configuration
 st.set_page_config(
     page_title="BTCUSDT RADAR",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
-# Hide Streamlit Chrome & Exact Screenshot Styling
+# Custom Styling (Dark Radar UI)
 st.markdown("""
     <style>
         header, footer, #MainMenu { visibility: hidden !important; height: 0 !important; }
@@ -23,35 +23,37 @@ st.markdown("""
         }
         .stApp { background-color: #0b0e14; color: #d1d4dc; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
 
-        /* TOP RADAR BAR */
+        /* Top HUD Bar */
         .top-radar-bar {
             display: flex;
             align-items: center;
             justify-content: space-between;
-            padding: 4px 8px;
+            padding: 4px 6px;
             background: #10141d;
             border-bottom: 1px solid #1a2230;
             font-size: 10px;
         }
-        .bar-left { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+        .bar-left { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
         .badge-online { background: #00e676; color: #000; font-weight: 900; font-size: 8px; padding: 2px 4px; border-radius: 2px; }
         .hud-cell { display: flex; flex-direction: column; }
         .cell-lbl { font-size: 7px; color: #64748b; font-weight: 700; text-transform: uppercase; }
         .cell-val { font-weight: 800; font-size: 10px; }
 
-        /* VAULT BTN TOP-RIGHT */
-        .vault-pill {
-            background: #182232;
-            border: 1px solid #28374d;
-            color: #38bdf8;
-            padding: 3px 8px;
-            border-radius: 4px;
-            font-size: 10px;
-            font-weight: 700;
-            text-decoration: none;
+        /* Custom Vault Button Styling */
+        div[data-testid="stButton"] > button {
+            background-color: #182232 !important;
+            color: #38bdf8 !important;
+            border: 1px solid #28374d !important;
+            border-radius: 4px !important;
+            padding: 2px 8px !important;
+            font-size: 10px !important;
+            font-weight: 700 !important;
+            height: auto !important;
+            min-height: 24px !important;
+            margin: 0 !important;
         }
 
-        /* BOTTOM DUAL CONTROL PANEL */
+        /* Bottom Controls */
         .bottom-panel-1 {
             display: flex;
             justify-content: space-between;
@@ -60,13 +62,14 @@ st.markdown("""
             padding: 4px 8px;
             border-top: 1px solid #1a2230;
             font-size: 9px;
+            margin-top: 2px;
         }
-        .panel-grp { display: flex; align-items: center; gap: 12px; }
+        .panel-grp { display: flex; align-items: center; gap: 10px; }
         .btn-force {
             border: 1px solid #ca8a04;
             color: #facc15;
             background: rgba(202, 138, 4, 0.15);
-            padding: 3px 6px;
+            padding: 2px 5px;
             border-radius: 3px;
             font-weight: 700;
             font-size: 8px;
@@ -75,7 +78,7 @@ st.markdown("""
             border: 1px solid #dc2626;
             color: #f87171;
             background: rgba(220, 38, 38, 0.15);
-            padding: 3px 6px;
+            padding: 2px 5px;
             border-radius: 3px;
             font-weight: 700;
             font-size: 8px;
@@ -92,13 +95,13 @@ st.markdown("""
         .info-card {
             background: #0f141d;
             border: 1px solid #17202e;
-            padding: 4px 6px;
+            padding: 4px 5px;
             border-radius: 3px;
             display: flex;
             flex-direction: column;
         }
         .info-title { color: #475569; font-size: 7px; font-weight: 700; }
-        .info-val { font-weight: 800; font-size: 8px; margin-top: 2px; }
+        .info-val { font-weight: 800; font-size: 8px; margin-top: 1px; }
 
         .c-green { color: #00e676 !important; font-weight: bold; }
         .c-red { color: #ff3b30 !important; font-weight: bold; }
@@ -107,7 +110,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# --- SQLite Vault System ---
+# --- SQLite Database ---
 conn = sqlite3.connect('trades_vault.db', check_same_thread=False)
 cur = conn.cursor()
 cur.execute('''
@@ -123,64 +126,89 @@ cur.execute('''
 ''')
 conn.commit()
 
-# Total count for the top button
+# Default Seed trades if empty
+cur.execute("SELECT COUNT(*) FROM vault")
+if cur.fetchone()[0] == 0:
+    seed = [
+        ("19:01", "LONG", 84758.0, "BE EXIT (50%) 🛡️", "(+$0.06)", 1),
+        ("18:58", "LONG", 84758.0, "TP1 BOOK (50%) 🎯", "(+$0.30)", 1),
+        ("18:23", "LONG", 84604.4, "TP2 FULL HIT 🔥", "(+$0.63)", 1),
+        ("18:21", "LONG", 84604.4, "TP1 BOOK (50%) 🎯", "(+$0.31)", 1),
+        ("12:55", "LONG", 85002.8, "SL HIT 🛑", "(-$0.85)", 0),
+        ("09:51", "LONG", 84804.2, "TP2 FULL HIT 🔥", "(+$0.86)", 1),
+        ("09:45", "LONG", 84804.2, "TP1 BOOK (50%) 🎯", "(+$0.43)", 1)
+    ]
+    cur.executemany("INSERT INTO vault (timestamp, direction, entry, result, pnl, is_win) VALUES (?, ?, ?, ?, ?, ?)", seed)
+    conn.commit()
+
 cur.execute("SELECT COUNT(*) FROM vault")
 vault_count = cur.fetchone()[0]
 
-# --- 100% Reliable Multi-Exchange Candles Feed ---
+# --- Dialog Popup Modal for Vault ---
+@st.dialog("🔒 SQLITE VAULT (PROTECTED TRADES)")
+def show_vault_dialog():
+    cur.execute("SELECT timestamp, direction, entry, result, pnl, is_win FROM vault ORDER BY id DESC")
+    rows = cur.fetchall()
+    total = len(rows)
+    wins = sum(1 for r in rows if r[5] == 1)
+    rate = int((wins / total) * 100) if total > 0 else 0
+
+    col_a, col_b = st.columns(2)
+    col_a.markdown(f"**Total Trades:** `{total}`")
+    col_b.markdown(f"**Win Rate:** <span class='c-green'>{rate}%</span>", unsafe_allow_html=True)
+    st.write("---")
+
+    for r in rows:
+        clr = "#00e676" if r[5] == 1 else "#ff3b30"
+        st.markdown(
+            f"<div style='display:flex; justify-content:space-between; padding:5px 0; border-bottom:1px solid #1a2230; font-size:11px;'>"
+            f"<span>{r[0]} <b style='color:#00e5ff'>{r[1]}</b> @ ${r[2]}</span>"
+            f"<span style='color:{clr}; font-weight:bold;'>{r[3]} {r[4]}</span>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+    st.write("")
+    if st.button("🗑️ ONE-CLICK CLEAR VAULT", use_container_width=True):
+        cur.execute("DELETE FROM vault")
+        conn.commit()
+        st.rerun()
+
+# --- Market Data Fetcher ---
 def get_market_candles():
     headers = {'User-Agent': 'Mozilla/5.0'}
-    
-    # Binance US
     try:
-        url = "https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=70"
+        url = "https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=50"
         r = requests.get(url, headers=headers, timeout=3.5).json()
         if isinstance(r, list) and len(r) > 10:
             df = pd.DataFrame(r, columns=['t', 'o', 'h', 'l', 'c', 'v', 'ct', 'qa', 'tr', 'tb', 'tq', 'i'])
-            df['time'] = pd.to_datetime(df['t'], unit='ms')
-            for c in ['o', 'h', 'l', 'c', 'v']: df[c] = df[c].astype(float)
-            df.rename(columns={'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close', 'v': 'volume'}, inplace=True)
+            df['time'] = pd.to_datetime(df['t'], unit='ms').dt.strftime('%H:%M')
+            for c in ['o', 'h', 'l', 'c']: df[c] = df[c].astype(float)
+            df.rename(columns={'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close'}, inplace=True)
             return df
     except Exception:
         pass
 
-    # Kraken Fallback
     try:
-        url = "https://api.kraken.com/0/public/OHLC?pair=XBTUSDT&interval=5"
-        res = requests.get(url, headers=headers, timeout=3.5).json().get('result', {}).get('XBTUSDT', [])
-        if res and len(res) > 10:
-            df = pd.DataFrame(res[-70:], columns=['t', 'o', 'h', 'l', 'c', 'vw', 'vol', 'cnt'])
-            df['time'] = pd.to_datetime(df['t'].astype(float), unit='s')
+        url = "https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=50"
+        r = requests.get(url, headers=headers, timeout=3.5).json()
+        if isinstance(r, list) and len(r) > 10:
+            df = pd.DataFrame(r, columns=['t', 'o', 'h', 'l', 'c', 'v', 'ct', 'qa', 'tr', 'tb', 'tq', 'i'])
+            df['time'] = pd.to_datetime(df['t'], unit='ms').dt.strftime('%H:%M')
             for c in ['o', 'h', 'l', 'c']: df[c] = df[c].astype(float)
             df.rename(columns={'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close'}, inplace=True)
-            df['volume'] = 100.0
             return df
-    except Exception:
-        pass
-
-    # Coinbase Pro Fallback
-    try:
-        url = "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300"
-        res = requests.get(url, headers=headers, timeout=3.5).json()
-        if isinstance(res, list) and len(res) > 10:
-            df = pd.DataFrame(res[:70], columns=['t', 'l', 'h', 'o', 'c', 'v'])
-            df['time'] = pd.to_datetime(df['t'], unit='s')
-            for c in ['o', 'h', 'l', 'c']: df[c] = df[c].astype(float)
-            df.rename(columns={'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close'}, inplace=True)
-            df['volume'] = 100.0
-            return df.iloc[::-1].reset_index(drop=True)
     except Exception:
         pass
 
     return pd.DataFrame()
 
 df = get_market_candles()
-
 if df.empty:
-    st.info("⚡ Connecting to High-Frequency Stream... Please reload in 3 seconds.")
+    st.info("⚡ Refreshing live stream... Please reload.")
     st.stop()
 
-# --- Exact Indicator & Signal Logic (ATR + OB + VOL + FUNDING + BREAKOUT) ---
+# --- Signal Strategy Logic ---
 df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
 df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
 
@@ -191,13 +219,11 @@ high_p = float(last['high'])
 low_p = float(last['low'])
 atr = round(abs(high_p - low_p), 2) or 110.0
 
-# Scanner State
 has_signal = False
 radar_status = "SCANNING"
 entry_txt, sl_txt, tp_txt = "--", "--", "--"
 entry_val, sl_val, tp_val = 0.0, 0.0, 0.0
 
-# Long Setup: EMA Bullish Cross + Candle Breakout
 if last['ema9'] > last['ema21'] and last['close'] > prev['high']:
     has_signal = True
     radar_status = "PRE-SIGNAL LONG"
@@ -207,8 +233,6 @@ if last['ema9'] > last['ema21'] and last['close'] > prev['high']:
     entry_txt = f"${entry_val}"
     sl_txt = f"${sl_val}"
     tp_txt = f"${tp_val}"
-
-# Short Setup: EMA Bearish Cross + Candle Breakdown
 elif last['ema9'] < last['ema21'] and last['close'] < prev['low']:
     has_signal = True
     radar_status = "PRE-SIGNAL SHORT"
@@ -219,35 +243,39 @@ elif last['ema9'] < last['ema21'] and last['close'] < prev['low']:
     sl_txt = f"${sl_val}"
     tp_txt = f"${tp_val}"
 
-# --- TOP HUD HEADER (Exact Screenshot 1000114748) ---
-st.markdown(f"""
-    <div class="top-radar-bar">
-        <div class="bar-left">
-            <span class="badge-online">ONLINE</span>
-            <div class="hud-cell">
-                <span class="cell-lbl">ACTIVE PAIR</span>
-                <span class="cell-val c-yellow">{radar_status}</span>
-            </div>
-            <div class="hud-cell">
-                <span class="cell-lbl">ENTRY</span>
-                <span class="cell-val c-cyan">{entry_txt}</span>
-            </div>
-            <div class="hud-cell">
-                <span class="cell-lbl">SL / TRAIL</span>
-                <span class="cell-val c-red">{sl_txt}</span>
-            </div>
-            <div class="hud-cell">
-                <span class="cell-lbl">DIRECT TP</span>
-                <span class="cell-val c-green">{tp_txt}</span>
-            </div>
-        </div>
-        <div>
-            <span class="vault-pill">📜 VAULT ({vault_count})</span>
-        </div>
-    </div>
-""", unsafe_allow_html=True)
+# --- TOP HUD HEADER WITH VAULT BUTTON AT TOP-RIGHT ---
+top_left, top_right = st.columns([5, 1.2])
 
-# --- CHART (EXACT CANDLES WITH REAL WICKS + RIGHT RED TRACKER BOX) ---
+with top_left:
+    st.markdown(f"""
+        <div class="top-radar-bar">
+            <div class="bar-left">
+                <span class="badge-online">ONLINE</span>
+                <div class="hud-cell">
+                    <span class="cell-lbl">ACTIVE PAIR</span>
+                    <span class="cell-val c-yellow">{radar_status}</span>
+                </div>
+                <div class="hud-cell">
+                    <span class="cell-lbl">ENTRY</span>
+                    <span class="cell-val c-cyan">{entry_txt}</span>
+                </div>
+                <div class="hud-cell">
+                    <span class="cell-lbl">SL / TRAIL</span>
+                    <span class="cell-val c-red">{sl_txt}</span>
+                </div>
+                <div class="hud-cell">
+                    <span class="cell-lbl">DIRECT TP</span>
+                    <span class="cell-val c-green">{tp_txt}</span>
+                </div>
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+
+with top_right:
+    if st.button(f"📜 VAULT ({vault_count})", use_container_width=True):
+        show_vault_dialog()
+
+# --- LOCKED CHART (NO TOUCH ZOOM / PAN FREEZE) ---
 fig = go.Figure()
 
 fig.add_trace(go.Candlestick(
@@ -263,7 +291,7 @@ fig.add_trace(go.Candlestick(
     name="BTCUSDT"
 ))
 
-# When a signal is confirmed, plot the exact dotted target lines
+# Signal Lines (Draws only on Active Signal)
 if has_signal:
     fig.add_hline(y=tp_val, line_dash="dash", line_color="#00e676", line_width=1.3,
                   annotation_text=f"PRE-SIGNAL DIRECT TP: {tp_val}", annotation_position="top right",
@@ -277,30 +305,46 @@ if has_signal:
                   annotation_text=f"PRE-SIGNAL SL: {sl_val}", annotation_position="bottom right",
                   annotation_font_color="#ff3b30", annotation_bgcolor="#0c0f14")
 
-# Right price tracker line + red label box (Screenshot 1000114748 style)
+# Live red price level
 fig.add_hline(y=cur_p, line_dash="dot", line_color="#ff3b30", line_width=1,
               annotation_text=f" {cur_p:.2f} ", annotation_position="right",
               annotation_font_color="#ffffff", annotation_bgcolor="#dc2626")
 
 fig.update_layout(
-    height=480,
-    margin=dict(l=0, r=65, t=10, b=10),
+    height=500,
+    margin=dict(l=0, r=65, t=5, b=5),
     xaxis_rangeslider_visible=False,
     plot_bgcolor='#090c10',
     paper_bgcolor='#090c10',
+    dragmode=False, # Touch drag/zoom completely disabled
     xaxis=dict(
-        showgrid=True, gridcolor='#151b26', color='#64748b',
-        type='date'
+        type='category', # Spreads candles evenly across entire screen
+        showgrid=True,
+        gridcolor='#151b26',
+        color='#64748b',
+        fixedrange=True # X-axis touch zoom disabled
     ),
     yaxis=dict(
-        showgrid=True, gridcolor='#151b26', color='#64748b',
-        side='right', tickformat='.2f'
+        showgrid=True,
+        gridcolor='#151b26',
+        color='#64748b',
+        side='right',
+        tickformat='.2f',
+        fixedrange=True # Y-axis touch zoom disabled
     )
 )
 
-st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+st.plotly_chart(
+    fig, 
+    use_container_width=True, 
+    config={
+        'displayModeBar': False,
+        'scrollZoom': False,
+        'doubleClick': False
+    }
+)
 
-# --- BOTTOM CONTROLS (Row 1: Account, Margin & Force Close/Kill Switch) ---
+# --- BOTTOM CONTROLS (Row 1) ---
 st.markdown(f"""
     <div class="bottom-panel-1">
         <div class="panel-grp">
@@ -315,7 +359,7 @@ st.markdown(f"""
     </div>
 """, unsafe_allow_html=True)
 
-# --- BOTTOM CONTROLS (Row 2: Risk Guard, Filters, Profile, Scanner) ---
+# --- BOTTOM CONTROLS (Row 2) ---
 st.markdown(f"""
     <div class="bottom-panel-2">
         <div class="info-card">
@@ -336,30 +380,3 @@ st.markdown(f"""
         </div>
     </div>
 """, unsafe_allow_html=True)
-
-# --- SQLITE VAULT (PROTECTED TRADES) MODAL / EXPANDER ---
-with st.expander(f"📜 SQLITE VAULT (PROTECTED TRADES) - {vault_count} RECORDED", expanded=False):
-    cur.execute("SELECT timestamp, direction, entry, result, pnl, is_win FROM vault ORDER BY id DESC")
-    rows = cur.fetchall()
-    total = len(rows)
-    wins = sum(1 for r in rows if r[5] == 1)
-    rate = int((wins / total) * 100) if total > 0 else 0
-
-    col_a, col_b = st.columns(2)
-    col_a.write(f"**Total Protected Trades:** {total}")
-    col_b.markdown(f"**Calculated Win Rate:** <span class='c-green'>{rate}%</span>", unsafe_allow_html=True)
-
-    for r in rows:
-        clr = "#00e676" if r[5] == 1 else "#ff3b30"
-        st.markdown(
-            f"<div style='display:flex; justify-content:space-between; padding:5px 0; border-bottom:1px solid #1a2230; font-size:11px;'>"
-            f"<span>{r[0]} <b style='color:#00e5ff'>{r[1]}</b> @ ${r[2]}</span>"
-            f"<span style='color:{clr}; font-weight:bold;'>{r[3]} {r[4]}</span>"
-            f"</div>",
-            unsafe_allow_html=True
-        )
-
-    if st.button("🗑️ ONE-CLICK CLEAR VAULT"):
-        cur.execute("DELETE FROM vault")
-        conn.commit()
-        st.rerun()
