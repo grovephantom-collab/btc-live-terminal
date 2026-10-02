@@ -3,16 +3,14 @@ import pandas as pd
 import requests
 import plotly.graph_objects as go
 import sqlite3
-from datetime import datetime
 
-# Page Configuration
 st.set_page_config(
     page_title="BTCUSDT RADAR",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
-# Custom Styling (Dark Radar UI)
+# Mobile viewport CSS (Exact Screenshot 1000114748 match)
 st.markdown("""
     <style>
         header, footer, #MainMenu { visibility: hidden !important; height: 0 !important; }
@@ -28,43 +26,43 @@ st.markdown("""
             display: flex;
             align-items: center;
             justify-content: space-between;
-            padding: 4px 6px;
+            padding: 5px 8px;
             background: #10141d;
             border-bottom: 1px solid #1a2230;
             font-size: 10px;
         }
-        .bar-left { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .bar-left { display: flex; align-items: center; gap: 8px; }
         .badge-online { background: #00e676; color: #000; font-weight: 900; font-size: 8px; padding: 2px 4px; border-radius: 2px; }
         .hud-cell { display: flex; flex-direction: column; }
         .cell-lbl { font-size: 7px; color: #64748b; font-weight: 700; text-transform: uppercase; }
         .cell-val { font-weight: 800; font-size: 10px; }
 
-        /* Custom Vault Button Styling */
-        div[data-testid="stButton"] > button {
-            background-color: #182232 !important;
-            color: #38bdf8 !important;
-            border: 1px solid #28374d !important;
-            border-radius: 4px !important;
-            padding: 2px 8px !important;
-            font-size: 10px !important;
-            font-weight: 700 !important;
-            height: auto !important;
-            min-height: 24px !important;
-            margin: 0 !important;
+        /* Real inline Vault Button */
+        .vault-trigger {
+            background: #182232;
+            border: 1px solid #28374d;
+            color: #38bdf8;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 10px;
+            font-weight: 700;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
         }
 
-        /* Bottom Controls */
+        /* Bottom Controls Row 1 */
         .bottom-panel-1 {
             display: flex;
             justify-content: space-between;
             align-items: center;
             background: #0d1117;
-            padding: 4px 8px;
+            padding: 5px 8px;
             border-top: 1px solid #1a2230;
             font-size: 9px;
             margin-top: 2px;
         }
-        .panel-grp { display: flex; align-items: center; gap: 10px; }
+        .panel-grp { display: flex; align-items: center; gap: 8px; }
         .btn-force {
             border: 1px solid #ca8a04;
             color: #facc15;
@@ -84,6 +82,7 @@ st.markdown("""
             font-size: 8px;
         }
 
+        /* Bottom Controls Row 2 */
         .bottom-panel-2 {
             display: grid;
             grid-template-columns: repeat(4, 1fr);
@@ -110,7 +109,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# --- SQLite Database ---
+# Database Setup
 conn = sqlite3.connect('trades_vault.db', check_same_thread=False)
 cur = conn.cursor()
 cur.execute('''
@@ -126,7 +125,7 @@ cur.execute('''
 ''')
 conn.commit()
 
-# Default Seed trades if empty
+# Seed default history if empty
 cur.execute("SELECT COUNT(*) FROM vault")
 if cur.fetchone()[0] == 0:
     seed = [
@@ -144,45 +143,15 @@ if cur.fetchone()[0] == 0:
 cur.execute("SELECT COUNT(*) FROM vault")
 vault_count = cur.fetchone()[0]
 
-# --- Dialog Popup Modal for Vault ---
-@st.dialog("🔒 SQLITE VAULT (PROTECTED TRADES)")
-def show_vault_dialog():
-    cur.execute("SELECT timestamp, direction, entry, result, pnl, is_win FROM vault ORDER BY id DESC")
-    rows = cur.fetchall()
-    total = len(rows)
-    wins = sum(1 for r in rows if r[5] == 1)
-    rate = int((wins / total) * 100) if total > 0 else 0
-
-    col_a, col_b = st.columns(2)
-    col_a.markdown(f"**Total Trades:** `{total}`")
-    col_b.markdown(f"**Win Rate:** <span class='c-green'>{rate}%</span>", unsafe_allow_html=True)
-    st.write("---")
-
-    for r in rows:
-        clr = "#00e676" if r[5] == 1 else "#ff3b30"
-        st.markdown(
-            f"<div style='display:flex; justify-content:space-between; padding:5px 0; border-bottom:1px solid #1a2230; font-size:11px;'>"
-            f"<span>{r[0]} <b style='color:#00e5ff'>{r[1]}</b> @ ${r[2]}</span>"
-            f"<span style='color:{clr}; font-weight:bold;'>{r[3]} {r[4]}</span>"
-            f"</div>",
-            unsafe_allow_html=True
-        )
-
-    st.write("")
-    if st.button("🗑️ ONE-CLICK CLEAR VAULT", use_container_width=True):
-        cur.execute("DELETE FROM vault")
-        conn.commit()
-        st.rerun()
-
-# --- Market Data Fetcher ---
+# Market Data Feed
 def get_market_candles():
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
-        url = "https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=50"
+        url = "https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=60"
         r = requests.get(url, headers=headers, timeout=3.5).json()
         if isinstance(r, list) and len(r) > 10:
             df = pd.DataFrame(r, columns=['t', 'o', 'h', 'l', 'c', 'v', 'ct', 'qa', 'tr', 'tb', 'tq', 'i'])
-            df['time'] = pd.to_datetime(df['t'], unit='ms').dt.strftime('%H:%M')
+            df['time'] = pd.to_datetime(df['t'], unit='ms')
             for c in ['o', 'h', 'l', 'c']: df[c] = df[c].astype(float)
             df.rename(columns={'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close'}, inplace=True)
             return df
@@ -190,11 +159,11 @@ def get_market_candles():
         pass
 
     try:
-        url = "https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=50"
+        url = "https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=60"
         r = requests.get(url, headers=headers, timeout=3.5).json()
         if isinstance(r, list) and len(r) > 10:
             df = pd.DataFrame(r, columns=['t', 'o', 'h', 'l', 'c', 'v', 'ct', 'qa', 'tr', 'tb', 'tq', 'i'])
-            df['time'] = pd.to_datetime(df['t'], unit='ms').dt.strftime('%H:%M')
+            df['time'] = pd.to_datetime(df['t'], unit='ms')
             for c in ['o', 'h', 'l', 'c']: df[c] = df[c].astype(float)
             df.rename(columns={'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close'}, inplace=True)
             return df
@@ -205,10 +174,10 @@ def get_market_candles():
 
 df = get_market_candles()
 if df.empty:
-    st.info("⚡ Refreshing live stream... Please reload.")
+    st.info("Reconnecting...")
     st.stop()
 
-# --- Signal Strategy Logic ---
+# Strategy logic
 df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
 df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
 
@@ -243,39 +212,73 @@ elif last['ema9'] < last['ema21'] and last['close'] < prev['low']:
     sl_txt = f"${sl_val}"
     tp_txt = f"${tp_val}"
 
-# --- TOP HUD HEADER WITH VAULT BUTTON AT TOP-RIGHT ---
-top_left, top_right = st.columns([5, 1.2])
+# TOP HUD BAR (Vault button right me locked)
+query_params = st.query_params
+show_vault = query_params.get("vault", "0") == "1"
 
-with top_left:
-    st.markdown(f"""
-        <div class="top-radar-bar">
-            <div class="bar-left">
-                <span class="badge-online">ONLINE</span>
-                <div class="hud-cell">
-                    <span class="cell-lbl">ACTIVE PAIR</span>
-                    <span class="cell-val c-yellow">{radar_status}</span>
-                </div>
-                <div class="hud-cell">
-                    <span class="cell-lbl">ENTRY</span>
-                    <span class="cell-val c-cyan">{entry_txt}</span>
-                </div>
-                <div class="hud-cell">
-                    <span class="cell-lbl">SL / TRAIL</span>
-                    <span class="cell-val c-red">{sl_txt}</span>
-                </div>
-                <div class="hud-cell">
-                    <span class="cell-lbl">DIRECT TP</span>
-                    <span class="cell-val c-green">{tp_txt}</span>
-                </div>
+vault_action = "?vault=0" if show_vault else "?vault=1"
+vault_label = f"✕ CLOSE" if show_vault else f"📜 VAULT ({vault_count})"
+
+st.markdown(f"""
+    <div class="top-radar-bar">
+        <div class="bar-left">
+            <span class="badge-online">ONLINE</span>
+            <div class="hud-cell">
+                <span class="cell-lbl">ACTIVE PAIR</span>
+                <span class="cell-val c-yellow">{radar_status}</span>
+            </div>
+            <div class="hud-cell">
+                <span class="cell-lbl">ENTRY</span>
+                <span class="cell-val c-cyan">{entry_txt}</span>
+            </div>
+            <div class="hud-cell">
+                <span class="cell-lbl">SL / TRAIL</span>
+                <span class="cell-val c-red">{sl_txt}</span>
+            </div>
+            <div class="hud-cell">
+                <span class="cell-lbl">DIRECT TP</span>
+                <span class="cell-val c-green">{tp_txt}</span>
             </div>
         </div>
+        <div>
+            <a href="{vault_action}" target="_self" class="vault-trigger">{vault_label}</a>
+        </div>
+    </div>
+""", unsafe_allow_html=True)
+
+# Vault Modal View if Open
+if show_vault:
+    cur.execute("SELECT timestamp, direction, entry, result, pnl, is_win FROM vault ORDER BY id DESC")
+    rows = cur.fetchall()
+    total = len(rows)
+    wins = sum(1 for r in rows if r[5] == 1)
+    rate = int((wins / total) * 100) if total > 0 else 0
+
+    st.markdown(f"""
+        <div style="background:#11151f; border:1px solid #1e2838; border-radius:6px; padding:10px; margin:6px 0;">
+            <div style="display:flex; justify-content:space-between; font-size:11px; font-weight:bold; margin-bottom:8px;">
+                <span>Total Trades: {total}</span>
+                <span>Win Rate: <span class="c-green">{rate}%</span></span>
+            </div>
     """, unsafe_allow_html=True)
 
-with top_right:
-    if st.button(f"📜 VAULT ({vault_count})", use_container_width=True):
-        show_vault_dialog()
+    for r in rows:
+        clr = "#00e676" if r[5] == 1 else "#ff3b30"
+        st.markdown(
+            f"<div style='display:flex; justify-content:space-between; padding:4px 0; border-bottom:1px solid #1a2230; font-size:10px;'>"
+            f"<span>{r[0]} <b style='color:#00e5ff'>{r[1]}</b> @ ${r[2]}</span>"
+            f"<span style='color:{clr}; font-weight:bold;'>{r[3]} {r[4]}</span>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+    st.markdown("</div>", unsafe_allow_html=True)
+    if st.button("🗑️ ONE-CLICK CLEAR VAULT"):
+        cur.execute("DELETE FROM vault")
+        conn.commit()
+        st.query_params.clear()
+        st.rerun()
 
-# --- LOCKED CHART (NO TOUCH ZOOM / PAN FREEZE) ---
+# CHART VIEW (Clean Time Axis - 2 to 3 Timestamps only)
 fig = go.Figure()
 
 fig.add_trace(go.Candlestick(
@@ -291,7 +294,7 @@ fig.add_trace(go.Candlestick(
     name="BTCUSDT"
 ))
 
-# Signal Lines (Draws only on Active Signal)
+# Signal Lines
 if has_signal:
     fig.add_hline(y=tp_val, line_dash="dash", line_color="#00e676", line_width=1.3,
                   annotation_text=f"PRE-SIGNAL DIRECT TP: {tp_val}", annotation_position="top right",
@@ -311,18 +314,20 @@ fig.add_hline(y=cur_p, line_dash="dot", line_color="#ff3b30", line_width=1,
               annotation_font_color="#ffffff", annotation_bgcolor="#dc2626")
 
 fig.update_layout(
-    height=500,
+    height=480,
     margin=dict(l=0, r=65, t=5, b=5),
     xaxis_rangeslider_visible=False,
     plot_bgcolor='#090c10',
     paper_bgcolor='#090c10',
-    dragmode=False, # Touch drag/zoom completely disabled
+    dragmode=False,
     xaxis=dict(
-        type='category', # Spreads candles evenly across entire screen
+        type='date',
         showgrid=True,
         gridcolor='#151b26',
         color='#64748b',
-        fixedrange=True # X-axis touch zoom disabled
+        fixedrange=True,
+        nticks=3, # Niche sirf 2-3 saaf time labels dikhayega
+        tickformat='%H:%M'
     ),
     yaxis=dict(
         showgrid=True,
@@ -330,21 +335,17 @@ fig.update_layout(
         color='#64748b',
         side='right',
         tickformat='.2f',
-        fixedrange=True # Y-axis touch zoom disabled
+        fixedrange=True
     )
 )
 
 st.plotly_chart(
     fig, 
     use_container_width=True, 
-    config={
-        'displayModeBar': False,
-        'scrollZoom': False,
-        'doubleClick': False
-    }
+    config={'displayModeBar': False, 'scrollZoom': False, 'doubleClick': False}
 )
 
-# --- BOTTOM CONTROLS (Row 1) ---
+# Bottom Controls Row 1
 st.markdown(f"""
     <div class="bottom-panel-1">
         <div class="panel-grp">
@@ -359,7 +360,7 @@ st.markdown(f"""
     </div>
 """, unsafe_allow_html=True)
 
-# --- BOTTOM CONTROLS (Row 2) ---
+# Bottom Controls Row 2
 st.markdown(f"""
     <div class="bottom-panel-2">
         <div class="info-card">
