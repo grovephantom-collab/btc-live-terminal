@@ -10,12 +10,13 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
+# Streamlit chrome aur blank space ko zero lock karein
 st.markdown("""
     <style>
         header, footer, #MainMenu { visibility: hidden !important; height: 0 !important; }
-        .block-container { padding: 0 !important; max-width: 100% !important; background-color: #080a0f !important; }
+        .block-container { padding: 0 !important; margin: 0 !important; max-width: 100% !important; background-color: #080a0f !important; }
         .stApp { background-color: #080a0f !important; overflow: hidden !important; }
-        iframe { border: none !important; width: 100vw !important; height: 100vh !important; }
+        iframe { border: none !important; width: 100vw !important; height: 100vh !important; display: block !important; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -71,20 +72,34 @@ custom_app_html = f"""
     <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
-        body {{ background-color: #080a0f; color: #d1d4dc; overflow: hidden; height: 100vh; display: flex; flex-direction: column; justify-content: space-between; }}
+        html, body {{ 
+            background-color: #080a0f; 
+            color: #d1d4dc; 
+            overflow: hidden; 
+            height: 100vh; 
+            width: 100vw;
+            display: flex; 
+            flex-direction: column; 
+        }}
 
-        /* Top HUD Bar */
+        /* TOP HUD BAR */
         .top-bar {{
-            display: flex; justify-content: space-between; align-items: center;
-            padding: 6px 8px; background: #0d1118; border-bottom: 1px solid rgba(255,255,255,0.06);
-            height: 40px; font-size: 10px; flex-shrink: 0;
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center;
+            padding: 5px 8px; 
+            background: #0d1118; 
+            border-bottom: 1px solid rgba(255,255,255,0.06);
+            height: 38px; 
+            font-size: 10px; 
+            flex-shrink: 0;
         }}
         .bar-left {{ display: flex; align-items: center; gap: 8px; }}
         .badge-live {{ background: #089981; color: #fff; font-size: 8px; font-weight: 800; padding: 2px 4px; border-radius: 2px; }}
         .badge-tf {{ background: #131924; color: #38bdf8; font-size: 8px; font-weight: 800; padding: 2px 5px; border-radius: 2px; border: 1px solid #1e293b; }}
         .hud-col {{ display: flex; flex-direction: column; }}
         .hud-lbl {{ font-size: 7px; color: #565f70; font-weight: 700; text-transform: uppercase; }}
-        .hud-val {{ font-weight: 800; font-size: 10.5px; }}
+        .hud-val {{ font-weight: 800; font-size: 10px; }}
 
         .vault-btn {{
             background: #141b27; border: 1px solid #232f42; color: #38bdf8;
@@ -92,20 +107,21 @@ custom_app_html = f"""
         }}
 
         .basis-badge {{
-            position: absolute; top: 46px; left: 8px; z-index: 10;
+            position: absolute; top: 42px; left: 8px; z-index: 10;
             background: rgba(13, 17, 24, 0.9); border: 1px solid #232f42;
-            padding: 4px 8px; border-radius: 4px; font-size: 9px; font-weight: 700;
+            padding: 3px 7px; border-radius: 4px; font-size: 8.5px; font-weight: 700;
             color: #64748b; pointer-events: none;
         }}
 
-        /* Exact Green Line Height Chart */
+        /* CHART CONTAINER: Fills exact screen height between top and bottom bars */
         #chart-container {{
+            flex: 1;
             width: 100vw;
-            height: 68vh;
             position: relative;
+            min-height: 0;
         }}
 
-        /* Bottom Control Panels (Green Line ke theek niche) */
+        /* BOTTOM SECTION (TIGHTLY ATTACHED TO BOTTOM OF CHART) */
         .bottom-section {{
             display: flex;
             flex-direction: column;
@@ -114,20 +130,35 @@ custom_app_html = f"""
             flex-shrink: 0;
         }}
         .bot-bar-1 {{
-            display: flex; justify-content: space-between; align-items: center;
-            padding: 5px 8px; background: #0b0f16; border-top: 1px solid rgba(255,255,255,0.06);
-            font-size: 9px;
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center;
+            padding: 4px 8px; 
+            background: #0b0f16; 
+            border-top: 1px solid rgba(255,255,255,0.06);
+            height: 28px;
+            font-size: 8.5px;
         }}
         .bot-bar-2 {{
-            display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px;
-            padding: 4px 6px 8px 6px; background: #06080c; font-size: 8px;
+            display: grid; 
+            grid-template-columns: repeat(4, 1fr); 
+            gap: 4px;
+            padding: 3px 6px 5px 6px; 
+            background: #06080c; 
+            height: 34px;
+            font-size: 7.5px;
         }}
         .info-card {{
-            background: #0d121a; border: 1px solid #161e2a; padding: 4px;
-            border-radius: 3px; display: flex; flex-direction: column;
+            background: #0d121a; 
+            border: 1px solid #161e2a; 
+            padding: 2px 4px;
+            border-radius: 3px; 
+            display: flex; 
+            flex-direction: column;
+            justify-content: center;
         }}
 
-        /* Modal */
+        /* MODAL */
         .modal {{
             display: none; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
             background: rgba(0,0,0,0.85); z-index: 999999; align-items: center; justify-content: center; padding: 16px;
@@ -173,16 +204,16 @@ custom_app_html = f"""
     <!-- BASIS BADGE -->
     <div id="basis-box" class="basis-badge">SCANNING: Awaiting 48H Sweep / Structure Shift</div>
 
-    <!-- CHART AREA (Fits at Green Line) -->
+    <!-- MAIN CHART AREA -->
     <div id="chart-container"></div>
 
-    <!-- BOTTOM CONTROLS & SCANNER PANELS -->
+    <!-- BOTTOM CONTROLS & SCANNER PANELS (TIGHTLY ATTACHED) -->
     <div class="bottom-section">
         <div class="bot-bar-1">
             <div>ACCOUNT: <span class="c-green">$10.00 BASE</span> | ALLOCATION: <span class="c-cyan">$2.50 (10x)</span></div>
-            <div style="display:flex; gap:6px;">
-                <span style="border:1px solid rgba(202,138,4,0.4); color:#fbbf24; padding:2px 5px; border-radius:2px; font-weight:700;">⚡ FORCE CLOSE</span>
-                <span style="border:1px solid rgba(220,38,38,0.4); color:#f87171; padding:2px 5px; border-radius:2px; font-weight:700;">🚨 KILL SWITCH</span>
+            <div style="display:flex; gap:5px;">
+                <span style="border:1px solid rgba(202,138,4,0.4); color:#fbbf24; padding:1px 4px; border-radius:2px; font-weight:700;">⚡ FORCE CLOSE</span>
+                <span style="border:1px solid rgba(220,38,38,0.4); color:#f87171; padding:1px 4px; border-radius:2px; font-weight:700;">🚨 KILL SWITCH</span>
             </div>
         </div>
         <div class="bot-bar-2">
@@ -227,7 +258,7 @@ custom_app_html = f"""
             rightPriceScale: {{
                 borderColor: '#161e2a',
                 autoScale: true,
-                scaleMargins: {{ top: 0.1, bottom: 0.05 }},
+                scaleMargins: {{ top: 0.08, bottom: 0.02 }},
             }},
             timeScale: {{
                 borderColor: '#161e2a',
@@ -236,7 +267,7 @@ custom_app_html = f"""
                 barSpacing: 9,
                 minBarSpacing: 2,
                 fixLeftEdge: true,
-                rightOffset: 5,
+                rightOffset: 4,
             }},
             handleScroll: {{ mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: true }},
             handleScale: {{ axisPressedMouseMove: true, mouseWheel: true, pinch: true }},
@@ -316,6 +347,7 @@ custom_app_html = f"""
             document.getElementById('basis-box').style.borderColor = "#232f42";
         }}
 
+        // LIVE REAL-TIME BINANCE WEBSOCKET
         const ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@kline_5m');
         ws.onmessage = (event) => {{
             const res = JSON.parse(event.data);
@@ -353,6 +385,7 @@ custom_app_html = f"""
             document.getElementById('vaultModal').style.display = 'none';
         }}
 
+        // Screen change par auto fit resize
         window.addEventListener('resize', () => {{
             chart.resize(container.clientWidth, container.clientHeight);
         }});
