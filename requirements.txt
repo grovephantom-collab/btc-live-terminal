@@ -1,5 +1,3 @@
 streamlit
-streamlit-autorefresh
-plotly
-pandas
 requests
+aiohttp
