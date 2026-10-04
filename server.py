@@ -1,18 +1,21 @@
-import asyncio
+import streamlit as st
+import streamlit.components.v1 as components
+import requests
 import json
 import sqlite3
+import asyncio
 import aiohttp
-import requests
+import threading
 from datetime import datetime
 
+# --- 1. CONFIGURATION & TELEGRAM ---
 BOT_TOKEN = "8941403990:AAGLH_dupqmGoipglhVvRuiPBzvgMqJR3Ms"
 CHAT_ID = "7886716805"
-
 DB_FILE = "trades_vault.db"
 
-# Database initialization
+# --- 2. SQLITE VAULT SETUP ---
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     cur = conn.cursor()
     cur.execute('''
         CREATE TABLE IF NOT EXISTS vault (
@@ -33,20 +36,18 @@ def init_db():
     conn.commit()
     conn.close()
 
+init_db()
+
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": msg,
-        "parse_mode": "HTML"
-    }
+    payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"}
     try:
         requests.post(url, json=payload, timeout=5)
-    except Exception as e:
-        print(f"Telegram error: {e}")
+    except Exception:
+        pass
 
 def save_vault(trade, exit_price, result, pnl, is_win):
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     cur = conn.cursor()
     cur.execute('''
         INSERT INTO vault (timestamp, direction, entry, sweep_level, atr, sl, tp, exit, result, pnl, is_win)
@@ -58,214 +59,323 @@ def save_vault(trade, exit_price, result, pnl, is_win):
     conn.commit()
     conn.close()
 
-# 48H Historical Buffer Fetcher
-def fetch_initial_candles():
-    url = "https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=5m&limit=650"
+# --- 3. BACKGROUND STRATEGY STATE MACHINE ---
+class BotEngine:
+    def __init__(self):
+        self.state = "SCANNING"
+        self.sweep_extreme = None
+        self.sweep_level = None
+        self.sweep_candle_time = None
+        self.active_trade = None
+        self.candles_data = []
+
+    def calculate_atr(self, data, period=14):
+        if len(data) < period + 1:
+            return 85.0
+        trs = []
+        for i in range(len(data) - period, len(data)):
+            hl = data[i]['high'] - data[i]['low']
+            hc = abs(data[i]['high'] - data[i - 1]['close'])
+            lc = abs(data[i]['low'] - data[i - 1]['close'])
+            trs.append(max(hl, hc, lc))
+        return sum(trs) / period
+
+    def get_48h_bounds(self, data):
+        slice_576 = data[-576:]
+        h48 = max(c['high'] for c in slice_576)
+        l48 = min(c['low'] for c in slice_576)
+        return h48, l48
+
+    def on_closed_candle(self, closed_candle):
+        self.candles_data.append(closed_candle)
+        if len(self.candles_data) > 650:
+            self.candles_data.pop(0)
+
+        completed_buffer = self.candles_data[:-1]
+        h48, l48 = self.get_48h_bounds(completed_buffer)
+        atr = self.calculate_atr(completed_buffer, 14)
+
+        if self.state == "SCANNING":
+            if closed_candle['low'] < l48:
+                self.state = "SWEEP_LOW_WAIT"
+                self.sweep_extreme = closed_candle['low']
+                self.sweep_level = l48
+                self.sweep_candle_time = closed_candle['time']
+            elif closed_candle['high'] > h48:
+                self.state = "SWEEP_HIGH_WAIT"
+                self.sweep_extreme = closed_candle['high']
+                self.sweep_level = h48
+                self.sweep_candle_time = closed_candle['time']
+
+        elif self.state == "SWEEP_LOW_WAIT":
+            if closed_candle['time'] > self.sweep_candle_time:
+                if closed_candle['close'] > self.sweep_level:
+                    entry = closed_candle['close']
+                    sl = self.sweep_extreme - (1.6 * atr)
+                    risk = entry - sl
+                    tp = entry + (2.5 * risk)
+                    self.arm_trade("LONG", entry, sl, tp, self.sweep_level, atr)
+                else:
+                    if closed_candle['low'] < self.sweep_extreme:
+                        self.sweep_extreme = closed_candle['low']
+                    else:
+                        self.state = "SCANNING"
+
+        elif self.state == "SWEEP_HIGH_WAIT":
+            if closed_candle['time'] > self.sweep_candle_time:
+                if closed_candle['close'] < self.sweep_level:
+                    entry = closed_candle['close']
+                    sl = self.sweep_extreme + (1.6 * atr)
+                    risk = sl - entry
+                    tp = entry - (2.5 * risk)
+                    self.arm_trade("SHORT", entry, sl, tp, self.sweep_level, atr)
+                else:
+                    if closed_candle['high'] > self.sweep_extreme:
+                        self.sweep_extreme = closed_candle['high']
+                    else:
+                        self.state = "SCANNING"
+
+    def arm_trade(self, dir_type, entry, sl, tp, s_level, atr_val):
+        self.state = "ACTIVE_TRADE"
+        t_str = datetime.now().strftime('%H:%M:%S')
+        self.active_trade = {
+            "dir": dir_type, "entry": entry, "sl": sl, "tp": tp,
+            "sweep_level": s_level, "atr": atr_val, "time": t_str
+        }
+        msg = (
+            f"🚨 <b>BTCUSDT {dir_type} PRE-SIGNAL ARMED</b> 🚨\n\n"
+            f"⏱ <b>Timeframe:</b> 5M (48H Sweep Confirmed)\n"
+            f"🎯 <b>Basis:</b> 48H {'Low Reclaim' if dir_type == 'LONG' else 'High Rejection'}\n\n"
+            f"🔹 <b>Entry:</b> ${entry:.2f}\n"
+            f"🛑 <b>Stop Loss:</b> ${sl:.2f}\n"
+            f"🎯 <b>Take Profit (2.5R):</b> ${tp:.2f}\n"
+            f"⚡ <b>RR Ratio:</b> 1:2.5\n"
+            f"🛡 <b>ATR(14):</b> {atr_val:.1f}\n\n"
+            f"<i>Monitoring 24/7 ticks for resolution...</i>"
+        )
+        send_telegram(msg)
+
+    def resolve_trade(self, result, pnl, is_win, exit_price):
+        save_vault(self.active_trade, exit_price, result, pnl, is_win)
+        msg = (
+            f"🏁 <b>TRADE RESOLVED: {result}</b>\n\n"
+            f"📌 <b>Direction:</b> {self.active_trade['dir']}\n"
+            f"🔹 <b>Entry:</b> ${self.active_trade['entry']:.2f}\n"
+            f"🔸 <b>Exit Price:</b> ${exit_price:.2f}\n"
+            f"💰 <b>Result:</b> {pnl}\n\n"
+            f"🔄 <i>State Reset: SCANNING next 48H sweep...</i>"
+        )
+        send_telegram(msg)
+        self.state = "SCANNING"
+        self.active_trade = None
+
+# Global engine singleton
+if "engine" not in st.session_state:
+    st.session_state["engine"] = BotEngine()
+engine = st.session_state["engine"]
+
+# --- 4. PERSISTENT BACKGROUND WORKER THREAD ---
+def start_background_loop():
+    async def kline_worker():
+        while True:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.ws_connect("wss://fstream.binance.com/ws/btcusdt@kline_5m") as ws:
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                data = json.loads(msg.data)
+                                k = data.get('k', {})
+                                if k.get('x'):
+                                    c = {
+                                        "time": int(k['t'] / 1000),
+                                        "open": float(k['o']), "high": float(k['h']),
+                                        "low": float(k['l']), "close": float(k['c']), "vol": float(k['v'])
+                                    }
+                                    engine.on_closed_candle(c)
+            except Exception:
+                await asyncio.sleep(2)
+
+    async def trade_worker():
+        while True:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.ws_connect("wss://fstream.binance.com/ws/btcusdt@trade") as ws:
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                data = json.loads(msg.data)
+                                p = float(data.get('p', 0.0))
+                                if engine.state == "ACTIVE_TRADE" and engine.active_trade:
+                                    t = engine.active_trade
+                                    if t['dir'] == "LONG":
+                                        if p >= t['tp']: engine.resolve_trade("TP HIT 🔥", "+2.5R", 1, p)
+                                        elif p <= t['sl']: engine.resolve_trade("SL HIT 🛑", "-1R", 0, p)
+                                    elif t['dir'] == "SHORT":
+                                        if p <= t['tp']: engine.resolve_trade("TP HIT 🔥", "+2.5R", 1, p)
+                                        elif p >= t['sl']: engine.resolve_trade("SL HIT 🛑", "-1R", 0, p)
+            except Exception:
+                await asyncio.sleep(2)
+
+    async def main():
+        url = "https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=5m&limit=650"
+        try:
+            r = requests.get(url, timeout=5).json()
+            engine.candles_data = [{"time": int(b[0]/1000), "open": float(b[1]), "high": float(b[2]), "low": float(b[3]), "close": float(b[4]), "vol": float(b[5])} for b in r]
+        except Exception:
+            pass
+        send_telegram("🚀 <b>BTCUSDT 48H RADAR 24/7 ACTIVE</b>\nSystem running continuously...")
+        await asyncio.gather(kline_worker(), trade_worker())
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(main())
+
+if "worker_started" not in st.session_state:
+    st.session_state["worker_started"] = True
+    t = threading.Thread(target=start_background_loop, daemon=True)
+    t.start()
+
+# --- 5. STREAMLIT CLIENT-SIDE UI ---
+st.set_page_config(page_title="BTCUSDT RADAR 48H", layout="wide", initial_sidebar_state="collapsed")
+
+st.markdown("""
+    <style>
+        header, footer, #MainMenu { visibility: hidden !important; height: 0 !important; }
+        .block-container { padding: 0 !important; margin: 0 !important; max-width: 100% !important; background-color: #080a0f !important; }
+        .stApp { background-color: #080a0f !important; }
+        iframe { border: none !important; width: 100vw !important; display: block !important; }
+    </style>
+""", unsafe_allow_html=True)
+
+# Vault Data for Modal
+conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+cur = conn.cursor()
+cur.execute("SELECT timestamp, direction, entry, result, pnl, is_win FROM vault ORDER BY id DESC")
+rows = cur.fetchall()
+total_trades = len(rows)
+wins = sum(1 for r in rows if r[5] == 1)
+win_rate = int((wins / total_trades) * 100) if total_trades > 0 else 0
+conn.close()
+
+vault_json = json.dumps([{"time": r[0], "dir": r[1], "entry": r[2], "res": r[3], "pnl": r[4], "win": r[5]} for r in rows])
+
+# Initial Chart Data
+def get_chart_data():
     try:
-        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5).json()
-        if isinstance(r, list) and len(r) >= 576:
-            return [{"time": int(b[0]/1000), "open": float(b[1]), "high": float(b[2]), "low": float(b[3]), "close": float(b[4]), "vol": float(b[5])} for b in r]
-    except Exception as e:
-        print(f"Fetch error: {e}")
-    return []
+        r = requests.get("https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=5m&limit=350", timeout=3.5).json()
+        return [{"time": int(b[0]/1000), "open": float(b[1]), "high": float(b[2]), "low": float(b[3]), "close": float(b[4])} for b in r]
+    except Exception:
+        return []
 
-# True Range ATR(14)
-def calculate_atr(data, period=14):
-    if len(data) < period + 1:
-        return 85.0
-    trs = []
-    for i in range(len(data) - period, len(data)):
-        hl = data[i]['high'] - data[i]['low']
-        hc = abs(data[i]['high'] - data[i - 1]['close'])
-        lc = abs(data[i]['low'] - data[i - 1]['close'])
-        trs.append(max(hl, hc, lc))
-    return sum(trs) / period
+candles_json = json.dumps(get_chart_data())
 
-def get_48h_bounds(data):
-    slice_576 = data[-576:]
-    h48 = max(c['high'] for c in slice_576)
-    l48 = min(c['low'] for c in slice_576)
-    return h48, l48
+ui_html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+        * {{ margin:0; padding:0; box-sizing:border-box; font-family:-apple-system, sans-serif; }}
+        body {{ background:#080a0f; color:#d1d4dc; overflow:hidden; width:100vw; display:flex; flex-direction:column; }}
+        .top-bar {{ display:flex; justify-content:space-between; align-items:center; padding:5px 8px; background:#0d1118; border-bottom:1px solid rgba(255,255,255,0.06); height:38px; font-size:10px; }}
+        .badge-live {{ background:#089981; color:#fff; font-size:8px; font-weight:800; padding:2px 4px; border-radius:2px; }}
+        .badge-tf {{ background:#131924; color:#38bdf8; font-size:8px; font-weight:800; padding:2px 5px; border-radius:2px; }}
+        .vault-btn {{ background:#141b27; border:1px solid #232f42; color:#38bdf8; padding:3px 8px; border-radius:4px; font-size:10px; font-weight:700; cursor:pointer; }}
+        #chart-container {{ width:100vw; height:375px; position:relative; }}
+        .bottom-section {{ display:flex; flex-direction:column; width:100vw; background:#080a0f; }}
+        .bot-bar-1 {{ display:flex; justify-content:space-between; align-items:center; padding:4px 8px; background:#0b0f16; border-top:1px solid rgba(255,255,255,0.06); height:28px; font-size:8.5px; }}
+        .bot-bar-2 {{ display:grid; grid-template-columns:repeat(4, 1fr); gap:4px; padding:3px 6px 5px 6px; background:#06080c; height:34px; font-size:7.5px; }}
+        .info-card {{ background:#0d121a; border:1px solid #161e2a; padding:2px 4px; border-radius:3px; display:flex; flex-direction:column; justify-content:center; }}
+        .modal {{ display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.85); z-index:999999; align-items:center; justify-content:center; padding:16px; }}
+        .modal-box {{ background:#0f141e; border:1px solid #1c2636; border-radius:8px; width:100%; max-width:380px; padding:14px; }}
+        .c-green {{ color:#089981 !important; font-weight:bold; }}
+        .c-red {{ color:#f23645 !important; font-weight:bold; }}
+        .c-cyan {{ color:#00e5ff !important; font-weight:bold; }}
+        .c-yellow {{ color:#f59e0b !important; font-weight:bold; }}
+    </style>
+</head>
+<body>
+    <div class="top-bar">
+        <div style="display:flex; align-items:center; gap:8px;">
+            <span class="badge-live">FUTURES</span>
+            <span class="badge-tf">5M • 48H</span>
+            <div><span style="font-size:7px; color:#565f70; font-weight:700;">RADAR</span><div id="hud-status" class="c-yellow" style="font-weight:800; font-size:10px;">SCANNING</div></div>
+            <div><span style="font-size:7px; color:#565f70; font-weight:700;">ENTRY</span><div id="hud-entry" class="c-cyan" style="font-weight:800; font-size:10px;">--</div></div>
+            <div><span style="font-size:7px; color:#565f70; font-weight:700;">SL</span><div id="hud-sl" class="c-red" style="font-weight:800; font-size:10px;">--</div></div>
+            <div><span style="font-size:7px; color:#565f70; font-weight:700;">TP</span><div id="hud-tp" class="c-green" style="font-weight:800; font-size:10px;">--</div></div>
+        </div>
+        <button class="vault-btn" onclick="openVault()">📜 VAULT ({total_trades})</button>
+    </div>
 
-# Global Strategy State
-state = "SCANNING"  # SCANNING | SWEEP_LOW_WAIT | SWEEP_HIGH_WAIT | ACTIVE_TRADE
-sweep_extreme = None
-sweep_level = None
-sweep_candle_time = None
-active_trade = None
-candles_data = []
+    <div id="chart-container"></div>
 
-def process_closed_candle(closed_candle):
-    global state, sweep_extreme, sweep_level, sweep_candle_time, active_trade, candles_data
-    candles_data.append(closed_candle)
-    if len(candles_data) > 650:
-        candles_data.pop(0)
+    <div class="bottom-section">
+        <div class="bot-bar-1">
+            <div>ACCOUNT: <span class="c-green">$10.00 BASE</span> | ALLOCATION: <span class="c-cyan">$2.50 (10x)</span></div>
+            <div style="display:flex; gap:5px;">
+                <span style="border:1px solid rgba(202,138,4,0.4); color:#fbbf24; padding:1px 4px; border-radius:2px; font-weight:700;">⚡ FORCE CLOSE</span>
+                <span style="border:1px solid rgba(220,38,38,0.4); color:#f87171; padding:1px 4px; border-radius:2px; font-weight:700;">🚨 KILL SWITCH</span>
+            </div>
+        </div>
+        <div class="bot-bar-2">
+            <div class="info-card"><span style="color:#565f70;">STATUS</span><span class="c-green">24/7 ACTIVE</span></div>
+            <div class="info-card"><span style="color:#565f70;">BOT ALERT</span><span class="c-cyan">TELEGRAM ON</span></div>
+            <div class="info-card"><span style="color:#565f70;">REGIME</span><span class="c-green">48H SMC</span></div>
+            <div class="info-card"><span style="color:#565f70;">SHIELD</span><span class="c-green">ARMED 🛡️</span></div>
+        </div>
+    </div>
 
-    completed_buffer = candles_data[:-1]
-    h48, l48 = get_48h_bounds(completed_buffer)
-    atr = calculate_atr(completed_buffer, 14)
+    <div id="vaultModal" class="modal">
+        <div class="modal-box">
+            <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #1c2636; padding-bottom:8px; margin-bottom:8px;">
+                <span style="font-weight:bold; font-size:12px;">🔒 SQLITE VAULT</span>
+                <span style="cursor:pointer; font-weight:bold;" onclick="closeVault()">✕</span>
+            </div>
+            <div id="vaultList" style="max-height: 220px; overflow-y: auto;"></div>
+        </div>
+    </div>
 
-    # FALSE SIGNAL SHIELD RULES
-    if state == "SCANNING":
-        if closed_candle['low'] < l48:
-            state = "SWEEP_LOW_WAIT"
-            sweep_extreme = closed_candle['low']
-            sweep_level = l48
-            sweep_candle_time = closed_candle['time']
-            print(f"[SHIELD] 48H Low Swept: {l48:.1f}. Waiting for next candle reclaim.")
-        elif closed_candle['high'] > h48:
-            state = "SWEEP_HIGH_WAIT"
-            sweep_extreme = closed_candle['high']
-            sweep_level = h48
-            sweep_candle_time = closed_candle['time']
-            print(f"[SHIELD] 48H High Swept: {h48:.1f}. Waiting for next candle rejection.")
+    <script>
+        const candlesData = {candles_json};
+        const vaultTrades = {vault_json};
 
-    elif state == "SWEEP_LOW_WAIT":
-        if closed_candle['time'] > sweep_candle_time:
-            if closed_candle['close'] > sweep_level:
-                # Confirmed Reclaim
-                entry = closed_candle['close']
-                sl = sweep_extreme - (1.6 * atr)
-                risk = entry - sl
-                tp = entry + (2.5 * risk)
-                arm_trade("LONG", entry, sl, tp, sweep_level, atr)
-            else:
-                if closed_candle['low'] < sweep_extreme:
-                    sweep_extreme = closed_candle['low']
-                else:
-                    state = "SCANNING"
-                    print("[SHIELD] Failed Reclaim -> Back to SCANNING.")
+        const container = document.getElementById('chart-container');
+        const chart = LightweightCharts.createChart(container, {{
+            layout: {{ background: {{ type: 'solid', color: '#080a0f' }}, textColor: '#64748b', fontSize: 10 }},
+            grid: {{ vertLines: {{ color: 'rgba(255, 255, 255, 0.03)' }}, horzLines: {{ color: 'rgba(255, 255, 255, 0.03)' }} }},
+            rightPriceScale: {{ borderColor: '#161e2a' }},
+            timeScale: {{ borderColor: '#161e2a', timeVisible: true, secondsVisible: false }}
+        }});
 
-    elif state == "SWEEP_HIGH_WAIT":
-        if closed_candle['time'] > sweep_candle_time:
-            if closed_candle['close'] < sweep_level:
-                # Confirmed Rejection
-                entry = closed_candle['close']
-                sl = sweep_extreme + (1.6 * atr)
-                risk = sl - entry
-                tp = entry - (2.5 * risk)
-                arm_trade("SHORT", entry, sl, tp, sweep_level, atr)
-            else:
-                if closed_candle['high'] > sweep_extreme:
-                    sweep_extreme = closed_candle['high']
-                else:
-                    state = "SCANNING"
-                    print("[SHIELD] Failed Rejection -> Back to SCANNING.")
+        const candleSeries = chart.addCandlestickSeries({{
+            upColor: '#089981', downColor: '#f23645', borderUpColor: '#089981', borderDownColor: '#f23645', wickUpColor: '#089981', wickDownColor: '#f23645'
+        }});
+        if (candlesData.length > 0) candleSeries.setData(candlesData);
 
-def arm_trade(dir_type, entry, sl, tp, s_level, atr_val):
-    global state, active_trade
-    state = "ACTIVE_TRADE"
-    t_str = datetime.now().strftime('%H:%M:%S')
-    active_trade = {
-        "dir": dir_type,
-        "entry": entry,
-        "sl": sl,
-        "tp": tp,
-        "sweep_level": s_level,
-        "atr": atr_val,
-        "time": t_str
-    }
-    
-    msg = (
-        f"🚨 <b>BTCUSDT {dir_type} PRE-SIGNAL ARMED</b> 🚨\n\n"
-        f"⏱ <b>Timeframe:</b> 5M (48H Sweep)\n"
-        f"🎯 <b>Basis:</b> 48H {'Low Reclaim' if dir_type == 'LONG' else 'High Rejection'} (Closed Candle)\n\n"
-        f"🔹 <b>Entry:</b> ${entry:.2f}\n"
-        f"🛑 <b>Stop Loss:</b> ${sl:.2f}\n"
-        f"🎯 <b>Take Profit (2.5R):</b> ${tp:.2f}\n"
-        f"⚡ <b>RR Ratio:</b> 1:2.5\n"
-        f"🛡 <b>ATR(14):</b> {atr_val:.1f}\n\n"
-        f"<i>Monitoring real-time ticks for resolution...</i>"
-    )
-    send_telegram(msg)
-    print(f"[TRADE ARMED] {dir_type} @ {entry} | SL: {sl} | TP: {tp}")
+        const ws = new WebSocket('wss://fstream.binance.com/ws/btcusdt@kline_5m');
+        ws.onmessage = (event) => {{
+            const res = JSON.parse(event.data);
+            const k = res.k;
+            candleSeries.update({{
+                time: Math.floor(k.t / 1000), open: parseFloat(k.o), high: parseFloat(k.h), low: parseFloat(k.l), close: parseFloat(k.c)
+            }});
+        }};
 
-def resolve_trade(result, pnl, is_win, exit_price):
-    global state, active_trade
-    save_vault(active_trade, exit_price, result, pnl, is_win)
-    
-    msg = (
-        f"🏁 <b>TRADE RESOLVED: {result}</b>\n\n"
-        f"📌 <b>Direction:</b> {active_trade['dir']}\n"
-        f"🔹 <b>Entry:</b> ${active_trade['entry']:.2f}\n"
-        f"🔸 <b>Exit Price:</b> ${exit_price:.2f}\n"
-        f"💰 <b>Result:</b> {pnl}\n\n"
-        f"🔄 <i>State Reset: SCANNING for next 48H institutional pool...</i>"
-    )
-    send_telegram(msg)
-    print(f"[RESOLVED] {result} exit @ {exit_price}")
+        function openVault() {{
+            document.getElementById('vaultModal').style.display = 'flex';
+            const list = document.getElementById('vaultList');
+            list.innerHTML = vaultTrades.length === 0 ? '<div style="font-size:10px; color:#565f70; text-align:center; padding:15px;">No trades yet. Scanning...</div>' : '';
+            vaultTrades.forEach(t => {{
+                list.innerHTML += `<div style="display:flex; justify-content:space-between; padding:4px 0; border-bottom:1px solid #161e2a; font-size:10px;">
+                    <span>${{t.time}} <b style="color:#00e5ff">${{t.dir}}</b> @ ${{t.entry}}</span>
+                    <span style="color:${{t.win === 1 ? '#089981' : '#f23645'}}">${{t.res}} ${{t.pnl}}</span>
+                </div>`;
+            }});
+        }}
+        function closeVault() {{ document.getElementById('vaultModal').style.display = 'none'; }}
+    </script>
+</body>
+</html>
+"""
 
-    state = "SCANNING"
-    active_trade = None
-
-# WebSocket Tasks
-async def kline_listener():
-    url = "wss://fstream.binance.com/ws/btcusdt@kline_5m"
-    while True:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.ws_connect(url) as ws:
-                    print("Connected to Binance Futures 5M Kline Stream.")
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            data = json.loads(msg.data)
-                            k = data.get('k', {})
-                            if k.get('x'):  # Closed 5M Candle Only
-                                closed = {
-                                    "time": int(k['t'] / 1000),
-                                    "open": float(k['o']),
-                                    "high": float(k['h']),
-                                    "low": float(k['l']),
-                                    "close": float(k['c']),
-                                    "vol": float(k['v'])
-                                }
-                                process_closed_candle(closed)
-        except Exception as e:
-            print(f"Kline WS reconnecting: {e}")
-            await asyncio.sleep(2)
-
-async def trade_listener():
-    global state, active_trade
-    url = "wss://fstream.binance.com/ws/btcusdt@trade"
-    while True:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.ws_connect(url) as ws:
-                    print("Connected to Binance Futures Real-Time Trade Stream.")
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            data = json.loads(msg.data)
-                            price = float(data.get('p', 0.0))
-                            if state == "ACTIVE_TRADE" and active_trade:
-                                if active_trade['dir'] == "LONG":
-                                    if price >= active_trade['tp']:
-                                        resolve_trade("TP HIT 🔥", "+2.5R", 1, price)
-                                    elif price <= active_trade['sl']:
-                                        resolve_trade("SL HIT 🛑", "-1R", 0, price)
-                                elif active_trade['dir'] == "SHORT":
-                                    if price <= active_trade['tp']:
-                                        resolve_trade("TP HIT 🔥", "+2.5R", 1, price)
-                                    elif price >= active_trade['sl']:
-                                        resolve_trade("SL HIT 🛑", "-1R", 0, price)
-        except Exception as e:
-            print(f"Trade WS reconnecting: {e}")
-            await asyncio.sleep(2)
-
-async def main():
-    global candles_data
-    init_db()
-    print("Fetching 48H buffer...")
-    candles_data = fetch_initial_candles()
-    if not candles_data:
-        print("Failed to fetch initial candles. Exiting.")
-        return
-    print(f"Loaded {len(candles_data)} candles into buffer.")
-    send_telegram("🚀 <b>BTCUSDT 48H RADAR BACKGROUND WORKER ACTIVATED</b>\nMonitoring 24/7 Binance Futures streams...")
-    
-    await asyncio.gather(
-        kline_listener(),
-        trade_listener()
-    )
-
-if __name__ == "__main__":
-    asyncio.run(main())
+components.html(ui_html, height=490, scrolling=False)
