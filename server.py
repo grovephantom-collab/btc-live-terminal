@@ -8,12 +8,11 @@ import aiohttp
 import threading
 from datetime import datetime
 
-# --- 1. CONFIGURATION & TELEGRAM ---
 BOT_TOKEN = "8941403990:AAGLH_dupqmGoipglhVvRuiPBzvgMqJR3Ms"
 CHAT_ID = "7886716805"
 DB_FILE = "trades_vault.db"
 
-# --- 2. SQLITE VAULT SETUP ---
+# --- 1. SQLITE VAULT SETUP ---
 def init_db():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     cur = conn.cursor()
@@ -42,24 +41,44 @@ def send_telegram(msg):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"}
     try:
-        requests.post(url, json=payload, timeout=5)
+        requests.post(url, json=payload, timeout=4)
     except Exception:
         pass
 
 def save_vault(trade, exit_price, result, pnl, is_win):
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    cur = conn.cursor()
-    cur.execute('''
-        INSERT INTO vault (timestamp, direction, entry, sweep_level, atr, sl, tp, exit, result, pnl, is_win)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (
-        trade['time'], trade['dir'], trade['entry'], trade['sweep_level'],
-        trade['atr'], trade['sl'], trade['tp'], exit_price, result, pnl, is_win
-    ))
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        cur = conn.cursor()
+        cur.execute('''
+            INSERT INTO vault (timestamp, direction, entry, sweep_level, atr, sl, tp, exit, result, pnl, is_win)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            trade['time'], trade['dir'], trade['entry'], trade['sweep_level'],
+            trade['atr'], trade['sl'], trade['tp'], exit_price, result, pnl, is_win
+        ))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
-# --- 3. BACKGROUND STRATEGY STATE MACHINE ---
+# --- 2. MULTI-SOURCE ROBUST DATA FETCHER (PREVENTS BLANK CHART) ---
+def get_historical_candles(limit=580):
+    endpoints = [
+        f"https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=5m&limit={limit}",
+        f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=5m&limit={limit}",
+        f"https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=5m&limit={limit}",
+        f"https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval=5m&limit={limit}"
+    ]
+    for url in endpoints:
+        try:
+            r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3).json()
+            if isinstance(r, list) and len(r) > 100:
+                return [{"time": int(b[0]/1000), "open": float(b[1]), "high": float(b[2]), "low": float(b[3]), "close": float(b[4]), "vol": float(b[5])} for b in r]
+        except Exception:
+            continue
+    return []
+
+# --- 3. BACKGROUND STRATEGY ENGINE ---
 class BotEngine:
     def __init__(self):
         self.state = "SCANNING"
@@ -81,7 +100,7 @@ class BotEngine:
         return sum(trs) / period
 
     def get_48h_bounds(self, data):
-        slice_576 = data[-576:]
+        slice_576 = data[-576:] if len(data) >= 576 else data
         h48 = max(c['high'] for c in slice_576)
         l48 = min(c['low'] for c in slice_576)
         return h48, l48
@@ -91,9 +110,11 @@ class BotEngine:
         if len(self.candles_data) > 650:
             self.candles_data.pop(0)
 
-        completed_buffer = self.candles_data[:-1]
-        h48, l48 = self.get_48h_bounds(completed_buffer)
-        atr = self.calculate_atr(completed_buffer, 14)
+        completed = self.candles_data[:-1]
+        if len(completed) < 50:
+            return
+        h48, l48 = self.get_48h_bounds(completed)
+        atr = self.calculate_atr(completed, 14)
 
         if self.state == "SCANNING":
             if closed_candle['low'] < l48:
@@ -144,18 +165,18 @@ class BotEngine:
         }
         msg = (
             f"🚨 <b>BTCUSDT {dir_type} PRE-SIGNAL ARMED</b> 🚨\n\n"
-            f"⏱ <b>Timeframe:</b> 5M (48H Sweep Confirmed)\n"
-            f"🎯 <b>Basis:</b> 48H {'Low Reclaim' if dir_type == 'LONG' else 'High Rejection'}\n\n"
+            f"⏱ <b>Timeframe:</b> 5M (48H Liquidity Sweep)\n"
+            f"🎯 <b>Action:</b> Reclaim Confirmation\n\n"
             f"🔹 <b>Entry:</b> ${entry:.2f}\n"
             f"🛑 <b>Stop Loss:</b> ${sl:.2f}\n"
             f"🎯 <b>Take Profit (2.5R):</b> ${tp:.2f}\n"
-            f"⚡ <b>RR Ratio:</b> 1:2.5\n"
-            f"🛡 <b>ATR(14):</b> {atr_val:.1f}\n\n"
-            f"<i>Monitoring 24/7 ticks for resolution...</i>"
+            f"⚡ <b>RR Ratio:</b> 1:2.5"
         )
         send_telegram(msg)
 
     def resolve_trade(self, result, pnl, is_win, exit_price):
+        if not self.active_trade:
+            return
         save_vault(self.active_trade, exit_price, result, pnl, is_win)
         msg = (
             f"🏁 <b>TRADE RESOLVED: {result}</b>\n\n"
@@ -163,24 +184,24 @@ class BotEngine:
             f"🔹 <b>Entry:</b> ${self.active_trade['entry']:.2f}\n"
             f"🔸 <b>Exit Price:</b> ${exit_price:.2f}\n"
             f"💰 <b>Result:</b> {pnl}\n\n"
-            f"🔄 <i>State Reset: SCANNING next 48H sweep...</i>"
+            f"🔄 <i>State Reset: SCANNING...</i>"
         )
         send_telegram(msg)
         self.state = "SCANNING"
         self.active_trade = None
 
-# Global engine singleton
-if "engine" not in st.session_state:
-    st.session_state["engine"] = BotEngine()
-engine = st.session_state["engine"]
+# Global Engine Instance
+if "bg_engine" not in st.session_state:
+    st.session_state["bg_engine"] = BotEngine()
+engine = st.session_state["bg_engine"]
 
-# --- 4. PERSISTENT BACKGROUND WORKER THREAD ---
-def start_background_loop():
-    async def kline_worker():
+# --- 4. SAFE BACKGROUND WORKER (ZERO SPAM) ---
+def run_worker_thread():
+    async def kline_listener():
         while True:
             try:
                 async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect("wss://fstream.binance.com/ws/btcusdt@kline_5m") as ws:
+                    async with session.ws_connect("wss://stream.binance.com:9443/ws/btcusdt@kline_5m") as ws:
                         async for msg in ws:
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 data = json.loads(msg.data)
@@ -193,13 +214,13 @@ def start_background_loop():
                                     }
                                     engine.on_closed_candle(c)
             except Exception:
-                await asyncio.sleep(2)
+                await asyncio.sleep(5)
 
-    async def trade_worker():
+    async def trade_listener():
         while True:
             try:
                 async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect("wss://fstream.binance.com/ws/btcusdt@trade") as ws:
+                    async with session.ws_connect("wss://stream.binance.com:9443/ws/btcusdt@trade") as ws:
                         async for msg in ws:
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 data = json.loads(msg.data)
@@ -213,28 +234,22 @@ def start_background_loop():
                                         if p <= t['tp']: engine.resolve_trade("TP HIT 🔥", "+2.5R", 1, p)
                                         elif p >= t['sl']: engine.resolve_trade("SL HIT 🛑", "-1R", 0, p)
             except Exception:
-                await asyncio.sleep(2)
+                await asyncio.sleep(5)
 
-    async def main():
-        url = "https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=5m&limit=650"
-        try:
-            r = requests.get(url, timeout=5).json()
-            engine.candles_data = [{"time": int(b[0]/1000), "open": float(b[1]), "high": float(b[2]), "low": float(b[3]), "close": float(b[4]), "vol": float(b[5])} for b in r]
-        except Exception:
-            pass
-        send_telegram("🚀 <b>BTCUSDT 48H RADAR 24/7 ACTIVE</b>\nSystem running continuously...")
-        await asyncio.gather(kline_worker(), trade_worker())
+    async def runner():
+        engine.candles_data = get_historical_candles(580)
+        await asyncio.gather(kline_listener(), trade_listener())
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(main())
+    loop.run_until_complete(runner())
 
-if "worker_started" not in st.session_state:
-    st.session_state["worker_started"] = True
-    t = threading.Thread(target=start_background_loop, daemon=True)
-    t.start()
+# Prevent thread duplicates on Streamlit re-run
+if "worker_running" not in st.session_state:
+    st.session_state["worker_running"] = True
+    threading.Thread(target=run_worker_thread, daemon=True).start()
 
-# --- 5. STREAMLIT CLIENT-SIDE UI ---
+# --- 5. STREAMLIT UI ---
 st.set_page_config(page_title="BTCUSDT RADAR 48H", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown("""
@@ -246,7 +261,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Vault Data for Modal
+# Fetch Vault Stats
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cur = conn.cursor()
 cur.execute("SELECT timestamp, direction, entry, result, pnl, is_win FROM vault ORDER BY id DESC")
@@ -258,15 +273,9 @@ conn.close()
 
 vault_json = json.dumps([{"time": r[0], "dir": r[1], "entry": r[2], "res": r[3], "pnl": r[4], "win": r[5]} for r in rows])
 
-# Initial Chart Data
-def get_chart_data():
-    try:
-        r = requests.get("https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=5m&limit=350", timeout=3.5).json()
-        return [{"time": int(b[0]/1000), "open": float(b[1]), "high": float(b[2]), "low": float(b[3]), "close": float(b[4])} for b in r]
-    except Exception:
-        return []
-
-candles_json = json.dumps(get_chart_data())
+# Fetch Chart Candles
+ui_candles = get_historical_candles(350)
+candles_json = json.dumps(ui_candles)
 
 ui_html = f"""
 <!DOCTYPE html>
@@ -297,7 +306,7 @@ ui_html = f"""
 <body>
     <div class="top-bar">
         <div style="display:flex; align-items:center; gap:8px;">
-            <span class="badge-live">FUTURES</span>
+            <span class="badge-live">LIVE</span>
             <span class="badge-tf">5M • 48H</span>
             <div><span style="font-size:7px; color:#565f70; font-weight:700;">RADAR</span><div id="hud-status" class="c-yellow" style="font-weight:800; font-size:10px;">SCANNING</div></div>
             <div><span style="font-size:7px; color:#565f70; font-weight:700;">ENTRY</span><div id="hud-entry" class="c-cyan" style="font-weight:800; font-size:10px;">--</div></div>
@@ -318,8 +327,8 @@ ui_html = f"""
             </div>
         </div>
         <div class="bot-bar-2">
-            <div class="info-card"><span style="color:#565f70;">STATUS</span><span class="c-green">24/7 ACTIVE</span></div>
-            <div class="info-card"><span style="color:#565f70;">BOT ALERT</span><span class="c-cyan">TELEGRAM ON</span></div>
+            <div class="info-card"><span style="color:#565f70;">SYSTEM</span><span class="c-green">24/7 ONLINE</span></div>
+            <div class="info-card"><span style="color:#565f70;">BOT ALERT</span><span class="c-cyan">STANDBY</span></div>
             <div class="info-card"><span style="color:#565f70;">REGIME</span><span class="c-green">48H SMC</span></div>
             <div class="info-card"><span style="color:#565f70;">SHIELD</span><span class="c-green">ARMED 🛡️</span></div>
         </div>
@@ -343,22 +352,36 @@ ui_html = f"""
         const chart = LightweightCharts.createChart(container, {{
             layout: {{ background: {{ type: 'solid', color: '#080a0f' }}, textColor: '#64748b', fontSize: 10 }},
             grid: {{ vertLines: {{ color: 'rgba(255, 255, 255, 0.03)' }}, horzLines: {{ color: 'rgba(255, 255, 255, 0.03)' }} }},
-            rightPriceScale: {{ borderColor: '#161e2a' }},
+            rightPriceScale: {{ borderColor: '#161e2a', autoScale: true }},
             timeScale: {{ borderColor: '#161e2a', timeVisible: true, secondsVisible: false }}
         }});
 
         const candleSeries = chart.addCandlestickSeries({{
             upColor: '#089981', downColor: '#f23645', borderUpColor: '#089981', borderDownColor: '#f23645', wickUpColor: '#089981', wickDownColor: '#f23645'
         }});
-        if (candlesData.length > 0) candleSeries.setData(candlesData);
 
-        const ws = new WebSocket('wss://fstream.binance.com/ws/btcusdt@kline_5m');
+        if (candlesData && candlesData.length > 0) {{
+            candleSeries.setData(candlesData);
+            chart.timeScale().fitContent();
+        }}
+
+        // Direct Browser WebSocket for Instant Candle Rendering
+        let ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@kline_5m');
         ws.onmessage = (event) => {{
             const res = JSON.parse(event.data);
             const k = res.k;
             candleSeries.update({{
-                time: Math.floor(k.t / 1000), open: parseFloat(k.o), high: parseFloat(k.h), low: parseFloat(k.l), close: parseFloat(k.c)
+                time: Math.floor(k.t / 1000),
+                open: parseFloat(k.o),
+                high: parseFloat(k.h),
+                low: parseFloat(k.l),
+                close: parseFloat(k.c)
             }});
+        }};
+        ws.onclose = () => {{
+            setTimeout(() => {{
+                ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@kline_5m');
+            }}, 3000);
         }};
 
         function openVault() {{
