@@ -61,24 +61,23 @@ def save_vault(trade, exit_price, result, pnl, is_win):
     except Exception:
         pass
 
-# --- 2. MULTI-SOURCE ROBUST DATA FETCHER (PREVENTS BLANK CHART) ---
+# --- 2. MULTI-SOURCE ROBUST DATA FETCHER ---
 def get_historical_candles(limit=580):
     endpoints = [
-        f"https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=5m&limit={limit}",
-        f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=5m&limit={limit}",
         f"https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=5m&limit={limit}",
-        f"https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval=5m&limit={limit}"
+        f"https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=5m&limit={limit}",
+        f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=5m&limit={limit}"
     ]
     for url in endpoints:
         try:
-            r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3).json()
+            r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3.5).json()
             if isinstance(r, list) and len(r) > 100:
                 return [{"time": int(b[0]/1000), "open": float(b[1]), "high": float(b[2]), "low": float(b[3]), "close": float(b[4]), "vol": float(b[5])} for b in r]
         except Exception:
             continue
     return []
 
-# --- 3. BACKGROUND STRATEGY ENGINE ---
+# --- 3. BACKGROUND STRATEGY STATE MACHINE ---
 class BotEngine:
     def __init__(self):
         self.state = "SCANNING"
@@ -166,7 +165,7 @@ class BotEngine:
         msg = (
             f"🚨 <b>BTCUSDT {dir_type} PRE-SIGNAL ARMED</b> 🚨\n\n"
             f"⏱ <b>Timeframe:</b> 5M (48H Liquidity Sweep)\n"
-            f"🎯 <b>Action:</b> Reclaim Confirmation\n\n"
+            f"🎯 <b>Status:</b> Next-Candle Confirmed\n\n"
             f"🔹 <b>Entry:</b> ${entry:.2f}\n"
             f"🛑 <b>Stop Loss:</b> ${sl:.2f}\n"
             f"🎯 <b>Take Profit (2.5R):</b> ${tp:.2f}\n"
@@ -190,18 +189,18 @@ class BotEngine:
         self.state = "SCANNING"
         self.active_trade = None
 
-# Global Engine Instance
+# Global Engine
 if "bg_engine" not in st.session_state:
     st.session_state["bg_engine"] = BotEngine()
 engine = st.session_state["bg_engine"]
 
-# --- 4. SAFE BACKGROUND WORKER (ZERO SPAM) ---
+# --- 4. SAFE 24/7 BACKGROUND WORKER (ZERO SPAM) ---
 def run_worker_thread():
     async def kline_listener():
         while True:
             try:
                 async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect("wss://stream.binance.com:9443/ws/btcusdt@kline_5m") as ws:
+                    async with session.ws_connect("wss://fstream.binance.com/ws/btcusdt@kline_5m") as ws:
                         async for msg in ws:
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 data = json.loads(msg.data)
@@ -220,7 +219,7 @@ def run_worker_thread():
         while True:
             try:
                 async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect("wss://stream.binance.com:9443/ws/btcusdt@trade") as ws:
+                    async with session.ws_connect("wss://fstream.binance.com/ws/btcusdt@trade") as ws:
                         async for msg in ws:
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 data = json.loads(msg.data)
@@ -244,12 +243,11 @@ def run_worker_thread():
     asyncio.set_event_loop(loop)
     loop.run_until_complete(runner())
 
-# Prevent thread duplicates on Streamlit re-run
 if "worker_running" not in st.session_state:
     st.session_state["worker_running"] = True
     threading.Thread(target=run_worker_thread, daemon=True).start()
 
-# --- 5. STREAMLIT UI ---
+# --- 5. STREAMLIT UI (0-BLINK CLIENT ENGINE) ---
 st.set_page_config(page_title="BTCUSDT RADAR 48H", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown("""
@@ -261,7 +259,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Fetch Vault Stats
+# Vault Stats
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cur = conn.cursor()
 cur.execute("SELECT timestamp, direction, entry, result, pnl, is_win FROM vault ORDER BY id DESC")
@@ -273,7 +271,6 @@ conn.close()
 
 vault_json = json.dumps([{"time": r[0], "dir": r[1], "entry": r[2], "res": r[3], "pnl": r[4], "win": r[5]} for r in rows])
 
-# Fetch Chart Candles
 ui_candles = get_historical_candles(350)
 candles_json = json.dumps(ui_candles)
 
@@ -306,10 +303,10 @@ ui_html = f"""
 <body>
     <div class="top-bar">
         <div style="display:flex; align-items:center; gap:8px;">
-            <span class="badge-live">LIVE</span>
+            <span class="badge-live">LIVE FUTURES</span>
             <span class="badge-tf">5M • 48H</span>
             <div><span style="font-size:7px; color:#565f70; font-weight:700;">RADAR</span><div id="hud-status" class="c-yellow" style="font-weight:800; font-size:10px;">SCANNING</div></div>
-            <div><span style="font-size:7px; color:#565f70; font-weight:700;">ENTRY</span><div id="hud-entry" class="c-cyan" style="font-weight:800; font-size:10px;">--</div></div>
+            <div><span style="font-size:7px; color:#565f70; font-weight:700;">PRICE</span><div id="hud-live-price" class="c-cyan" style="font-weight:800; font-size:10px;">--</div></div>
             <div><span style="font-size:7px; color:#565f70; font-weight:700;">SL</span><div id="hud-sl" class="c-red" style="font-weight:800; font-size:10px;">--</div></div>
             <div><span style="font-size:7px; color:#565f70; font-weight:700;">TP</span><div id="hud-tp" class="c-green" style="font-weight:800; font-size:10px;">--</div></div>
         </div>
@@ -328,7 +325,7 @@ ui_html = f"""
         </div>
         <div class="bot-bar-2">
             <div class="info-card"><span style="color:#565f70;">SYSTEM</span><span class="c-green">24/7 ONLINE</span></div>
-            <div class="info-card"><span style="color:#565f70;">BOT ALERT</span><span class="c-cyan">STANDBY</span></div>
+            <div class="info-card"><span style="color:#565f70;">STREAM</span><span id="card-stream" class="c-cyan">FUTURES TICK</span></div>
             <div class="info-card"><span style="color:#565f70;">REGIME</span><span class="c-green">48H SMC</span></div>
             <div class="info-card"><span style="color:#565f70;">SHIELD</span><span class="c-green">ARMED 🛡️</span></div>
         </div>
@@ -348,6 +345,11 @@ ui_html = f"""
         const candlesData = {candles_json};
         const vaultTrades = {vault_json};
 
+        let currentBar = null;
+        if (candlesData.length > 0) {{
+            currentBar = {{ ...candlesData[candlesData.length - 1] }};
+        }}
+
         const container = document.getElementById('chart-container');
         const chart = LightweightCharts.createChart(container, {{
             layout: {{ background: {{ type: 'solid', color: '#080a0f' }}, textColor: '#64748b', fontSize: 10 }},
@@ -360,29 +362,53 @@ ui_html = f"""
             upColor: '#089981', downColor: '#f23645', borderUpColor: '#089981', borderDownColor: '#f23645', wickUpColor: '#089981', wickDownColor: '#f23645'
         }});
 
-        if (candlesData && candlesData.length > 0) {{
+        if (candlesData.length > 0) {{
             candleSeries.setData(candlesData);
             chart.timeScale().fitContent();
         }}
 
-        // Direct Browser WebSocket for Instant Candle Rendering
-        let ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@kline_5m');
-        ws.onmessage = (event) => {{
-            const res = JSON.parse(event.data);
-            const k = res.k;
-            candleSeries.update({{
-                time: Math.floor(k.t / 1000),
-                open: parseFloat(k.o),
-                high: parseFloat(k.h),
-                low: parseFloat(k.l),
-                close: parseFloat(k.c)
-            }});
-        }};
-        ws.onclose = () => {{
-            setTimeout(() => {{
-                ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@kline_5m');
-            }}, 3000);
-        }};
+        // --- DUAL LOW-LATENCY WEBSOCKETS (0-BLINK REAL-TIME ENGINE) ---
+        let wsKline = null;
+        let wsTrade = null;
+
+        function connectStreams() {{
+            // 1. 5M Kline WebSocket
+            wsKline = new WebSocket('wss://fstream.binance.com/ws/btcusdt@kline_5m');
+            wsKline.onmessage = (event) => {{
+                const res = JSON.parse(event.data);
+                const k = res.k;
+                const candleTime = Math.floor(k.t / 1000);
+                
+                currentBar = {{
+                    time: candleTime,
+                    open: parseFloat(k.o),
+                    high: parseFloat(k.h),
+                    low: parseFloat(k.l),
+                    close: parseFloat(k.c)
+                }};
+                candleSeries.update(currentBar);
+            }};
+            wsKline.onclose = () => {{ setTimeout(connectStreams, 2500); }};
+
+            // 2. Real-Time Tick Stream for Smooth Price & Candle Update (Zero-Blink)
+            wsTrade = new WebSocket('wss://fstream.binance.com/ws/btcusdt@trade');
+            wsTrade.onmessage = (event) => {{
+                const t = JSON.parse(event.data);
+                const livePrice = parseFloat(t.p);
+                document.getElementById('hud-live-price').innerText = "$" + livePrice.toFixed(1);
+
+                if (currentBar) {{
+                    let updated = false;
+                    if (livePrice > currentBar.high) {{ currentBar.high = livePrice; updated = true; }}
+                    if (livePrice < currentBar.low) {{ currentBar.low = livePrice; updated = true; }}
+                    currentBar.close = livePrice;
+                    candleSeries.update(currentBar);
+                }}
+            }};
+            wsTrade.onclose = () => {{ setTimeout(connectStreams, 2500); }};
+        }}
+
+        connectStreams();
 
         function openVault() {{
             document.getElementById('vaultModal').style.display = 'flex';
