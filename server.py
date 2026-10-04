@@ -9,14 +9,14 @@ import threading
 from datetime import datetime, timezone
 
 # ============================================================
-# BTCUSDT INSTITUTIONAL SMC PRO TERMINAL (MOBILE + DESKTOP ADAPTIVE)
+# BTCUSDT INSTITUTIONAL SMC PRO TERMINAL (WITH PERSISTENT VAULT)
 # ============================================================
 
 BOT_TOKEN = "8941403990:AAGLH_dupqmGoipglhVvRuiPBzvgMqJR3Ms"
 CHAT_ID = "7886716805"
 DB_FILE = "smc_quant_vault.db"
 
-# --- 1. SQLITE VAULT SETUP ---
+# --- 1. PERSISTENT SQLITE VAULT SETUP ---
 def init_db():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     cur = conn.cursor()
@@ -54,7 +54,7 @@ def send_telegram(msg):
 
 def save_vault(trade, exit_price, result, pnl_r):
     try:
-        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        conn = sqlite3.connect(DB_FILE, check_same_thread=False, isolation_level=None)
         cur = conn.cursor()
         cur.execute('''
             INSERT INTO trades (timestamp, tf_tier, direction, setup_name, score, entry, sl, tp1, tp2, tp3, exit, result, pnl_r, confluence)
@@ -68,6 +68,17 @@ def save_vault(trade, exit_price, result, pnl_r):
         conn.close()
     except Exception:
         pass
+
+def get_vault_history():
+    try:
+        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        cur = conn.cursor()
+        cur.execute("SELECT timestamp, tf_tier, direction, setup_name, score, entry, exit, result, pnl_r, confluence FROM trades ORDER BY id DESC LIMIT 50")
+        rows = cur.fetchall()
+        conn.close()
+        return rows
+    except Exception:
+        return []
 
 # --- 2. DATA FETCHER ---
 def fetch_klines(symbol="BTCUSDT", interval="15m", limit=350):
@@ -247,6 +258,17 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
+vault_rows = get_vault_history()
+total_trades = len(vault_rows)
+wins = sum(1 for r in vault_rows if r[8] > 0)
+win_rate = int((wins / total_trades) * 100) if total_trades > 0 else 0
+net_r = sum(r[8] for r in vault_rows) if total_trades > 0 else 0.0
+
+vault_json = json.dumps([
+    {"time": r[0], "tf": r[1], "dir": r[2], "setup": r[3], "score": r[4], "entry": r[5], "exit": r[6], "res": r[7], "pnl": r[8], "conf": r[9]}
+    for r in vault_rows
+])
+
 ui_candles = fetch_klines("BTCUSDT", "15m", 350)
 candles_json = json.dumps(ui_candles)
 
@@ -274,8 +296,8 @@ ui_html = f"""
         .nav-stat {{ display:flex; flex-direction:column; line-height:1.1; }}
         .stat-label {{ font-size:7.5px; color:#5b6473; font-weight:700; }}
         .stat-val {{ font-size:10px; font-weight:700; }}
-        .info-toggle-btn {{
-            background:#16202f; border:1px solid #233147; color:#38bdf8; padding:3px 7px;
+        .btn-ui {{
+            background:#16202f; border:1px solid #233147; color:#38bdf8; padding:3px 8px;
             border-radius:4px; font-size:9.5px; font-weight:700; cursor:pointer; display:flex; align-items:center; gap:4px;
         }}
         .c-green {{ color:#089981 !important; }}
@@ -286,13 +308,13 @@ ui_html = f"""
         /* MAIN TERMINAL BODY */
         .terminal-body {{ display:flex; flex:1; height:calc(100vh - 38px); overflow:hidden; position:relative; }}
 
-        /* DESKTOP LEFT TOOLBAR (Auto-hidden on phone) */
+        /* DESKTOP LEFT TOOLBAR */
         .left-toolbar {{
             width:36px; background:#0c1017; border-right:1px solid #161e2a;
             display:flex; flex-direction:column; align-items:center; padding-top:6px; gap:12px; color:#6b7280; font-size:11px;
         }}
 
-        /* CHART WORKSPACE: FULL 100% WIDTH ON MOBILE */
+        /* CHART WORKSPACE */
         .chart-workspace {{ flex:1; display:flex; flex-direction:column; position:relative; background:#06080d; overflow:hidden; width:100%; }}
         .chart-legend {{
             position:absolute; top:4px; left:8px; z-index:10; font-size:9px;
@@ -316,26 +338,25 @@ ui_html = f"""
         .grid-row .label {{ color:#7e8796; }}
         .grid-row .val {{ font-weight:700; color:#d1d5db; }}
 
-        /* MODAL POPUP FOR MOBILE STATS */
+        /* MODAL POPUPS */
         .modal-drawer {{
             display:none; position:fixed; top:0; left:0; width:100vw; height:100vh;
-            background:rgba(0,0,0,0.85); z-index:999999; align-items:center; justify-content:center; padding:14px;
+            background:rgba(0,0,0,0.88); z-index:999999; align-items:center; justify-content:center; padding:14px;
         }}
         .drawer-box {{
             background:#0b0f16; border:1px solid #1c2636; border-radius:8px;
-            width:100%; max-width:380px; max-height:85vh; overflow-y:auto; padding:12px;
+            width:100%; max-width:420px; max-height:85vh; overflow-y:auto; padding:12px;
         }}
 
-        /* MOBILE MEDIA QUERY BREAKPOINT (< 768px) */
+        /* MOBILE RESPONSIVE MEDIA QUERIES */
         @media (max-width: 768px) {{
             .left-toolbar {{ display:none !important; }}
             .right-sidebar {{ display:none !important; }}
-            .nav-center {{ display:none !important; }}
             .chart-workspace {{ width:100vw !important; }}
             #live-ist-clock {{ display:none !important; }}
         }}
         @media (min-width: 769px) {{
-            .info-toggle-btn {{ display:none !important; }}
+            .mobile-only-btn {{ display:none !important; }}
         }}
     </style>
 </head>
@@ -358,15 +379,15 @@ ui_html = f"""
 
         <div class="nav-right">
             <div class="nav-stat"><span class="stat-label">Price</span><span id="nav-price" class="stat-val c-green">104,628.4</span></div>
-            <div class="nav-stat"><span class="stat-label">24h</span><span class="stat-val c-red">-1.24%</span></div>
-            <button class="info-toggle-btn" onclick="toggleMobileStats()"><i class="fa-solid fa-chart-pie"></i> STATS</button>
+            <button class="btn-ui" onclick="toggleVaultHistory()"><i class="fa-solid fa-scroll"></i> VAULT ({total_trades})</button>
+            <button class="btn-ui mobile-only-btn" onclick="toggleMobileStats()"><i class="fa-solid fa-chart-pie"></i> STATS</button>
             <div id="live-ist-clock" style="color:#808a9d; font-size:10px; font-weight:600;">12:34 (IST)</div>
         </div>
     </div>
 
     <!-- TERMINAL MAIN BODY -->
     <div class="terminal-body">
-        <!-- LEFT DRAWING TOOLS (VISIBLE ON DESKTOP) -->
+        <!-- LEFT DRAWING TOOLS -->
         <div class="left-toolbar">
             <i class="fa-solid fa-crosshairs tool-icon" style="color:#38bdf8;"></i>
             <i class="fa-solid fa-pen tool-icon"></i>
@@ -376,7 +397,7 @@ ui_html = f"""
             <i class="fa-solid fa-trash tool-icon" style="margin-top:auto; margin-bottom:10px;"></i>
         </div>
 
-        <!-- CENTER MULTI-PANE CHART WORKSPACE (100% WIDTH ON MOBILE) -->
+        <!-- CENTER CHART WORKSPACE -->
         <div class="chart-workspace">
             <div class="chart-legend">
                 <div class="legend-row">
@@ -396,8 +417,8 @@ ui_html = f"""
             <div id="chart-vol"></div>
         </div>
 
-        <!-- RIGHT SIDEBAR (VISIBLE ON DESKTOP ONLY) -->
-        <div class="right-sidebar" id="desktop-sidebar">
+        <!-- RIGHT SIDEBAR -->
+        <div class="right-sidebar">
             <div class="panel-box">
                 <div class="panel-title">MARKET INFO</div>
                 <div class="grid-row"><span class="label">Price</span><span id="side-price" class="val c-green">104,628.4</span></div>
@@ -418,11 +439,27 @@ ui_html = f"""
                 <div class="grid-row"><span class="label">1H Low</span><span id="side-1l" class="val c-green">103,860.5</span></div>
             </div>
             <div class="panel-box">
-                <div class="panel-title">KEY INDICATORS</div>
-                <div class="grid-row"><span class="label">RSI (14)</span><span class="val c-cyan">56.21</span></div>
-                <div class="grid-row"><span class="label">MACD</span><span class="val c-green">12.4</span></div>
-                <div class="grid-row"><span class="label">ATR (14)</span><span class="val c-red">138.6</span></div>
+                <div class="panel-title">QUANT VAULT STATS</div>
+                <div class="grid-row"><span class="label">Win Rate</span><span class="val c-green">{win_rate}%</span></div>
+                <div class="grid-row"><span class="label">Net Realized</span><span class="val c-cyan">{net_r:+.1f}R</span></div>
+                <div class="grid-row"><span class="label">Recorded Trades</span><span class="val">{total_trades}</span></div>
             </div>
+        </div>
+    </div>
+
+    <!-- VAULT HISTORY MODAL -->
+    <div id="vaultHistoryDrawer" class="modal-drawer">
+        <div class="drawer-box">
+            <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #1f2937; padding-bottom:8px; margin-bottom:8px;">
+                <span style="font-weight:bold; font-size:12px; color:#fff;">📜 QUANT TRADING VAULT HISTORY</span>
+                <span style="cursor:pointer; font-weight:bold; font-size:14px;" onclick="toggleVaultHistory()">✕</span>
+            </div>
+            <div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:6px; margin-bottom:10px; font-size:9px;">
+                <div style="background:#090d14; padding:6px; border-radius:4px; border:1px solid #161e2a;"><span style="color:#64748b;">WIN RATE</span><div class="c-green" style="font-size:12px; font-weight:bold;">{win_rate}%</div></div>
+                <div style="background:#090d14; padding:6px; border-radius:4px; border:1px solid #161e2a;"><span style="color:#64748b;">NET R</span><div class="c-cyan" style="font-size:12px; font-weight:bold;">{net_r:+.1f}R</div></div>
+                <div style="background:#090d14; padding:6px; border-radius:4px; border:1px solid #161e2a;"><span style="color:#64748b;">TRADES</span><div class="c-yellow" style="font-size:12px; font-weight:bold;">{total_trades}</div></div>
+            </div>
+            <div id="vaultListContainer" style="max-height: 280px; overflow-y: auto;"></div>
         </div>
     </div>
 
@@ -446,16 +483,12 @@ ui_html = f"""
                 <div class="grid-row"><span class="label">1H High</span><span id="mob-1h" class="val c-red">--</span></div>
                 <div class="grid-row"><span class="label">1H Low</span><span id="mob-1l" class="val c-green">--</span></div>
             </div>
-            <div class="panel-box" style="border-bottom:none;">
-                <div class="panel-title">SYSTEM STATUS</div>
-                <div class="grid-row"><span class="label">TELEGRAM ALERT</span><span class="val c-green">24/7 ACTIVE</span></div>
-                <div class="grid-row"><span class="label">SL / TP TRACKER</span><span class="val c-cyan">ARMED</span></div>
-            </div>
         </div>
     </div>
 
     <script>
         const rawCandles = {candles_json};
+        const vaultTrades = {vault_json};
         const localOffsetSeconds = 5.5 * 3600;
 
         function align15m(ts) {{ return Math.floor(ts / 900) * 900; }}
@@ -561,14 +594,13 @@ ui_html = f"""
             time: c.time, value: c.vol, color: c.close >= c.open ? 'rgba(8, 153, 129, 0.5)' : 'rgba(242, 54, 69, 0.5)'
         }})));
 
-        // SYNC TIMESCALE ACROSS ALL 4 PANES
+        // SYNC TIMESCALE
         mainChart.timeScale().subscribeVisibleLogicalRangeChange(r => {{
             rsiChart.timeScale().setVisibleLogicalRange(r);
             macdChart.timeScale().setVisibleLogicalRange(r);
             volChart.timeScale().setVisibleLogicalRange(r);
         }});
 
-        // AUTO-RESIZE CHART ON MOBILE ROTATION OR RESIZE
         window.addEventListener('resize', () => {{
             const w = mainEl.clientWidth;
             mainChart.applyOptions({{ width: w }});
@@ -577,9 +609,40 @@ ui_html = f"""
             volChart.applyOptions({{ width: w }});
         }});
 
+        // POPUP TOGGLES
         function toggleMobileStats() {{
             const drawer = document.getElementById('mobileDrawer');
             drawer.style.display = drawer.style.display === 'flex' ? 'none' : 'flex';
+        }}
+
+        function toggleVaultHistory() {{
+            const drawer = document.getElementById('vaultHistoryDrawer');
+            if (drawer.style.display === 'flex') {{
+                drawer.style.display = 'none';
+            }} else {{
+                drawer.style.display = 'flex';
+                renderVaultList();
+            }}
+        }}
+
+        function renderVaultList() {{
+            const container = document.getElementById('vaultListContainer');
+            if (!vaultTrades || vaultTrades.length === 0) {{
+                container.innerHTML = '<div style="font-size:10px; color:#64748b; text-align:center; padding:20px;">No trades executed yet. Scanner active...</div>';
+                return;
+            }}
+            let html = '';
+            vaultTrades.forEach(t => {{
+                html += `
+                    <div style="padding:6px 0; border-bottom:1px solid #161e2a; font-size:9.5px;">
+                        <div style="display:flex; justify-content:space-between; margin-bottom:2px;">
+                            <span>${{t.time}} <b style="color:#fbbf24">[${{t.tf}}]</b> <b style="color:${{t.dir === 'LONG' ? '#089981' : '#f43f5e'}}">${{t.dir}}</b> @ ${{t.entry.toFixed(1)}}</span>
+                            <span style="font-weight:bold; color:${{t.pnl >= 0 ? '#089981' : '#f43f5e'}}">${{t.res}} (${{t.pnl >= 0 ? '+' : ''}}${{t.pnl}}R)</span>
+                        </div>
+                        <div style="color:#64748b; font-size:8.5px;">Exit: $${{t.exit.toFixed(1)}} | Score: <b style="color:#38bdf8">${{t.score}}/105</b></div>
+                    </div>`;
+            }});
+            container.innerHTML = html;
         }}
 
         // REAL-TIME WEBSOCKET TICKS
