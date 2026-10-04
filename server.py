@@ -3,7 +3,6 @@ import streamlit.components.v1 as components
 import requests
 import json
 import sqlite3
-from datetime import datetime
 
 st.set_page_config(
     page_title="BTCUSDT RADAR 48H",
@@ -11,7 +10,6 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# Full Viewport Styling (No Streamlit Bars)
 st.markdown("""
     <style>
         header, footer, #MainMenu { visibility: hidden !important; height: 0 !important; }
@@ -21,7 +19,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Database Setup
+# Database
 conn = sqlite3.connect('trades_vault.db', check_same_thread=False)
 cur = conn.cursor()
 cur.execute('''
@@ -47,37 +45,23 @@ vault_json = json.dumps([
     {"time": r[0], "dir": r[1], "entry": r[2], "res": r[3], "pnl": r[4], "win": r[5]} for r in rows
 ])
 
-# Fetch Fresh 48H 5M Candles (Last 350 bars for perfect screen density)
 def fetch_candles():
     url = "https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=350"
     try:
         r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3.5).json()
         if isinstance(r, list) and len(r) > 20:
-            data = []
-            for b in r:
-                data.append({
-                    "time": int(b[0] / 1000),
-                    "open": float(b[1]),
-                    "high": float(b[2]),
-                    "low": float(b[3]),
-                    "close": float(b[4])
-                })
-            return data
+            return [{"time": int(b[0]/1000), "open": float(b[1]), "high": float(b[2]), "low": float(b[3]), "close": float(b[4])} for b in r]
     except Exception:
         pass
-    return []
-
-candles = fetch_candles()
-if not candles:
     try:
         r = requests.get("https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=350", timeout=3.5).json()
-        candles = [{"time": int(b[0]/1000), "open": float(b[1]), "high": float(b[2]), "low": float(b[3]), "close": float(b[4])} for b in r]
+        return [{"time": int(b[0]/1000), "open": float(b[1]), "high": float(b[2]), "low": float(b[3]), "close": float(b[4])} for b in r]
     except Exception:
-        candles = []
+        return []
 
+candles = fetch_candles()
 candles_json = json.dumps(candles)
 
-# Native Lightweight Charts Engine (Zero Blink, Touch-Zoom, Live Binance WebSocket)
 custom_app_html = f"""
 <!DOCTYPE html>
 <html lang="en">
@@ -87,13 +71,13 @@ custom_app_html = f"""
     <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
-        body {{ background-color: #080a0f; color: #d1d4dc; overflow: hidden; height: 100vh; display: flex; flex-direction: column; }}
+        body {{ background-color: #080a0f; color: #d1d4dc; overflow: hidden; height: 100vh; display: flex; flex-direction: column; justify-content: space-between; }}
 
-        /* Top HUD */
+        /* Top HUD Bar */
         .top-bar {{
             display: flex; justify-content: space-between; align-items: center;
             padding: 6px 8px; background: #0d1118; border-bottom: 1px solid rgba(255,255,255,0.06);
-            height: 42px; font-size: 10px; flex-shrink: 0;
+            height: 40px; font-size: 10px; flex-shrink: 0;
         }}
         .bar-left {{ display: flex; align-items: center; gap: 8px; }}
         .badge-live {{ background: #089981; color: #fff; font-size: 8px; font-weight: 800; padding: 2px 4px; border-radius: 2px; }}
@@ -107,35 +91,43 @@ custom_app_html = f"""
             padding: 3px 8px; border-radius: 4px; font-size: 10px; font-weight: 700; cursor: pointer;
         }}
 
-        /* Signal Confluence Basis Badge */
         .basis-badge {{
-            position: absolute; top: 48px; left: 8px; z-index: 10;
+            position: absolute; top: 46px; left: 8px; z-index: 10;
             background: rgba(13, 17, 24, 0.9); border: 1px solid #232f42;
             padding: 4px 8px; border-radius: 4px; font-size: 9px; font-weight: 700;
             color: #64748b; pointer-events: none;
         }}
 
-        /* Chart Canvas */
+        /* Exact Green Line Height Chart */
         #chart-container {{
-            flex: 1; width: 100vw; position: relative;
+            width: 100vw;
+            height: 68vh;
+            position: relative;
         }}
 
-        /* Bottom Controls */
+        /* Bottom Control Panels (Green Line ke theek niche) */
+        .bottom-section {{
+            display: flex;
+            flex-direction: column;
+            width: 100vw;
+            background: #080a0f;
+            flex-shrink: 0;
+        }}
         .bot-bar-1 {{
             display: flex; justify-content: space-between; align-items: center;
-            padding: 4px 8px; background: #0b0f16; border-top: 1px solid rgba(255,255,255,0.06);
-            height: 32px; font-size: 9px; flex-shrink: 0;
+            padding: 5px 8px; background: #0b0f16; border-top: 1px solid rgba(255,255,255,0.06);
+            font-size: 9px;
         }}
         .bot-bar-2 {{
             display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px;
-            padding: 3px 6px 6px 6px; background: #06080c; height: 38px; font-size: 8px; flex-shrink: 0;
+            padding: 4px 6px 8px 6px; background: #06080c; font-size: 8px;
         }}
         .info-card {{
-            background: #0d121a; border: 1px solid #161e2a; padding: 2px 4px;
+            background: #0d121a; border: 1px solid #161e2a; padding: 4px;
             border-radius: 3px; display: flex; flex-direction: column;
         }}
 
-        /* Modal Overlay */
+        /* Modal */
         .modal {{
             display: none; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
             background: rgba(0,0,0,0.85); z-index: 999999; align-items: center; justify-content: center; padding: 16px;
@@ -178,25 +170,27 @@ custom_app_html = f"""
         <button class="vault-btn" onclick="openVault()">📜 VAULT ({total_trades})</button>
     </div>
 
-    <!-- BASIS HUD -->
+    <!-- BASIS BADGE -->
     <div id="basis-box" class="basis-badge">SCANNING: Awaiting 48H Sweep / Structure Shift</div>
 
-    <!-- NATIVE CHART (ZERO BLINK + FULL TOUCH ZOOM) -->
+    <!-- CHART AREA (Fits at Green Line) -->
     <div id="chart-container"></div>
 
-    <!-- BOTTOM HUD -->
-    <div class="bot-bar-1">
-        <div>ACCOUNT: <span class="c-green">$10.00 BASE</span> | ALLOCATION: <span class="c-cyan">$2.50 (10x)</span></div>
-        <div style="display:flex; gap:6px;">
-            <span style="border:1px solid rgba(202,138,4,0.4); color:#fbbf24; padding:2px 5px; border-radius:2px; font-weight:700;">⚡ FORCE CLOSE</span>
-            <span style="border:1px solid rgba(220,38,38,0.4); color:#f87171; padding:2px 5px; border-radius:2px; font-weight:700;">🚨 KILL SWITCH</span>
+    <!-- BOTTOM CONTROLS & SCANNER PANELS -->
+    <div class="bottom-section">
+        <div class="bot-bar-1">
+            <div>ACCOUNT: <span class="c-green">$10.00 BASE</span> | ALLOCATION: <span class="c-cyan">$2.50 (10x)</span></div>
+            <div style="display:flex; gap:6px;">
+                <span style="border:1px solid rgba(202,138,4,0.4); color:#fbbf24; padding:2px 5px; border-radius:2px; font-weight:700;">⚡ FORCE CLOSE</span>
+                <span style="border:1px solid rgba(220,38,38,0.4); color:#f87171; padding:2px 5px; border-radius:2px; font-weight:700;">🚨 KILL SWITCH</span>
+            </div>
         </div>
-    </div>
-    <div class="bot-bar-2">
-        <div class="info-card"><span style="color:#565f70;">THREAD 3 RISK</span><span class="c-green">-$2.00 GUARD</span></div>
-        <div class="info-card"><span style="color:#565f70;">FILTERS</span><span class="c-cyan">48H • BOS • APR</span></div>
-        <div class="info-card"><span style="color:#565f70;">REGIME</span><span id="hud-regime" class="c-green">PULLBACK REGIME</span></div>
-        <div class="info-card"><span style="color:#565f70;">SCANNER</span><span id="hud-scanner" class="c-yellow">SCANNING</span></div>
+        <div class="bot-bar-2">
+            <div class="info-card"><span style="color:#565f70;">THREAD 3 RISK</span><span class="c-green">-$2.00 GUARD</span></div>
+            <div class="info-card"><span style="color:#565f70;">FILTERS</span><span class="c-cyan">48H • BOS • APR</span></div>
+            <div class="info-card"><span style="color:#565f70;">REGIME</span><span id="hud-regime" class="c-green">PULLBACK REGIME</span></div>
+            <div class="info-card"><span style="color:#565f70;">SCANNER</span><span id="hud-scanner" class="c-yellow">SCANNING</span></div>
+        </div>
     </div>
 
     <!-- VAULT MODAL -->
@@ -233,13 +227,13 @@ custom_app_html = f"""
             rightPriceScale: {{
                 borderColor: '#161e2a',
                 autoScale: true,
-                scaleMargins: {{ top: 0.1, bottom: 0.1 }},
+                scaleMargins: {{ top: 0.1, bottom: 0.05 }},
             }},
             timeScale: {{
                 borderColor: '#161e2a',
                 timeVisible: true,
                 secondsVisible: false,
-                barSpacing: 8,
+                barSpacing: 9,
                 minBarSpacing: 2,
                 fixLeftEdge: true,
                 rightOffset: 5,
@@ -262,13 +256,11 @@ custom_app_html = f"""
             chart.timeScale().fitContent();
         }}
 
-        // Dynamic State
         let activeSignal = null;
         let tpLine = null, entryLine = null, slLine = null;
 
         function checkStrategyRules(curCandle, prevCandle) {{
             if (!candlesData || candlesData.length < 50) return;
-            
             let h48 = Math.max(...candlesData.map(c => c.high));
             let l48 = Math.min(...candlesData.map(c => c.low));
             let atr = Math.max(curCandle.high - curCandle.low, 80.0);
@@ -290,7 +282,6 @@ custom_app_html = f"""
 
         function armSignal(direction, entry, sl, tp, basis) {{
             activeSignal = {{ dir: direction, entry: entry.toFixed(1), sl: sl.toFixed(1), tp: tp.toFixed(1) }};
-            
             document.getElementById('hud-status').innerText = "PRE-SIGNAL " + direction;
             document.getElementById('hud-status').className = direction === "LONG" ? "hud-val c-green" : "hud-val c-red";
             document.getElementById('hud-scanner').innerText = "ACTIVE " + direction;
@@ -325,7 +316,6 @@ custom_app_html = f"""
             document.getElementById('basis-box').style.borderColor = "#232f42";
         }}
 
-        // REAL-TIME WEBSOCKET (0% BLINKING, CONTINUOUS IN-BROWSER TICKS)
         const ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@kline_5m');
         ws.onmessage = (event) => {{
             const res = JSON.parse(event.data);
@@ -343,13 +333,12 @@ custom_app_html = f"""
             }}
         }};
 
-        // Modal Controls
         function openVault() {{
             document.getElementById('vaultModal').style.display = 'flex';
             const list = document.getElementById('vaultList');
             list.innerHTML = '';
             if (vaultTrades.length === 0) {{
-                list.innerHTML = '<div style="font-size:10px; color:#565f70; text-align:center; padding:15px;">No closed trades yet. Monitoring 48H institutional sweeps...</div>';
+                list.innerHTML = '<div style="font-size:10px; color:#565f70; text-align:center; padding:15px;">No closed trades yet. Monitoring 48H sweeps...</div>';
             }} else {{
                 vaultTrades.forEach(t => {{
                     const clr = t.win === 1 ? '#089981' : '#f23645';
