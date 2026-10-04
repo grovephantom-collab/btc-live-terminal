@@ -1,753 +1,557 @@
-import os
-import json
-import time
-import sqlite3
-import threading
-from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
-
-import requests
-import pandas as pd
-import numpy as np
 import streamlit as st
-import plotly.graph_objects as go
+import streamlit.components.v1 as components
+import requests
+import json
+import sqlite3
+import asyncio
+import aiohttp
+import threading
+from datetime import datetime
 
-# ============================================================
-# BTCUSDT SMC RADAR — COMPLETE SINGLE FILE STREAMLIT ENGINE
-# Public Binance Futures data + Telegram + SQLite Vault
-# ============================================================
+# --- CONFIGURATION & TELEGRAM ---
+BOT_TOKEN = "8941403990:AAGLH_dupqmGoipglhVvRuiPBzvgMqJR3Ms"
+CHAT_ID = "7886716805"
+DB_FILE = "trades_vault.db"
 
-st.set_page_config(
-    page_title="BTCUSDT SMC RADAR",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
-
-SYMBOL = "BTCUSDT"
-BASE = "https://fapi.binance.com"
-DB_FILE = os.getenv("SMC_DB_FILE", "smc_vault.db")
-
-# HARDCODED INTEGRATED TELEGRAM DETAILS
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8941403990:AAGLH_dupqmGoipglhVvRuiPBzvgMqJR3Ms")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7886716805")
-
-TF_LIMITS = {
-    "5m": 800,
-    "15m": 500,
-    "1h": 500,
-    "4h": 300,
-}
-
-LOCK = threading.RLock()
-
-
-# ----------------------------- UTILITIES -----------------------------
-
-def now_utc():
-    return datetime.now(timezone.utc)
-
-
-def fmt_price(x):
-    return f"${x:,.2f}" if x is not None and not np.isnan(x) else "--"
-
-
-def safe_float(x, default=np.nan):
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-
-def telegram(msg: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
-            timeout=5,
+# --- 1. SQLITE VAULT SETUP ---
+def init_db():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    cur = conn.cursor()
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS vault (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            tf_tier TEXT,
+            direction TEXT,
+            entry REAL,
+            sl REAL,
+            tp1 REAL,
+            tp2 REAL,
+            tp3 REAL,
+            exit REAL,
+            result TEXT,
+            pnl TEXT,
+            is_win INTEGER
         )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+def send_telegram(msg):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"}
+    try:
+        requests.post(url, json=payload, timeout=4)
     except Exception:
         pass
 
-
-# ----------------------------- DATABASE -----------------------------
-
-def db_init():
-    with sqlite3.connect(DB_FILE, timeout=10) as con:
-        con.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL,
-            setup TEXT NOT NULL,
-            direction TEXT NOT NULL,
-            score INTEGER NOT NULL,
-            entry REAL NOT NULL,
-            sl REAL NOT NULL,
-            tp1 REAL NOT NULL,
-            tp2 REAL NOT NULL,
-            tp3 REAL NOT NULL,
-            exit REAL,
-            result TEXT,
-            pnl_r REAL,
-            notes TEXT
-        )
-        """)
-        con.commit()
-
-
-def db_insert_trade(t):
-    with sqlite3.connect(DB_FILE, timeout=10) as con:
-        con.execute("""
-        INSERT INTO trades
-        (created_at,setup,direction,score,entry,sl,tp1,tp2,tp3,exit,result,pnl_r,notes)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            t.created_at, t.setup, t.direction, t.score,
-            t.entry, t.sl, t.tp1, t.tp2, t.tp3,
-            None, "OPEN", None, t.notes
+def save_vault(trade, exit_price, result, pnl, is_win):
+    try:
+        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        cur = conn.cursor()
+        cur.execute('''
+            INSERT INTO vault (timestamp, tf_tier, direction, entry, sl, tp1, tp2, tp3, exit, result, pnl, is_win)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            trade['time'], trade.get('tier', 'MULTI'), trade['dir'], trade['entry'],
+            trade['sl'], trade['tp1'], trade['tp2'], trade['tp3'], exit_price, result, pnl, is_win
         ))
-        con.commit()
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
-
-def db_close_trade(exit_price, result, pnl_r):
-    with sqlite3.connect(DB_FILE, timeout=10) as con:
-        row = con.execute(
-            "SELECT id FROM trades WHERE result='OPEN' ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        if row:
-            con.execute("""
-                UPDATE trades SET exit=?, result=?, pnl_r=? WHERE id=?
-            """, (exit_price, result, pnl_r, row[0]))
-            con.commit()
-
-
-def db_rows():
-    with sqlite3.connect(DB_FILE, timeout=10) as con:
-        return con.execute("""
-            SELECT created_at,setup,direction,score,entry,sl,tp1,tp2,tp3,
-                   exit,result,pnl_r,notes
-            FROM trades ORDER BY id DESC LIMIT 50
-        """).fetchall()
-
-
-# ----------------------------- BINANCE DATA -----------------------------
-
-class BinanceClient:
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "BTCUSDT-SMC-RADAR/1.0"})
-
-    def klines(self, interval, limit=500):
-        url = f"{BASE}/fapi/v1/klines"
-        r = self.session.get(
-            url,
-            params={"symbol": SYMBOL, "interval": interval, "limit": limit},
-            timeout=8,
-        )
-        r.raise_for_status()
-        raw = r.json()
-
-        cols = [
-            "open_time", "open", "high", "low", "close", "volume",
-            "close_time", "quote_volume", "trades", "taker_buy_base",
-            "taker_buy_quote", "ignore"
-        ]
-        df = pd.DataFrame(raw, columns=cols)
-        for c in ["open", "high", "low", "close", "volume"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-        df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
-        return df[["open_time","close_time","open","high","low","close","volume"]].copy()
-
-    def ticker(self):
-        r = self.session.get(
-            f"{BASE}/fapi/v1/ticker/price",
-            params={"symbol": SYMBOL},
-            timeout=5,
-        )
-        r.raise_for_status()
-        return float(r.json()["price"])
-
-    def funding(self):
-        r = self.session.get(
-            f"{BASE}/fapi/v1/premiumIndex",
-            params={"symbol": SYMBOL},
-            timeout=5,
-        )
-        r.raise_for_status()
-        j = r.json()
-        return safe_float(j.get("lastFundingRate"), 0.0)
-
-    def open_interest(self):
-        r = self.session.get(
-            f"{BASE}/fapi/v1/openInterest",
-            params={"symbol": SYMBOL},
-            timeout=5,
-        )
-        r.raise_for_status()
-        return safe_float(r.json().get("openInterest"), 0.0)
-
-
-# ----------------------------- SMC INDICATORS -----------------------------
-
-def atr(df, period=14):
-    prev = df["close"].shift(1)
-    tr = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - prev).abs(),
-        (df["low"] - prev).abs()
-    ], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
-
-
-def ema(df, n):
-    return df["close"].ewm(span=n, adjust=False).mean()
-
-
-def rsi(df, n=14):
-    d = df["close"].diff()
-    up = d.clip(lower=0).ewm(alpha=1/n, adjust=False).mean()
-    down = (-d.clip(upper=0)).ewm(alpha=1/n, adjust=False).mean()
-    rs = up / down.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-
-def adx(df, n=14):
-    h, l, c = df["high"], df["low"], df["close"]
-    up = h.diff()
-    down = -l.diff()
-    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
-    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-    tr = pd.concat([
-        h-l, (h-c.shift()).abs(), (l-c.shift()).abs()
-    ], axis=1).max(axis=1)
-    atrv = tr.ewm(alpha=1/n, adjust=False).mean()
-    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1/n, adjust=False).mean() / atrv
-    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1/n, adjust=False).mean() / atrv
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    return dx.ewm(alpha=1/n, adjust=False).mean()
-
-
-def swings(df, left=3, right=3):
-    highs, lows = [], []
-    h = df["high"].values
-    l = df["low"].values
-    for i in range(left, len(df)-right):
-        if h[i] == max(h[i-left:i+right+1]):
-            highs.append((i, h[i]))
-        if l[i] == min(l[i-left:i+right+1]):
-            lows.append((i, l[i]))
-    return highs, lows
-
-
-def structure_state(df):
-    if len(df) < 30:
-        return {"trend": "UNKNOWN", "bos": None, "choch": None, "last_swing_high": None, "last_swing_low": None}
-
-    highs, lows = swings(df.tail(180).reset_index(drop=True), 3, 3)
-    if len(highs) < 2 or len(lows) < 2:
-        return {"trend": "RANGE", "bos": None, "choch": None, "last_swing_high": None, "last_swing_low": None}
-
-    h1, h2 = highs[-2][1], highs[-1][1]
-    l1, l2 = lows[-2][1], lows[-1][1]
-    last = float(df["close"].iloc[-1])
-
-    if h2 > h1 and l2 > l1:
-        trend = "BULL"
-    elif h2 < h1 and l2 < l1:
-        trend = "BEAR"
-    else:
-        trend = "RANGE"
-
-    bos = None
-    if last > h2:
-        bos = "BULL_BOS"
-    elif last < l2:
-        bos = "BEAR_BOS"
-
-    choch = None
-    if trend == "BEAR" and last > h2:
-        choch = "BULL_CHOCH"
-    elif trend == "BULL" and last < l2:
-        choch = "BEAR_CHOCH"
-
-    return {"trend": trend, "bos": bos, "choch": choch,
-            "last_swing_high": h2, "last_swing_low": l2}
-
-
-def liquidity_levels(df):
-    out = {}
-    for n, label in [(576, "48H"), (288, "24H"), (48, "4H"), (12, "1H"), (3, "15M")]:
-        x = df.iloc[:-1].tail(n)
-        if len(x):
-            out[label+"_HIGH"] = float(x["high"].max())
-            out[label+"_LOW"] = float(x["low"].min())
-    
-    # 5M Previous Closed Candle Liquidity
-    if len(df) >= 2:
-        prev = df.iloc[-2]
-        out["5M_HIGH"] = float(prev["high"])
-        out["5M_LOW"] = float(prev["low"])
-        
-    return out
-
-
-def detect_fvg(df):
-    if len(df) < 3:
-        return None
-    a, b, c = df.iloc[-3], df.iloc[-2], df.iloc[-1]
-
-    if c["low"] > a["high"]:
-        return {
-            "type": "BULL_FVG",
-            "low": float(a["high"]),
-            "high": float(c["low"]),
-            "size": float(c["low"] - a["high"])
-        }
-
-    if c["high"] < a["low"]:
-        return {
-            "type": "BEAR_FVG",
-            "low": float(c["high"]),
-            "high": float(a["low"]),
-            "size": float(a["low"] - c["high"])
-        }
-
-    return None
-
-
-def detect_order_block(df):
-    if len(df) < 8:
-        return None
-
-    a = df.iloc[-6:-1]
-    current = df.iloc[-1]
-    av_atr = float(atr(df, 14).iloc[-1])
-
-    if not np.isfinite(av_atr) or av_atr <= 0:
-        return None
-
-    body = abs(float(current["close"] - current["open"]))
-
-    if body >= 1.3 * av_atr:
-        if current["close"] > current["open"]:
-            for i in range(len(a)-1, -1, -1):
-                x = a.iloc[i]
-                if x["close"] < x["open"]:
-                    return {
-                        "type": "BULL_OB",
-                        "low": float(x["low"]),
-                        "high": float(x["high"])
-                    }
-
-        if current["close"] < current["open"]:
-            for i in range(len(a)-1, -1, -1):
-                x = a.iloc[i]
-                if x["close"] > x["open"]:
-                    return {
-                        "type": "BEAR_OB",
-                        "low": float(x["low"]),
-                        "high": float(x["high"])
-                    }
-
-    return None
-
-
-def sweep_signal(df):
-    if len(df) < 600:
-        return None
-
-    current = df.iloc[-1]
-    levels = liquidity_levels(df)
-
-    checks = [
-        ("48H", levels.get("48H_LOW"), levels.get("48H_HIGH")),
-        ("24H", levels.get("24H_LOW"), levels.get("24H_HIGH")),
-        ("4H", levels.get("4H_LOW"), levels.get("4H_HIGH")),
-        ("1H", levels.get("1H_LOW"), levels.get("1H_HIGH")),
-        ("15M", levels.get("15M_LOW"), levels.get("15M_HIGH")),
-        ("5M", levels.get("5M_LOW"), levels.get("5M_HIGH")),
+# --- 2. MULTI-SOURCE BINANCE HISTORICAL CANDLES ---
+def get_historical_candles(limit=580):
+    endpoints = [
+        f"https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=5m&limit={limit}",
+        f"https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=5m&limit={limit}",
+        f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=5m&limit={limit}"
     ]
-
-    for name, low, high in checks:
-        if low is not None and current["low"] < low and current["close"] > low:
-            return {"direction": "LONG", "pool": name,
-                    "level": float(low), "extreme": float(current["low"])}
-
-        if high is not None and current["high"] > high and current["close"] < high:
-            return {"direction": "SHORT", "pool": name,
-                    "level": float(high), "extreme": float(current["high"])}
-
-    return None
-
-
-# ----------------------------- SIGNAL ENGINE -----------------------------
-
-@dataclass
-class Signal:
-    created_at: str
-    direction: str
-    setup: str
-    score: int
-    entry: float
-    sl: float
-    tp1: float
-    tp2: float
-    tp3: float
-    atr: float
-    notes: str
-
-
-class SMCSignalEngine:
-    def __init__(self):
-        self.last_signal_key = None
-        self.last_signal: Optional[Signal] = None
-        self.active: Optional[Signal] = None
-        self.last_error = ""
-        self.last_scan = None
-        self.data: Dict[str, pd.DataFrame] = {}
-        self.market = {}
-
-    def fetch(self):
-        api = BinanceClient()
-        for tf, limit in TF_LIMITS.items():
-            self.data[tf] = api.klines(tf, limit)
-        self.market["price"] = api.ticker()
-        self.market["funding"] = api.funding()
-        self.market["oi"] = api.open_interest()
-        self.last_scan = now_utc().isoformat()
-
-    def build_signal(self):
-        df5 = self.data["5m"]
-        df15 = self.data["15m"]
-        df1 = self.data["1h"]
-        df4 = self.data["4h"]
-
-        closed5 = df5.iloc[:-1].copy()
-        if len(closed5) < 600:
-            return None
-
-        price = float(self.market["price"])
-        atr5 = float(atr(closed5, 14).iloc[-1])
-        if not np.isfinite(atr5) or atr5 <= 0:
-            return None
-
-        st4 = structure_state(df4.iloc[:-1])
-        st1 = structure_state(df1.iloc[:-1])
-        st15 = structure_state(df15.iloc[:-1])
-        st5 = structure_state(closed5)
-
-        sweep = sweep_signal(closed5)
-        fvg = detect_fvg(closed5)
-        ob = detect_order_block(closed5)
-
-        score_long = 0
-        score_short = 0
-        reasons_long, reasons_short = [], []
-
-        if st4["trend"] == "BULL":
-            score_long += 12; reasons_long.append("4H bullish")
-        elif st4["trend"] == "BEAR":
-            score_short += 12; reasons_short.append("4H bearish")
-
-        if st1["trend"] == "BULL":
-            score_long += 12; reasons_long.append("1H bullish")
-        elif st1["trend"] == "BEAR":
-            score_short += 12; reasons_short.append("1H bearish")
-
-        if st15["trend"] == "BULL":
-            score_long += 7; reasons_long.append("15M bullish")
-        elif st15["trend"] == "BEAR":
-            score_short += 7; reasons_short.append("15M bearish")
-
-        if sweep:
-            pts = {"48H": 24, "24H": 19, "4H": 15, "1H": 11, "15M": 7, "5M": 5}.get(sweep["pool"], 5)
-            if sweep["direction"] == "LONG":
-                score_long += pts
-                reasons_long.append(f"{sweep['pool']} sell-side sweep")
-            else:
-                score_short += pts
-                reasons_short.append(f"{sweep['pool']} buy-side sweep")
-
-        if st5["bos"] == "BULL_BOS" or st5["choch"] == "BULL_CHOCH":
-            score_long += 12; reasons_long.append("5M bullish structure shift")
-        if st5["bos"] == "BEAR_BOS" or st5["choch"] == "BEAR_CHOCH":
-            score_short += 12; reasons_short.append("5M bearish structure shift")
-
-        if fvg and fvg["type"] == "BULL_FVG":
-            score_long += 8; reasons_long.append("bullish FVG")
-        elif fvg and fvg["type"] == "BEAR_FVG":
-            score_short += 8; reasons_short.append("bearish FVG")
-
-        if ob and ob["type"] == "BULL_OB":
-            score_long += 8; reasons_long.append("bullish OB")
-        elif ob and ob["type"] == "BEAR_OB":
-            score_short += 8; reasons_short.append("bearish OB")
-
-        r = float(rsi(closed5).iloc[-1])
-        if np.isfinite(r):
-            if 52 <= r <= 72:
-                score_long += 5; reasons_long.append(f"RSI {r:.1f}")
-            if 28 <= r <= 48:
-                score_short += 5; reasons_short.append(f"RSI {r:.1f}")
-
-        a = float(adx(closed5).iloc[-1])
-        if np.isfinite(a) and a >= 20:
-            if score_long > score_short:
-                score_long += 4; reasons_long.append(f"ADX {a:.1f}")
-            elif score_short > score_long:
-                score_short += 4; reasons_short.append(f"ADX {a:.1f}")
-
-        vol = closed5["volume"]
-        if len(vol) >= 21:
-            vr = float(vol.iloc[-1] / vol.iloc[-21:-1].mean())
-            if vr >= 1.5:
-                if closed5["close"].iloc[-1] > closed5["open"].iloc[-1]:
-                    score_long += 5; reasons_long.append(f"volume {vr:.1f}x")
-                else:
-                    score_short += 5; reasons_short.append(f"volume {vr:.1f}x")
-
-        funding = float(self.market.get("funding", 0.0))
-        if funding > 0.0005:
-            score_short += 3; reasons_short.append("positive funding")
-        elif funding < -0.0005:
-            score_long += 3; reasons_long.append("negative funding")
-
-        direction = "LONG" if score_long > score_short else "SHORT"
-        score = max(score_long, score_short)
-
-        if not sweep and not fvg and not ob:
-            return None
-
-        if score < 70:
-            return None
-
-        if direction == "LONG":
-            anchor = sweep["extreme"] if sweep else float(closed5["low"].iloc[-1])
-            sl = anchor - 0.8 * atr5
-            risk = price - sl
-            if risk <= 0:
-                return None
-            tp1, tp2, tp3 = price + risk*1.0, price + risk*2.0, price + risk*3.0
-            notes = " | ".join(reasons_long)
-            setup = sweep["pool"] + " SWEEP" if sweep and sweep["direction"] == "LONG" else "SMC CONFLUENCE"
-        else:
-            anchor = sweep["extreme"] if sweep else float(closed5["high"].iloc[-1])
-            sl = anchor + 0.8 * atr5
-            risk = sl - price
-            if risk <= 0:
-                return None
-            tp1, tp2, tp3 = price - risk*1.0, price - risk*2.0, price - risk*3.0
-            notes = " | ".join(reasons_short)
-            setup = sweep["pool"] + " SWEEP" if sweep and sweep["direction"] == "SHORT" else "SMC CONFLUENCE"
-
-        key = f"{closed5['open_time'].iloc[-1]}-{direction}-{setup}"
-        if key == self.last_signal_key:
-            return None
-
-        return Signal(
-            created_at=now_utc().strftime("%Y-%m-%d %H:%M:%S UTC"),
-            direction=direction,
-            setup=setup,
-            score=int(score),
-            entry=price,
-            sl=float(sl),
-            tp1=float(tp1),
-            tp2=float(tp2),
-            tp3=float(tp3),
-            atr=float(atr5),
-            notes=notes,
-        ), key
-
-    def scan(self):
-        with LOCK:
-            try:
-                self.fetch()
-                result = self.build_signal()
-                if result:
-                    signal, key = result
-                    self.last_signal_key = key
-                    self.last_signal = signal
-                    if self.active is None:
-                        self.active = signal
-                        db_insert_trade(signal)
-
-                        emoji = "🟢" if signal.direction == "LONG" else "🔴"
-                        telegram(
-                            f"{emoji} <b>BTCUSDT {signal.direction} SIGNAL</b>\n"
-                            f"Score: <b>{signal.score}/100</b>\n"
-                            f"Setup: <b>{signal.setup}</b>\n"
-                            f"Entry: <code>{fmt_price(signal.entry)}</code>\n"
-                            f"SL: <code>{fmt_price(signal.sl)}</code>\n"
-                            f"TP1: <code>{fmt_price(signal.tp1)}</code>\n"
-                            f"TP2: <code>{fmt_price(signal.tp2)}</code>\n"
-                            f"TP3: <code>{fmt_price(signal.tp3)}</code>\n"
-                            f"ATR: {signal.atr:.2f}\n\n"
-                            f"Confluence: <i>{signal.notes}</i>"
-                        )
-            except Exception as e:
-                self.last_error = str(e)
-
-    def check_active(self):
-        with LOCK:
-            if not self.active:
-                return
-            try:
-                price = BinanceClient().ticker()
-                t = self.active
-
-                if t.direction == "LONG":
-                    if price <= t.sl:
-                        db_close_trade(price, "SL HIT", -1.0)
-                        telegram(f"🛑 <b>LONG SL HIT</b> @ {fmt_price(price)} (-1.0R)")
-                        self.active = None
-                    elif price >= t.tp3:
-                        db_close_trade(price, "TP3 HIT 🔥", 3.0)
-                        telegram(f"🎯 <b>LONG TP3 HIT 🔥</b> @ {fmt_price(price)} (+3.0R Target Complete)")
-                        self.active = None
-                    elif price >= t.tp2 and not getattr(t, 'hit_tp2', False):
-                        setattr(t, 'hit_tp2', True)
-                        telegram(f"✨ <b>LONG TP2 REACHED</b> @ {fmt_price(price)} (+2.0R)")
-                    elif price >= t.tp1 and not getattr(t, 'hit_tp1', False):
-                        setattr(t, 'hit_tp1', True)
-                        telegram(f"🔹 <b>LONG TP1 REACHED</b> @ {fmt_price(price)} (+1.0R)")
-
-                elif t.direction == "SHORT":
-                    if price >= t.sl:
-                        db_close_trade(price, "SL HIT", -1.0)
-                        telegram(f"🛑 <b>SHORT SL HIT</b> @ {fmt_price(price)} (-1.0R)")
-                        self.active = None
-                    elif price <= t.tp3:
-                        db_close_trade(price, "TP3 HIT 🔥", 3.0)
-                        telegram(f"🎯 <b>SHORT TP3 HIT 🔥</b> @ {fmt_price(price)} (+3.0R Target Complete)")
-                        self.active = None
-                    elif price <= t.tp2 and not getattr(t, 'hit_tp2', False):
-                        setattr(t, 'hit_tp2', True)
-                        telegram(f"✨ <b>SHORT TP2 REACHED</b> @ {fmt_price(price)} (+2.0R)")
-                    elif price <= t.tp1 and not getattr(t, 'hit_tp1', False):
-                        setattr(t, 'hit_tp1', True)
-                        telegram(f"🔹 <b>SHORT TP1 REACHED</b> @ {fmt_price(price)} (+1.0R)")
-            except Exception as e:
-                self.last_error = str(e)
-
-
-# ----------------------------- 24/7 BACKGROUND WORKER -----------------------------
-
-db_init()
-
-if "engine" not in st.session_state:
-    st.session_state.engine = SMCSignalEngine()
-
-ENGINE = st.session_state.engine
-
-def background_loop():
-    while True:
+    for url in endpoints:
         try:
-            ENGINE.scan()
-            for _ in range(12):
-                ENGINE.check_active()
-                time.sleep(5)
+            r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3.5).json()
+            if isinstance(r, list) and len(r) > 100:
+                candles = []
+                for b in r:
+                    o, h, l, c = float(b[1]), float(b[2]), float(b[3]), float(b[4])
+                    if min(o, h, l, c) > 10000:
+                        candles.append({"time": int(b[0]/1000), "open": o, "high": h, "low": l, "close": c})
+                if len(candles) > 100:
+                    return candles
         except Exception:
-            time.sleep(10)
+            continue
+    return []
 
-if "bg_thread_started" not in st.session_state:
-    st.session_state.bg_thread_started = True
-    t = threading.Thread(target=background_loop, daemon=True)
-    t.start()
+# --- 3. ALL-SMC INSTITUTIONAL ENGINE ---
+class SMCEngine:
+    def __init__(self):
+        self.state = "SCANNING"
+        self.pending_setup = None
+        self.active_trade = None
+        self.candles_data = []
 
+    def calculate_atr(self, data, period=14):
+        if len(data) < period + 1:
+            return 85.0
+        trs = []
+        for i in range(len(data) - period, len(data)):
+            hl = data[i]['high'] - data[i]['low']
+            hc = abs(data[i]['high'] - data[i - 1]['close'])
+            lc = abs(data[i]['low'] - data[i - 1]['close'])
+            trs.append(max(hl, hc, lc))
+        return sum(trs) / period
 
-# ----------------------------- DASHBOARD UI -----------------------------
+    def on_closed_candle(self, closed_candle):
+        self.candles_data.append(closed_candle)
+        if len(self.candles_data) > 650:
+            self.candles_data.pop(0)
+
+        completed = self.candles_data[:-1]
+        if len(completed) < 30:
+            return
+        atr = self.calculate_atr(completed, 14)
+
+        # 48H Macro
+        slice48 = completed[-576:] if len(completed) >= 576 else completed
+        h48, l48 = max(c['high'] for c in slice48), min(c['low'] for c in slice48)
+
+        # 1H Intermediate
+        slice1h = completed[-12:]
+        h1h, l1h = max(c['high'] for c in slice1h), min(c['low'] for c in slice1h)
+
+        # 5M Local
+        prev_bar = completed[-1]
+        h5m, l5m = prev_bar['high'], prev_bar['low']
+
+        if self.state == "SCANNING":
+            if closed_candle['low'] < l48:
+                self.setup_trigger("LONG", "48H MACRO SWEEP", l48, closed_candle['low'], closed_candle['time'], 3.0)
+            elif closed_candle['high'] > h48:
+                self.setup_trigger("SHORT", "48H MACRO SWEEP", h48, closed_candle['high'], closed_candle['time'], 3.0)
+            elif closed_candle['low'] < l1h:
+                self.setup_trigger("LONG", "1H SESSION SWEEP", l1h, closed_candle['low'], closed_candle['time'], 2.0)
+            elif closed_candle['high'] > h1h:
+                self.setup_trigger("SHORT", "1H SESSION SWEEP", h1h, closed_candle['high'], closed_candle['time'], 2.0)
+            elif closed_candle['low'] < l5m:
+                self.setup_trigger("LONG", "5M MICRO SWEEP", l5m, closed_candle['low'], closed_candle['time'], 1.5)
+            elif closed_candle['high'] > h5m:
+                self.setup_trigger("SHORT", "5M MICRO SWEEP", h5m, closed_candle['high'], closed_candle['time'], 1.5)
+
+        elif self.state == "CONFIRMATION_WAIT" and self.pending_setup:
+            ps = self.pending_setup
+            if closed_candle['time'] > ps['candle_time']:
+                if ps['dir'] == "LONG":
+                    if closed_candle['close'] > ps['level']:
+                        entry = closed_candle['close']
+                        sl = ps['extreme'] - (1.2 * atr)
+                        risk = entry - sl
+                        tp1 = entry + (1.0 * risk)
+                        tp2 = entry + (2.0 * risk)
+                        tp3 = entry + (ps['rr'] * risk)
+                        self.arm_trade("LONG", ps['tier'], entry, sl, tp1, tp2, tp3, atr)
+                    else:
+                        if closed_candle['low'] < ps['extreme']: self.pending_setup['extreme'] = closed_candle['low']
+                        else: self.reset_scanner()
+
+                elif ps['dir'] == "SHORT":
+                    if closed_candle['close'] < ps['level']:
+                        entry = closed_candle['close']
+                        sl = ps['extreme'] + (1.2 * atr)
+                        risk = sl - entry
+                        tp1 = entry - (1.0 * risk)
+                        tp2 = entry - (2.0 * risk)
+                        tp3 = entry - (ps['rr'] * risk)
+                        self.arm_trade("SHORT", ps['tier'], entry, sl, tp1, tp2, tp3, atr)
+                    else:
+                        if closed_candle['high'] > ps['extreme']: self.pending_setup['extreme'] = closed_candle['high']
+                        else: self.reset_scanner()
+
+    def setup_trigger(self, dir_type, tier, level, extreme, candle_time, rr):
+        self.state = "CONFIRMATION_WAIT"
+        self.pending_setup = {
+            "dir": dir_type, "tier": tier, "level": level,
+            "extreme": extreme, "candle_time": candle_time, "rr": rr
+        }
+
+    def arm_trade(self, dir_type, tier, entry, sl, tp1, tp2, tp3, atr_val):
+        self.state = "ACTIVE_TRADE"
+        t_str = datetime.now().strftime('%H:%M:%S')
+        self.active_trade = {
+            "dir": dir_type, "tier": tier, "entry": entry,
+            "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+            "atr": atr_val, "time": t_str
+        }
+        emoji = "🟢" if dir_type == "LONG" else "🔴"
+        msg = (
+            f"{emoji} <b>BTCUSDT {dir_type} ARMED [{tier}]</b>\n\n"
+            f"🎯 <b>Liquidity Reclaim Confirmed</b>\n"
+            f"🔹 <b>Entry:</b> ${entry:,.2f}\n"
+            f"🛑 <b>Stop Loss:</b> ${sl:,.2f}\n"
+            f"🎯 <b>TP1 (1R):</b> ${tp1:,.2f}\n"
+            f"🎯 <b>TP2 (2R):</b> ${tp2:,.2f}\n"
+            f"🔥 <b>TP3 (Final):</b> ${tp3:,.2f}\n"
+            f"🛡 <b>ATR(14):</b> {atr_val:.1f}\n\n"
+            f"<i>Execution engine scanning live ticks...</i>"
+        )
+        send_telegram(msg)
+        self.pending_setup = None
+
+    def resolve_trade(self, result, pnl, is_win, exit_price):
+        if not self.active_trade:
+            return
+        save_vault(self.active_trade, exit_price, result, pnl, is_win)
+        msg = (
+            f"🏁 <b>TRADE RESOLVED: {result} [{self.active_trade['tier']}]</b>\n\n"
+            f"📌 <b>Direction:</b> {self.active_trade['dir']}\n"
+            f"🔹 <b>Entry:</b> ${self.active_trade['entry']:,.2f}\n"
+            f"🔸 <b>Exit Price:</b> ${exit_price:,.2f}\n"
+            f"💰 <b>Result:</b> {pnl}\n\n"
+            f"🔄 <i>Scanning all formats (48H / 1H / 5M)...</i>"
+        )
+        send_telegram(msg)
+        self.reset_scanner()
+
+    def reset_scanner(self):
+        self.state = "SCANNING"
+        self.pending_setup = None
+        self.active_trade = None
+
+# Global Engine Singleton
+if "smc_engine" not in st.session_state:
+    st.session_state["smc_engine"] = SMCEngine()
+engine = st.session_state["smc_engine"]
+
+# --- 4. SAFE 24/7 BACKGROUND WORKER ---
+def run_worker_thread():
+    async def kline_listener():
+        while True:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.ws_connect("wss://fstream.binance.com/ws/btcusdt@kline_5m") as ws:
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                data = json.loads(msg.data)
+                                k = data.get('k', {})
+                                if k.get('x'):
+                                    c = {
+                                        "time": int(k['t'] / 1000),
+                                        "open": float(k['o']), "high": float(k['h']),
+                                        "low": float(k['l']), "close": float(k['c'])
+                                    }
+                                    if min(c['open'], c['high'], c['low'], c['close']) > 10000:
+                                        engine.on_closed_candle(c)
+            except Exception:
+                await asyncio.sleep(5)
+
+    async def trade_listener():
+        while True:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.ws_connect("wss://fstream.binance.com/ws/btcusdt@trade") as ws:
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                data = json.loads(msg.data)
+                                p = float(data.get('p', 0.0))
+                                if p > 10000 and engine.state == "ACTIVE_TRADE" and engine.active_trade:
+                                    t = engine.active_trade
+                                    if t['dir'] == "LONG":
+                                        if p >= t['tp3']: engine.resolve_trade("TP3 HIT 🔥", "+Final Target", 1, p)
+                                        elif p <= t['sl']: engine.resolve_trade("SL HIT 🛑", "-1R", 0, p)
+                                    elif t['dir'] == "SHORT":
+                                        if p <= t['tp3']: engine.resolve_trade("TP3 HIT 🔥", "+Final Target", 1, p)
+                                        elif p >= t['sl']: engine.resolve_trade("SL HIT 🛑", "-1R", 0, p)
+            except Exception:
+                await asyncio.sleep(5)
+
+    async def runner():
+        engine.candles_data = get_historical_candles(580)
+        await asyncio.gather(kline_listener(), trade_listener())
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(runner())
+
+if "worker_running" not in st.session_state:
+    st.session_state["worker_running"] = True
+    threading.Thread(target=run_worker_thread, daemon=True).start()
+
+# --- 5. STREAMLIT FULL-SCREEN TRADING TERMINAL UI ---
+st.set_page_config(page_title="BTCUSDT RADAR", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown("""
     <style>
-        .block-container { padding-top: 1rem; padding-bottom: 2rem; }
-        .stMetric { background-color: #0e1117; border: 1px solid #1f2937; padding: 10px; border-radius: 6px; }
+        header, footer, #MainMenu { visibility: hidden !important; height: 0 !important; }
+        .block-container { padding: 0 !important; margin: 0 !important; max-width: 100% !important; background-color: #080a0f !important; }
+        .stApp { background-color: #080a0f !important; }
+        iframe { border: none !important; width: 100vw !important; display: block !important; }
     </style>
 """, unsafe_allow_html=True)
 
-st.title("⚡ BTCUSDT MULTI-TIER SMC RADAR")
+# Vault Data
+conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+cur = conn.cursor()
+cur.execute("SELECT timestamp, direction, entry, result, pnl, is_win FROM vault ORDER BY id DESC")
+rows = cur.fetchall()
+total_trades = len(rows)
+conn.close()
 
-with LOCK:
-    current_price = ENGINE.market.get("price", None)
-    funding_rate = ENGINE.market.get("funding", 0.0)
-    oi = ENGINE.market.get("oi", 0.0)
-    active_trade = ENGINE.active
+vault_json = json.dumps([{"time": r[0], "dir": r[1], "entry": r[2], "res": r[3], "pnl": r[4], "win": r[5]} for r in rows])
 
-# 1. Metric Row
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("BTC PRICE", fmt_price(current_price))
-c2.metric("FUNDING RATE", f"{funding_rate*100:.4f}%" if funding_rate else "--")
-c3.metric("OPEN INTEREST", f"{oi:,.0f} BTC" if oi else "--")
-c4.metric("RADAR STATUS", "ACTIVE TRADE" if active_trade else "SCANNING ALL TF", 
-          delta="IN POSITION" if active_trade else "ARMED", delta_color="normal" if active_trade else "off")
+ui_candles = get_historical_candles(580)
+candles_json = json.dumps(ui_candles)
 
-# 2. Active Trade Box (if active)
-if active_trade:
-    st.info(
-        f"🚨 **ACTIVE {active_trade.direction}** | Setup: **{active_trade.setup}** | Score: **{active_trade.score}/100**\n\n"
-        f"**Entry:** {fmt_price(active_trade.entry)} | **SL:** {fmt_price(active_trade.sl)} | "
-        f"**TP1 (1R):** {fmt_price(active_trade.tp1)} | **TP2 (2R):** {fmt_price(active_trade.tp2)} | **TP3 (3R):** {fmt_price(active_trade.tp3)}"
-    )
+ui_html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+        * {{ margin:0; padding:0; box-sizing:border-box; font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
+        body {{ background:#080a0f; color:#d1d4dc; overflow:hidden; width:100vw; display:flex; flex-direction:column; }}
+        .top-bar {{ display:flex; justify-content:space-between; align-items:center; padding:5px 8px; background:#0d1118; border-bottom:1px solid rgba(255,255,255,0.06); height:38px; font-size:10px; }}
+        .badge-live {{ background:#089981; color:#fff; font-size:8px; font-weight:800; padding:2px 4px; border-radius:2px; }}
+        .badge-tf {{ background:#131924; color:#38bdf8; font-size:8px; font-weight:800; padding:2px 5px; border-radius:2px; }}
+        .vault-btn {{ background:#141b27; border:1px solid #232f42; color:#38bdf8; padding:3px 8px; border-radius:4px; font-size:10px; font-weight:700; cursor:pointer; }}
+        #chart-container {{ width:100vw; height:375px; position:relative; }}
+        .bottom-section {{ display:flex; flex-direction:column; width:100vw; background:#080a0f; }}
+        .bot-bar-1 {{ display:flex; justify-content:space-between; align-items:center; padding:4px 8px; background:#0b0f16; border-top:1px solid rgba(255,255,255,0.06); height:28px; font-size:8.5px; }}
+        .bot-bar-2 {{ display:grid; grid-template-columns:repeat(4, 1fr); gap:4px; padding:3px 6px 5px 6px; background:#06080c; height:34px; font-size:7.5px; }}
+        .info-card {{ background:#0d121a; border:1px solid #161e2a; padding:2px 4px; border-radius:3px; display:flex; flex-direction:column; justify-content:center; }}
+        .modal {{ display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.85); z-index:999999; align-items:center; justify-content:center; padding:16px; }}
+        .modal-box {{ background:#0f141e; border:1px solid #1c2636; border-radius:8px; width:100%; max-width:380px; padding:14px; }}
+        .c-green {{ color:#089981 !important; font-weight:bold; }}
+        .c-red {{ color:#f23645 !important; font-weight:bold; }}
+        .c-orange {{ color:#fb923c !important; font-weight:bold; }}
+        .c-pink {{ color:#ec4899 !important; font-weight:bold; }}
+        .c-cyan {{ color:#00e5ff !important; font-weight:bold; }}
+        .c-yellow {{ color:#f59e0b !important; font-weight:bold; }}
+    </style>
+</head>
+<body>
+    <div class="top-bar">
+        <div style="display:flex; align-items:center; gap:8px;">
+            <span class="badge-live">LIVE FUTURES</span>
+            <span class="badge-tf">5M • 1H • 48H</span>
+            <div><span style="font-size:7px; color:#565f70; font-weight:700;">RADAR</span><div id="hud-status" class="c-yellow" style="font-weight:800; font-size:10px;">SCANNING</div></div>
+            <div><span style="font-size:7px; color:#565f70; font-weight:700;">PRICE</span><div id="hud-live-price" class="c-cyan" style="font-weight:800; font-size:10px;">--</div></div>
+            <div><span style="font-size:7px; color:#565f70; font-weight:700;">SL</span><div id="hud-sl" class="c-red" style="font-weight:800; font-size:10px;">--</div></div>
+            <div><span style="font-size:7px; color:#565f70; font-weight:700;">TP</span><div id="hud-tp" class="c-green" style="font-weight:800; font-size:10px;">--</div></div>
+        </div>
+        <button class="vault-btn" onclick="openVault()">📜 VAULT ({total_trades})</button>
+    </div>
 
-# 3. Interactive Candlestick Chart (Plotly)
-if "5m" in ENGINE.data and not ENGINE.data["5m"].empty:
-    df_plot = ENGINE.data["5m"].tail(120).copy()
-    fig = go.Figure(data=[go.Candlestick(
-        x=df_plot["open_time"],
-        open=df_plot["open"],
-        high=df_plot["high"],
-        low=df_plot["low"],
-        close=df_plot["close"],
-        name="BTCUSDT 5M"
-    )])
+    <div id="chart-container"></div>
 
-    # Multi-Timeframe Liquidity Lines
-    levs = liquidity_levels(ENGINE.data["5m"])
-    
-    # 48H Macro Liquidity
-    if "48H_HIGH" in levs:
-        fig.add_hline(y=levs["48H_HIGH"], line_dash="dash", line_color="#ef4444", annotation_text="48H HIGH POOL (BSL)")
-    if "48H_LOW" in levs:
-        fig.add_hline(y=levs["48H_LOW"], line_dash="dash", line_color="#10b981", annotation_text="48H LOW POOL (SSL)")
-        
-    # 1H Intermediate Liquidity
-    if "1H_HIGH" in levs:
-        fig.add_hline(y=levs["1H_HIGH"], line_dash="dot", line_color="#f59e0b", annotation_text="1H HIGH")
-    if "1H_LOW" in levs:
-        fig.add_hline(y=levs["1H_LOW"], line_dash="dot", line_color="#06b6d4", annotation_text="1H LOW")
+    <div class="bottom-section">
+        <div class="bot-bar-1">
+            <div>ACCOUNT: <span class="c-green">$10.00 BASE</span> | ALLOCATION: <span class="c-cyan">$2.50 (10x)</span></div>
+            <div style="display:flex; gap:5px;">
+                <span style="border:1px solid rgba(202,138,4,0.4); color:#fbbf24; padding:1px 4px; border-radius:2px; font-weight:700;">⚡ FORCE CLOSE</span>
+                <span style="border:1px solid rgba(220,38,38,0.4); color:#f87171; padding:1px 4px; border-radius:2px; font-weight:700;">🚨 KILL SWITCH</span>
+            </div>
+        </div>
+        <div class="bot-bar-2">
+            <div class="info-card"><span style="color:#565f70;">48H RANGE</span><span id="card-48h" class="c-red">--</span></div>
+            <div class="info-card"><span style="color:#565f70;">1H RANGE</span><span id="card-1h" class="c-orange">--</span></div>
+            <div class="info-card"><span style="color:#565f70;">5M PREV BAR</span><span id="card-5m" class="c-pink">--</span></div>
+            <div class="info-card"><span style="color:#565f70;">SHIELD</span><span class="c-green">ARMED 🛡️</span></div>
+        </div>
+    </div>
 
-    # 5M Local Micro Liquidity
-    if "5M_HIGH" in levs:
-        fig.add_hline(y=levs["5M_HIGH"], line_dash="dot", line_color="#ec4899", line_width=1, annotation_text="5M PREV HIGH")
-    if "5M_LOW" in levs:
-        fig.add_hline(y=levs["5M_LOW"], line_dash="dot", line_color="#a855f7", line_width=1, annotation_text="5M PREV LOW")
+    <div id="vaultModal" class="modal">
+        <div class="modal-box">
+            <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #1c2636; padding-bottom:8px; margin-bottom:8px;">
+                <span style="font-weight:bold; font-size:12px;">🔒 SQLITE VAULT</span>
+                <span style="cursor:pointer; font-weight:bold;" onclick="closeVault()">✕</span>
+            </div>
+            <div id="vaultList" style="max-height: 220px; overflow-y: auto;"></div>
+        </div>
+    </div>
 
-    # Active Trade Overlay
-    if active_trade:
-        fig.add_hline(y=active_trade.entry, line_color="#38bdf8", annotation_text="ENTRY")
-        fig.add_hline(y=active_trade.sl, line_dash="dash", line_color="#f43f5e", annotation_text="SL")
-        fig.add_hline(y=active_trade.tp3, line_dash="dash", line_color="#22c55e", annotation_text="TP3")
+    <script>
+        const rawCandles = {candles_json};
+        const vaultTrades = {vault_json};
 
-    fig.update_layout(
-        template="plotly_dark",
-        height=480,
-        margin=dict(l=10, r=10, t=10, b=10),
-        xaxis_rangeslider_visible=False,
-    )
-    st.plotly_chart(fig, use_container_width=True)
-else:
-    st.warning("Fetching market candle streams from Binance Futures...")
+        // Indian Standard Time (IST) Offset: UTC + 5:30
+        const localOffsetSeconds = 5.5 * 3600;
 
-# 4. Vault Database History
-st.subheader("📜 SMC Signal & Trade Vault")
-rows = db_rows()
-if rows:
-    df_vault = pd.DataFrame(rows, columns=[
-        "Time", "Setup", "Direction", "Score", "Entry", "SL", "TP1", "TP2", "TP3",
-        "Exit", "Result", "PnL (R)", "Confluence Notes"
-    ])
-    st.dataframe(df_vault, use_container_width=True)
-else:
-    st.write("Vault empty. Scanning institutional setups across 48H, 1H, and 5M...")
+        let allCandles = rawCandles.map(c => ({{
+            time: c.time + localOffsetSeconds,
+            open: c.open,
+            high: c.high,
+            low: c.low,
+            close: c.close
+        }}));
+
+        let currentBar = allCandles.length > 0 ? {{ ...allCandles[allCandles.length - 1] }} : null;
+
+        const container = document.getElementById('chart-container');
+        const chart = LightweightCharts.createChart(container, {{
+            layout: {{ background: {{ type: 'solid', color: '#080a0f' }}, textColor: '#64748b', fontSize: 10 }},
+            grid: {{
+                vertLines: {{ color: 'rgba(255, 255, 255, 0.03)' }},
+                horzLines: {{ color: 'rgba(255, 255, 255, 0.03)' }}
+            }},
+            rightPriceScale: {{
+                borderColor: '#161e2a',
+                autoScale: true,
+                scaleMargins: {{ top: 0.12, bottom: 0.12 }}
+            }},
+            timeScale: {{
+                borderColor: '#161e2a',
+                timeVisible: true,
+                secondsVisible: false,
+                barSpacing: 8,
+                rightOffset: 3
+            }}
+        }});
+
+        const candleSeries = chart.addCandlestickSeries({{
+            upColor: '#089981', downColor: '#f23645',
+            borderUpColor: '#089981', borderDownColor: '#f23645',
+            wickUpColor: '#089981', wickDownColor: '#f23645'
+        }});
+
+        if (allCandles.length > 0) {{
+            candleSeries.setData(allCandles);
+            chart.timeScale().fitContent();
+        }}
+
+        // --- LIQUIDITY LINES STORAGE (48H + 1H + 5M) ---
+        let lines = {{
+            h48: null, l48: null,
+            h1: null, l1: null,
+            h5: null, l5: null
+        }};
+
+        function updateAllLiquidityLines() {{
+            if (allCandles.length < 20) return;
+
+            // 1. 48-Hour Macro Liquidity
+            const slice48 = allCandles.slice(-576);
+            const high48 = Math.max(...slice48.map(c => c.high));
+            const low48 = Math.min(...slice48.map(c => c.low));
+
+            // 2. 1-Hour Intermediate Liquidity
+            const slice1h = allCandles.slice(-12);
+            const high1h = Math.max(...slice1h.map(c => c.high));
+            const low1h = Math.min(...slice1h.map(c => c.low));
+
+            // 3. 5-Minute Previous Bar Liquidity
+            const prevCandle = allCandles.length >= 2 ? allCandles[allCandles.length - 2] : allCandles[allCandles.length - 1];
+            const high5m = prevCandle.high;
+            const low5m = prevCandle.low;
+
+            // Update Bottom Cards
+            document.getElementById('card-48h').innerText = `$${{low48.toFixed(0)}} - $${{high48.toFixed(0)}}`;
+            document.getElementById('card-1h').innerText = `$${{low1h.toFixed(0)}} - $${{high1h.toFixed(0)}}`;
+            document.getElementById('card-5m').innerText = `$${{low5m.toFixed(0)}} - $${{high5m.toFixed(0)}}`;
+
+            // Remove existing lines
+            Object.keys(lines).forEach(k => {{
+                if (lines[k]) {{ candleSeries.removePriceLine(lines[k]); lines[k] = null; }}
+            }});
+
+            // 48H LINES
+            lines.h48 = candleSeries.createPriceLine({{
+                price: high48, color: '#f23645', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed,
+                axisLabelVisible: true, title: '48H HIGH POOL (BSL)'
+            }});
+            lines.l48 = candleSeries.createPriceLine({{
+                price: low48, color: '#089981', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed,
+                axisLabelVisible: true, title: '48H LOW POOL (SSL)'
+            }});
+
+            // 1H LINES
+            lines.h1 = candleSeries.createPriceLine({{
+                price: high1h, color: '#fb923c', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.LargeDashed,
+                axisLabelVisible: true, title: '1H HIGH'
+            }});
+            lines.l1 = candleSeries.createPriceLine({{
+                price: low1h, color: '#2dd4bf', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.LargeDashed,
+                axisLabelVisible: true, title: '1H LOW'
+            }});
+
+            // 5M LINES
+            lines.h5 = candleSeries.createPriceLine({{
+                price: high5m, color: '#ec4899', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted,
+                axisLabelVisible: true, title: '5M PREV HIGH'
+            }});
+            lines.l5 = candleSeries.createPriceLine({{
+                price: low5m, color: '#a855f7', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted,
+                axisLabelVisible: true, title: '5M PREV LOW'
+            }});
+        }}
+
+        updateAllLiquidityLines();
+
+        // --- HIGH INTEGRITY DUAL WEBSOCKETS (0-BLINK REAL-TIME ENGINE) ---
+        let wsKline = null;
+        let wsTrade = null;
+
+        function connectStreams() {{
+            wsKline = new WebSocket('wss://fstream.binance.com/ws/btcusdt@kline_5m');
+            wsKline.onmessage = (event) => {{
+                try {{
+                    const res = JSON.parse(event.data);
+                    const k = res.k;
+                    const o = parseFloat(k.o), h = parseFloat(k.h), l = parseFloat(k.l), c = parseFloat(k.c);
+                    if (o < 20000 || h < 20000 || l < 20000 || c < 20000) return;
+
+                    const candleTime = Math.floor(k.t / 1000) + localOffsetSeconds;
+                    currentBar = {{ time: candleTime, open: o, high: h, low: l, close: c }};
+                    candleSeries.update(currentBar);
+
+                    if (k.x) {{
+                        allCandles.push(currentBar);
+                        if (allCandles.length > 650) allCandles.shift();
+                        updateAllLiquidityLines();
+                    }}
+                }} catch(e) {{}}
+            }};
+            wsKline.onclose = () => {{ setTimeout(connectStreams, 2000); }};
+
+            wsTrade = new WebSocket('wss://fstream.binance.com/ws/btcusdt@trade');
+            wsTrade.onmessage = (event) => {{
+                try {{
+                    const t = JSON.parse(event.data);
+                    const livePrice = parseFloat(t.p);
+                    if (livePrice < 20000 || livePrice > 300000) return;
+
+                    document.getElementById('hud-live-price').innerText = "$" + livePrice.toFixed(1);
+
+                    if (currentBar) {{
+                        if (livePrice > currentBar.high) currentBar.high = livePrice;
+                        if (livePrice < currentBar.low) currentBar.low = livePrice;
+                        currentBar.close = livePrice;
+                        candleSeries.update(currentBar);
+                    }}
+                }} catch(e) {{}}
+            }};
+            wsTrade.onclose = () => {{ setTimeout(connectStreams, 2000); }};
+        }}
+
+        connectStreams();
+
+        function openVault() {{
+            document.getElementById('vaultModal').style.display = 'flex';
+            const list = document.getElementById('vaultList');
+            list.innerHTML = vaultTrades.length === 0 ? '<div style="font-size:10px; color:#565f70; text-align:center; padding:15px;">No trades yet. Scanning...</div>' : '';
+            vaultTrades.forEach(t => {{
+                list.innerHTML += `<div style="display:flex; justify-content:space-between; padding:4px 0; border-bottom:1px solid #161e2a; font-size:10px;">
+                    <span>${{t.time}} <b style="color:#00e5ff">${{t.dir}}</b> @ ${{t.entry}}</span>
+                    <span style="color:${{t.win === 1 ? '#089981' : '#f23645'}}">${{t.res}} ${{t.pnl}}</span>
+                </div>`;
+            }});
+        }}
+        function closeVault() {{ document.getElementById('vaultModal').style.display = 'none'; }}
+    </script>
+</body>
+</html>
+"""
+
+components.html(ui_html, height=490, scrolling=False)
