@@ -21,13 +21,12 @@ def init_db():
         CREATE TABLE IF NOT EXISTS vault (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT,
-            tf_tier TEXT,
+            timeframe TEXT,
             direction TEXT,
+            strategy_logic TEXT,
             entry REAL,
             sl REAL,
-            tp1 REAL,
-            tp2 REAL,
-            tp3 REAL,
+            tp REAL,
             exit REAL,
             result TEXT,
             pnl TEXT,
@@ -52,23 +51,23 @@ def save_vault(trade, exit_price, result, pnl, is_win):
         conn = sqlite3.connect(DB_FILE, check_same_thread=False)
         cur = conn.cursor()
         cur.execute('''
-            INSERT INTO vault (timestamp, tf_tier, direction, entry, sl, tp1, tp2, tp3, exit, result, pnl, is_win)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO vault (timestamp, timeframe, direction, strategy_logic, entry, sl, tp, exit, result, pnl, is_win)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
-            trade['time'], trade.get('tier', 'MULTI'), trade['dir'], trade['entry'],
-            trade['sl'], trade['tp1'], trade['tp2'], trade['tp3'], exit_price, result, pnl, is_win
+            trade['time'], trade['tf'], trade['dir'], trade['logic'],
+            trade['entry'], trade['sl'], trade['tp'], exit_price, result, pnl, is_win
         ))
         conn.commit()
         conn.close()
     except Exception:
         pass
 
-# --- 2. MULTI-SOURCE BINANCE HISTORICAL CANDLES ---
-def get_historical_candles(limit=580):
+# --- 2. MULTI-SOURCE 15M HISTORICAL CANDLES ---
+def get_historical_candles(limit=500):
     endpoints = [
-        f"https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=5m&limit={limit}",
-        f"https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=5m&limit={limit}",
-        f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=5m&limit={limit}"
+        f"https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=15m&limit={limit}",
+        f"https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=15m&limit={limit}",
+        f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=15m&limit={limit}"
     ]
     for url in endpoints:
         try:
@@ -85,8 +84,8 @@ def get_historical_candles(limit=580):
             continue
     return []
 
-# --- 3. ALL-SMC INSTITUTIONAL ENGINE ---
-class SMCEngine:
+# --- 3. DYNAMIC STRATEGY ENGINE (48H / 1H / 15M) ---
+class DynamicExecutionEngine:
     def __init__(self):
         self.state = "SCANNING"
         self.pending_setup = None
@@ -95,7 +94,7 @@ class SMCEngine:
 
     def calculate_atr(self, data, period=14):
         if len(data) < period + 1:
-            return 85.0
+            return 120.0
         trs = []
         for i in range(len(data) - period, len(data)):
             hl = data[i]['high'] - data[i]['low']
@@ -106,7 +105,7 @@ class SMCEngine:
 
     def on_closed_candle(self, closed_candle):
         self.candles_data.append(closed_candle)
-        if len(self.candles_data) > 650:
+        if len(self.candles_data) > 600:
             self.candles_data.pop(0)
 
         completed = self.candles_data[:-1]
@@ -114,31 +113,36 @@ class SMCEngine:
             return
         atr = self.calculate_atr(completed, 14)
 
-        # 48H Macro
-        slice48 = completed[-576:] if len(completed) >= 576 else completed
+        # 48H Levels (192 candles of 15m)
+        slice48 = completed[-192:] if len(completed) >= 192 else completed
         h48, l48 = max(c['high'] for c in slice48), min(c['low'] for c in slice48)
 
-        # 1H Intermediate
-        slice1h = completed[-12:]
+        # 1H Levels (4 candles of 15m)
+        slice1h = completed[-4:]
         h1h, l1h = max(c['high'] for c in slice1h), min(c['low'] for c in slice1h)
 
-        # 5M Local
+        # 15M Previous Candle Levels
         prev_bar = completed[-1]
-        h5m, l5m = prev_bar['high'], prev_bar['low']
+        h15m, l15m = prev_bar['high'], prev_bar['low']
 
         if self.state == "SCANNING":
+            # Priority 1: 48H Macro Sweep
             if closed_candle['low'] < l48:
-                self.setup_trigger("LONG", "48H MACRO SWEEP", l48, closed_candle['low'], closed_candle['time'], 3.0)
+                self.setup_trigger("LONG", "48-HOUR", "48H Macro SSL Swept -> Institutional Bullish Reclaim Confirmation", l48, closed_candle['low'], closed_candle['time'], 3.0)
             elif closed_candle['high'] > h48:
-                self.setup_trigger("SHORT", "48H MACRO SWEEP", h48, closed_candle['high'], closed_candle['time'], 3.0)
+                self.setup_trigger("SHORT", "48-HOUR", "48H Macro BSL Swept -> Institutional Bearish Rejection Confirmation", h48, closed_candle['high'], closed_candle['time'], 3.0)
+
+            # Priority 2: 1H Intermediate Sweep
             elif closed_candle['low'] < l1h:
-                self.setup_trigger("LONG", "1H SESSION SWEEP", l1h, closed_candle['low'], closed_candle['time'], 2.0)
+                self.setup_trigger("LONG", "1-HOUR", "1H Session Low Swept -> Intraday Bullish Reclaim", l1h, closed_candle['low'], closed_candle['time'], 2.0)
             elif closed_candle['high'] > h1h:
-                self.setup_trigger("SHORT", "1H SESSION SWEEP", h1h, closed_candle['high'], closed_candle['time'], 2.0)
-            elif closed_candle['low'] < l5m:
-                self.setup_trigger("LONG", "5M MICRO SWEEP", l5m, closed_candle['low'], closed_candle['time'], 1.5)
-            elif closed_candle['high'] > h5m:
-                self.setup_trigger("SHORT", "5M MICRO SWEEP", h5m, closed_candle['high'], closed_candle['time'], 1.5)
+                self.setup_trigger("SHORT", "1-HOUR", "1H Session High Swept -> Intraday Bearish Rejection", h1h, closed_candle['high'], closed_candle['time'], 2.0)
+
+            # Priority 3: 15M Local Structure Sweep
+            elif closed_candle['low'] < l15m:
+                self.setup_trigger("LONG", "15-MINUTE", "15M Prev Low Swept -> Local Structure Bullish CHoCH", l15m, closed_candle['low'], closed_candle['time'], 1.5)
+            elif closed_candle['high'] > h15m:
+                self.setup_trigger("SHORT", "15-MINUTE", "15M Prev High Swept -> Local Structure Bearish CHoCH", h15m, closed_candle['high'], closed_candle['time'], 1.5)
 
         elif self.state == "CONFIRMATION_WAIT" and self.pending_setup:
             ps = self.pending_setup
@@ -148,10 +152,8 @@ class SMCEngine:
                         entry = closed_candle['close']
                         sl = ps['extreme'] - (1.2 * atr)
                         risk = entry - sl
-                        tp1 = entry + (1.0 * risk)
-                        tp2 = entry + (2.0 * risk)
-                        tp3 = entry + (ps['rr'] * risk)
-                        self.arm_trade("LONG", ps['tier'], entry, sl, tp1, tp2, tp3, atr)
+                        tp = entry + (ps['rr'] * risk)
+                        self.arm_trade("LONG", ps['tf'], ps['logic'], entry, sl, tp, atr, ps['rr'])
                     else:
                         if closed_candle['low'] < ps['extreme']: self.pending_setup['extreme'] = closed_candle['low']
                         else: self.reset_scanner()
@@ -161,40 +163,36 @@ class SMCEngine:
                         entry = closed_candle['close']
                         sl = ps['extreme'] + (1.2 * atr)
                         risk = sl - entry
-                        tp1 = entry - (1.0 * risk)
-                        tp2 = entry - (2.0 * risk)
-                        tp3 = entry - (ps['rr'] * risk)
-                        self.arm_trade("SHORT", ps['tier'], entry, sl, tp1, tp2, tp3, atr)
+                        tp = entry - (ps['rr'] * risk)
+                        self.arm_trade("SHORT", ps['tf'], ps['logic'], entry, sl, tp, atr, ps['rr'])
                     else:
                         if closed_candle['high'] > ps['extreme']: self.pending_setup['extreme'] = closed_candle['high']
                         else: self.reset_scanner()
 
-    def setup_trigger(self, dir_type, tier, level, extreme, candle_time, rr):
+    def setup_trigger(self, dir_type, tf_name, logic_desc, level, extreme, candle_time, rr):
         self.state = "CONFIRMATION_WAIT"
         self.pending_setup = {
-            "dir": dir_type, "tier": tier, "level": level,
+            "dir": dir_type, "tf": tf_name, "logic": logic_desc, "level": level,
             "extreme": extreme, "candle_time": candle_time, "rr": rr
         }
 
-    def arm_trade(self, dir_type, tier, entry, sl, tp1, tp2, tp3, atr_val):
+    def arm_trade(self, dir_type, tf_name, logic_desc, entry, sl, tp, atr_val, rr):
         self.state = "ACTIVE_TRADE"
         t_str = datetime.now().strftime('%H:%M:%S')
         self.active_trade = {
-            "dir": dir_type, "tier": tier, "entry": entry,
-            "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
-            "atr": atr_val, "time": t_str
+            "dir": dir_type, "tf": tf_name, "logic": logic_desc, "entry": entry,
+            "sl": sl, "tp": tp, "atr": atr_val, "time": t_str, "rr": rr
         }
         emoji = "🟢" if dir_type == "LONG" else "🔴"
         msg = (
-            f"{emoji} <b>BTCUSDT {dir_type} ARMED [{tier}]</b>\n\n"
-            f"🎯 <b>Liquidity Reclaim Confirmed</b>\n"
+            f"{emoji} <b>BTCUSDT {dir_type} EXECUTED [{tf_name} FORMAT]</b>\n\n"
+            f"🧠 <b>Strategy Logic:</b> {logic_desc}\n"
+            f"🎯 <b>Risk/Reward Ratio:</b> 1:{rr}\n\n"
             f"🔹 <b>Entry:</b> ${entry:,.2f}\n"
             f"🛑 <b>Stop Loss:</b> ${sl:,.2f}\n"
-            f"🎯 <b>TP1 (1R):</b> ${tp1:,.2f}\n"
-            f"🎯 <b>TP2 (2R):</b> ${tp2:,.2f}\n"
-            f"🔥 <b>TP3 (Final):</b> ${tp3:,.2f}\n"
+            f"🎯 <b>Take Profit:</b> ${tp:,.2f}\n"
             f"🛡 <b>ATR(14):</b> {atr_val:.1f}\n\n"
-            f"<i>Execution engine scanning live ticks...</i>"
+            f"<i>Levels active on terminal chart. Monitoring live ticks...</i>"
         )
         send_telegram(msg)
         self.pending_setup = None
@@ -204,12 +202,13 @@ class SMCEngine:
             return
         save_vault(self.active_trade, exit_price, result, pnl, is_win)
         msg = (
-            f"🏁 <b>TRADE RESOLVED: {result} [{self.active_trade['tier']}]</b>\n\n"
+            f"🏁 <b>TRADE RESOLVED: {result}</b>\n\n"
+            f"⏱ <b>Format:</b> {self.active_trade['tf']}\n"
             f"📌 <b>Direction:</b> {self.active_trade['dir']}\n"
             f"🔹 <b>Entry:</b> ${self.active_trade['entry']:,.2f}\n"
             f"🔸 <b>Exit Price:</b> ${exit_price:,.2f}\n"
-            f"💰 <b>Result:</b> {pnl}\n\n"
-            f"🔄 <i>Scanning all formats (48H / 1H / 5M)...</i>"
+            f"💰 <b>Final P&L:</b> {pnl}\n\n"
+            f"🔄 <i>Chart cleared. Scanning next clean institutional liquidity pool...</i>"
         )
         send_telegram(msg)
         self.reset_scanner()
@@ -219,18 +218,17 @@ class SMCEngine:
         self.pending_setup = None
         self.active_trade = None
 
-# Global Engine Singleton
-if "smc_engine" not in st.session_state:
-    st.session_state["smc_engine"] = SMCEngine()
-engine = st.session_state["smc_engine"]
+if "exec_engine" not in st.session_state:
+    st.session_state["exec_engine"] = DynamicExecutionEngine()
+engine = st.session_state["exec_engine"]
 
-# --- 4. SAFE 24/7 BACKGROUND WORKER ---
+# --- 4. 24/7 BACKGROUND WORKER (15M KLINE + REAL-TIME TICKS) ---
 def run_worker_thread():
     async def kline_listener():
         while True:
             try:
                 async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect("wss://fstream.binance.com/ws/btcusdt@kline_5m") as ws:
+                    async with session.ws_connect("wss://fstream.binance.com/ws/btcusdt@kline_15m") as ws:
                         async for msg in ws:
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 data = json.loads(msg.data)
@@ -258,16 +256,16 @@ def run_worker_thread():
                                 if p > 10000 and engine.state == "ACTIVE_TRADE" and engine.active_trade:
                                     t = engine.active_trade
                                     if t['dir'] == "LONG":
-                                        if p >= t['tp3']: engine.resolve_trade("TP3 HIT 🔥", "+Final Target", 1, p)
-                                        elif p <= t['sl']: engine.resolve_trade("SL HIT 🛑", "-1R", 0, p)
+                                        if p >= t['tp']: engine.resolve_trade("TP HIT 🔥", f"+{t['rr']}R", 1, p)
+                                        elif p <= t['sl']: engine.resolve_trade("SL HIT 🛑", "-1.0R", 0, p)
                                     elif t['dir'] == "SHORT":
-                                        if p <= t['tp3']: engine.resolve_trade("TP3 HIT 🔥", "+Final Target", 1, p)
-                                        elif p >= t['sl']: engine.resolve_trade("SL HIT 🛑", "-1R", 0, p)
+                                        if p <= t['tp']: engine.resolve_trade("TP HIT 🔥", f"+{t['rr']}R", 1, p)
+                                        elif p >= t['sl']: engine.resolve_trade("SL HIT 🛑", "-1.0R", 0, p)
             except Exception:
                 await asyncio.sleep(5)
 
     async def runner():
-        engine.candles_data = get_historical_candles(580)
+        engine.candles_data = get_historical_candles(500)
         await asyncio.gather(kline_listener(), trade_listener())
 
     loop = asyncio.new_event_loop()
@@ -278,8 +276,8 @@ if "worker_running" not in st.session_state:
     st.session_state["worker_running"] = True
     threading.Thread(target=run_worker_thread, daemon=True).start()
 
-# --- 5. STREAMLIT FULL-SCREEN TRADING TERMINAL UI ---
-st.set_page_config(page_title="BTCUSDT RADAR", layout="wide", initial_sidebar_state="collapsed")
+# --- 5. CLEAN TERMINAL FRONTEND (15M ZERO-BLINK + DYNAMIC TRADING VIEW) ---
+st.set_page_config(page_title="BTCUSDT DYNAMIC TERMINAL", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown("""
     <style>
@@ -290,18 +288,20 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Vault Data
+# Vault Data Fetch
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cur = conn.cursor()
-cur.execute("SELECT timestamp, direction, entry, result, pnl, is_win FROM vault ORDER BY id DESC")
+cur.execute("SELECT timestamp, timeframe, direction, strategy_logic, entry, result, pnl, is_win FROM vault ORDER BY id DESC")
 rows = cur.fetchall()
 total_trades = len(rows)
 conn.close()
 
-vault_json = json.dumps([{"time": r[0], "dir": r[1], "entry": r[2], "res": r[3], "pnl": r[4], "win": r[5]} for r in rows])
+vault_json = json.dumps([{"time": r[0], "tf": r[1], "dir": r[2], "logic": r[3], "entry": r[4], "res": r[5], "pnl": r[6], "win": r[7]} for r in rows])
 
-ui_candles = get_historical_candles(580)
+ui_candles = get_historical_candles(500)
 candles_json = json.dumps(ui_candles)
+
+active_trade_json = json.dumps(engine.active_trade)
 
 ui_html = f"""
 <!DOCTYPE html>
@@ -310,7 +310,7 @@ ui_html = f"""
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
     <style>
-        * {{ margin:0; padding:0; box-sizing:border-box; font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
+        * {{ margin:0; padding:0; box-sizing:border-box; font-family:-apple-system, sans-serif; }}
         body {{ background:#080a0f; color:#d1d4dc; overflow:hidden; width:100vw; display:flex; flex-direction:column; }}
         .top-bar {{ display:flex; justify-content:space-between; align-items:center; padding:5px 8px; background:#0d1118; border-bottom:1px solid rgba(255,255,255,0.06); height:38px; font-size:10px; }}
         .badge-live {{ background:#089981; color:#fff; font-size:8px; font-weight:800; padding:2px 4px; border-radius:2px; }}
@@ -325,8 +325,6 @@ ui_html = f"""
         .modal-box {{ background:#0f141e; border:1px solid #1c2636; border-radius:8px; width:100%; max-width:380px; padding:14px; }}
         .c-green {{ color:#089981 !important; font-weight:bold; }}
         .c-red {{ color:#f23645 !important; font-weight:bold; }}
-        .c-orange {{ color:#fb923c !important; font-weight:bold; }}
-        .c-pink {{ color:#ec4899 !important; font-weight:bold; }}
         .c-cyan {{ color:#00e5ff !important; font-weight:bold; }}
         .c-yellow {{ color:#f59e0b !important; font-weight:bold; }}
     </style>
@@ -335,11 +333,10 @@ ui_html = f"""
     <div class="top-bar">
         <div style="display:flex; align-items:center; gap:8px;">
             <span class="badge-live">LIVE FUTURES</span>
-            <span class="badge-tf">5M • 1H • 48H</span>
+            <span class="badge-tf">15M • 1H • 48H</span>
             <div><span style="font-size:7px; color:#565f70; font-weight:700;">RADAR</span><div id="hud-status" class="c-yellow" style="font-weight:800; font-size:10px;">SCANNING</div></div>
             <div><span style="font-size:7px; color:#565f70; font-weight:700;">PRICE</span><div id="hud-live-price" class="c-cyan" style="font-weight:800; font-size:10px;">--</div></div>
-            <div><span style="font-size:7px; color:#565f70; font-weight:700;">SL</span><div id="hud-sl" class="c-red" style="font-weight:800; font-size:10px;">--</div></div>
-            <div><span style="font-size:7px; color:#565f70; font-weight:700;">TP</span><div id="hud-tp" class="c-green" style="font-weight:800; font-size:10px;">--</div></div>
+            <div><span style="font-size:7px; color:#565f70; font-weight:700;">ACTIVE TF</span><div id="hud-tf" class="c-cyan" style="font-weight:800; font-size:10px;">CLEAN</div></div>
         </div>
         <button class="vault-btn" onclick="openVault()">📜 VAULT ({total_trades})</button>
     </div>
@@ -348,16 +345,16 @@ ui_html = f"""
 
     <div class="bottom-section">
         <div class="bot-bar-1">
-            <div>ACCOUNT: <span class="c-green">$10.00 BASE</span> | ALLOCATION: <span class="c-cyan">$2.50 (10x)</span></div>
+            <div id="status-line">SYSTEM: <span class="c-green">SCANNING 48H • 1H • 15M</span> (CLEAN SCREEN)</div>
             <div style="display:flex; gap:5px;">
                 <span style="border:1px solid rgba(202,138,4,0.4); color:#fbbf24; padding:1px 4px; border-radius:2px; font-weight:700;">⚡ FORCE CLOSE</span>
                 <span style="border:1px solid rgba(220,38,38,0.4); color:#f87171; padding:1px 4px; border-radius:2px; font-weight:700;">🚨 KILL SWITCH</span>
             </div>
         </div>
         <div class="bot-bar-2">
-            <div class="info-card"><span style="color:#565f70;">48H RANGE</span><span id="card-48h" class="c-red">--</span></div>
-            <div class="info-card"><span style="color:#565f70;">1H RANGE</span><span id="card-1h" class="c-orange">--</span></div>
-            <div class="info-card"><span style="color:#565f70;">5M PREV BAR</span><span id="card-5m" class="c-pink">--</span></div>
+            <div class="info-card"><span style="color:#565f70;">ENGINE</span><span class="c-green">15M CASCADE</span></div>
+            <div class="info-card"><span style="color:#565f70;">ACTIVE SETUP</span><span id="card-setup" class="c-yellow">WAITING SWEEP</span></div>
+            <div class="info-card"><span style="color:#565f70;">FORMATS</span><span class="c-cyan">48H • 1H • 15M</span></div>
             <div class="info-card"><span style="color:#565f70;">SHIELD</span><span class="c-green">ARMED 🛡️</span></div>
         </div>
     </div>
@@ -365,18 +362,17 @@ ui_html = f"""
     <div id="vaultModal" class="modal">
         <div class="modal-box">
             <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #1c2636; padding-bottom:8px; margin-bottom:8px;">
-                <span style="font-weight:bold; font-size:12px;">🔒 SQLITE VAULT</span>
+                <span style="font-weight:bold; font-size:12px;">🔒 TIMEFRAME EXECUTION VAULT</span>
                 <span style="cursor:pointer; font-weight:bold;" onclick="closeVault()">✕</span>
             </div>
-            <div id="vaultList" style="max-height: 220px; overflow-y: auto;"></div>
+            <div id="vaultList" style="max-height: 250px; overflow-y: auto;"></div>
         </div>
     </div>
 
     <script>
         const rawCandles = {candles_json};
         const vaultTrades = {vault_json};
-
-        // Indian Standard Time (IST) Offset: UTC + 5:30
+        let activeTrade = {active_trade_json};
         const localOffsetSeconds = 5.5 * 3600;
 
         let allCandles = rawCandles.map(c => ({{
@@ -421,80 +417,65 @@ ui_html = f"""
             chart.timeScale().fitContent();
         }}
 
-        // --- LIQUIDITY LINES STORAGE (48H + 1H + 5M) ---
-        let lines = {{
-            h48: null, l48: null,
-            h1: null, l1: null,
-            h5: null, l5: null
-        }};
+        // Dynamic Trade Line References
+        let activeLines = {{ entry: null, sl: null, tp: null }};
 
-        function updateAllLiquidityLines() {{
-            if (allCandles.length < 20) return;
+        function renderDynamicTradeLines() {{
+            if (activeLines.entry) candleSeries.removePriceLine(activeLines.entry);
+            if (activeLines.sl) candleSeries.removePriceLine(activeLines.sl);
+            if (activeLines.tp) candleSeries.removePriceLine(activeLines.tp);
+            activeLines = {{ entry: null, sl: null, tp: null }};
 
-            // 1. 48-Hour Macro Liquidity
-            const slice48 = allCandles.slice(-576);
-            const high48 = Math.max(...slice48.map(c => c.high));
-            const low48 = Math.min(...slice48.map(c => c.low));
+            if (activeTrade) {{
+                document.getElementById('hud-status').innerText = activeTrade.dir + " ARMED";
+                document.getElementById('hud-status').className = activeTrade.dir === "LONG" ? "c-green" : "c-red";
+                document.getElementById('hud-tf').innerText = activeTrade.tf;
+                document.getElementById('status-line').innerHTML = `SETUP: <span class="c-cyan">${{activeTrade.tf}}</span> | <span class="c-green">${{activeTrade.logic}}</span>`;
+                document.getElementById('card-setup').innerText = activeTrade.tf + " " + activeTrade.dir;
 
-            // 2. 1-Hour Intermediate Liquidity
-            const slice1h = allCandles.slice(-12);
-            const high1h = Math.max(...slice1h.map(c => c.high));
-            const low1h = Math.min(...slice1h.map(c => c.low));
+                activeLines.entry = candleSeries.createPriceLine({{
+                    price: activeTrade.entry,
+                    color: '#38bdf8',
+                    lineWidth: 2,
+                    lineStyle: LightweightCharts.LineStyle.Solid,
+                    axisLabelVisible: true,
+                    title: `ENTRY [${{activeTrade.tf}}]`
+                }});
 
-            // 3. 5-Minute Previous Bar Liquidity
-            const prevCandle = allCandles.length >= 2 ? allCandles[allCandles.length - 2] : allCandles[allCandles.length - 1];
-            const high5m = prevCandle.high;
-            const low5m = prevCandle.low;
+                activeLines.sl = candleSeries.createPriceLine({{
+                    price: activeTrade.sl,
+                    color: '#f43f5e',
+                    lineWidth: 2,
+                    lineStyle: LightweightCharts.LineStyle.Dashed,
+                    axisLabelVisible: true,
+                    title: 'STOP LOSS'
+                }});
 
-            // Update Bottom Cards
-            document.getElementById('card-48h').innerText = `$${{low48.toFixed(0)}} - $${{high48.toFixed(0)}}`;
-            document.getElementById('card-1h').innerText = `$${{low1h.toFixed(0)}} - $${{high1h.toFixed(0)}}`;
-            document.getElementById('card-5m').innerText = `$${{low5m.toFixed(0)}} - $${{high5m.toFixed(0)}}`;
-
-            // Remove existing lines
-            Object.keys(lines).forEach(k => {{
-                if (lines[k]) {{ candleSeries.removePriceLine(lines[k]); lines[k] = null; }}
-            }});
-
-            // 48H LINES
-            lines.h48 = candleSeries.createPriceLine({{
-                price: high48, color: '#f23645', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed,
-                axisLabelVisible: true, title: '48H HIGH POOL (BSL)'
-            }});
-            lines.l48 = candleSeries.createPriceLine({{
-                price: low48, color: '#089981', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed,
-                axisLabelVisible: true, title: '48H LOW POOL (SSL)'
-            }});
-
-            // 1H LINES
-            lines.h1 = candleSeries.createPriceLine({{
-                price: high1h, color: '#fb923c', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.LargeDashed,
-                axisLabelVisible: true, title: '1H HIGH'
-            }});
-            lines.l1 = candleSeries.createPriceLine({{
-                price: low1h, color: '#2dd4bf', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.LargeDashed,
-                axisLabelVisible: true, title: '1H LOW'
-            }});
-
-            // 5M LINES
-            lines.h5 = candleSeries.createPriceLine({{
-                price: high5m, color: '#ec4899', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted,
-                axisLabelVisible: true, title: '5M PREV HIGH'
-            }});
-            lines.l5 = candleSeries.createPriceLine({{
-                price: low5m, color: '#a855f7', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted,
-                axisLabelVisible: true, title: '5M PREV LOW'
-            }});
+                activeLines.tp = candleSeries.createPriceLine({{
+                    price: activeTrade.tp,
+                    color: '#10b981',
+                    lineWidth: 2,
+                    lineStyle: LightweightCharts.LineStyle.Dashed,
+                    axisLabelVisible: true,
+                    title: `TARGET TP (${{activeTrade.rr}}R)`
+                }});
+            }} else {{
+                document.getElementById('hud-status').innerText = "SCANNING";
+                document.getElementById('hud-status').className = "c-yellow";
+                document.getElementById('hud-tf').innerText = "CLEAN";
+                document.getElementById('status-line').innerHTML = 'SYSTEM: <span class="c-green">SCANNING 48H • 1H • 15M</span> (NO CLUTTER)';
+                document.getElementById('card-setup').innerText = "WAITING SWEEP";
+            }}
         }}
 
-        updateAllLiquidityLines();
+        renderDynamicTradeLines();
 
-        // --- HIGH INTEGRITY DUAL WEBSOCKETS (0-BLINK REAL-TIME ENGINE) ---
+        // 15M Kline + 0-Blink Real-Time Tick Stream
         let wsKline = null;
         let wsTrade = null;
 
         function connectStreams() {{
-            wsKline = new WebSocket('wss://fstream.binance.com/ws/btcusdt@kline_5m');
+            wsKline = new WebSocket('wss://fstream.binance.com/ws/btcusdt@kline_15m');
             wsKline.onmessage = (event) => {{
                 try {{
                     const res = JSON.parse(event.data);
@@ -505,12 +486,6 @@ ui_html = f"""
                     const candleTime = Math.floor(k.t / 1000) + localOffsetSeconds;
                     currentBar = {{ time: candleTime, open: o, high: h, low: l, close: c }};
                     candleSeries.update(currentBar);
-
-                    if (k.x) {{
-                        allCandles.push(currentBar);
-                        if (allCandles.length > 650) allCandles.shift();
-                        updateAllLiquidityLines();
-                    }}
                 }} catch(e) {{}}
             }};
             wsKline.onclose = () => {{ setTimeout(connectStreams, 2000); }};
@@ -540,12 +515,16 @@ ui_html = f"""
         function openVault() {{
             document.getElementById('vaultModal').style.display = 'flex';
             const list = document.getElementById('vaultList');
-            list.innerHTML = vaultTrades.length === 0 ? '<div style="font-size:10px; color:#565f70; text-align:center; padding:15px;">No trades yet. Scanning...</div>' : '';
+            list.innerHTML = vaultTrades.length === 0 ? '<div style="font-size:10px; color:#565f70; text-align:center; padding:15px;">No resolved trades yet. Engine actively scanning...</div>' : '';
             vaultTrades.forEach(t => {{
-                list.innerHTML += `<div style="display:flex; justify-content:space-between; padding:4px 0; border-bottom:1px solid #161e2a; font-size:10px;">
-                    <span>${{t.time}} <b style="color:#00e5ff">${{t.dir}}</b> @ ${{t.entry}}</span>
-                    <span style="color:${{t.win === 1 ? '#089981' : '#f23645'}}">${{t.res}} ${{t.pnl}}</span>
-                </div>`;
+                list.innerHTML += `
+                    <div style="padding:6px 0; border-bottom:1px solid #161e2a; font-size:9.5px;">
+                        <div style="display:flex; justify-content:space-between; margin-bottom:2px;">
+                            <span>${{t.time}} <b style="color:#fbbf24">[${{t.tf}}]</b> <b style="color:${{t.dir === 'LONG' ? '#089981' : '#f43f5e'}}">${{t.dir}}</b> @ ${{t.entry}}</span>
+                            <span style="font-weight:bold; color:${{t.win === 1 ? '#089981' : '#f43f5e'}}">${{t.res}} (${{t.pnl}})</span>
+                        </div>
+                        <div style="color:#64748b; font-size:8.5px;">Logic: ${{t.logic}}</div>
+                    </div>`;
             }});
         }}
         function closeVault() {{ document.getElementById('vaultModal').style.display = 'none'; }}
