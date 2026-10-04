@@ -10,13 +10,13 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# Streamlit chrome aur blank space ko zero lock karein
+# Streamlit empty background
 st.markdown("""
     <style>
         header, footer, #MainMenu { visibility: hidden !important; height: 0 !important; }
         .block-container { padding: 0 !important; margin: 0 !important; max-width: 100% !important; background-color: #080a0f !important; }
-        .stApp { background-color: #080a0f !important; overflow: hidden !important; }
-        iframe { border: none !important; width: 100vw !important; height: 100vh !important; display: block !important; }
+        .stApp { background-color: #080a0f !important; }
+        iframe { border: none !important; width: 100vw !important; display: block !important; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -72,11 +72,10 @@ custom_app_html = f"""
     <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
-        html, body {{ 
+        body {{ 
             background-color: #080a0f; 
             color: #d1d4dc; 
             overflow: hidden; 
-            height: 100vh; 
             width: 100vw;
             display: flex; 
             flex-direction: column; 
@@ -113,15 +112,14 @@ custom_app_html = f"""
             color: #64748b; pointer-events: none;
         }}
 
-        /* CHART CONTAINER: Fills exact screen height between top and bottom bars */
+        /* CHART CONTAINER HEIGHT: Compact size taaki saare controls upar fit ho sakein */
         #chart-container {{
-            flex: 1;
             width: 100vw;
+            height: 375px;
             position: relative;
-            min-height: 0;
         }}
 
-        /* BOTTOM SECTION (TIGHTLY ATTACHED TO BOTTOM OF CHART) */
+        /* BOTTOM CONTROLS (DIRECTLY GLUED UNDER TIME AXIS) */
         .bottom-section {{
             display: flex;
             flex-direction: column;
@@ -204,10 +202,10 @@ custom_app_html = f"""
     <!-- BASIS BADGE -->
     <div id="basis-box" class="basis-badge">SCANNING: Awaiting 48H Sweep / Structure Shift</div>
 
-    <!-- MAIN CHART AREA -->
+    <!-- MAIN CHART -->
     <div id="chart-container"></div>
 
-    <!-- BOTTOM CONTROLS & SCANNER PANELS (TIGHTLY ATTACHED) -->
+    <!-- CONTROLS & SCANNER PANELS -->
     <div class="bottom-section">
         <div class="bot-bar-1">
             <div>ACCOUNT: <span class="c-green">$10.00 BASE</span> | ALLOCATION: <span class="c-cyan">$2.50 (10x)</span></div>
@@ -347,7 +345,7 @@ custom_app_html = f"""
             document.getElementById('basis-box').style.borderColor = "#232f42";
         }}
 
-        // LIVE REAL-TIME BINANCE WEBSOCKET
+        // LIVE BINANCE WEBSOCKET
         const ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@kline_5m');
         ws.onmessage = (event) => {{
             const res = JSON.parse(event.data);
@@ -385,7 +383,6 @@ custom_app_html = f"""
             document.getElementById('vaultModal').style.display = 'none';
         }}
 
-        // Screen change par auto fit resize
         window.addEventListener('resize', () => {{
             chart.resize(container.clientWidth, container.clientHeight);
         }});
@@ -394,4 +391,5 @@ custom_app_html = f"""
 </html>
 """
 
-components.html(custom_app_html, height=720, scrolling=False)
+# Iframe height exact 490px par lock taaki neeche ki jagah poori blank/clear rahe
+components.html(custom_app_html, height=490, scrolling=False)
