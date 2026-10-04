@@ -11,9 +11,9 @@ from datetime import datetime
 # --- CONFIGURATION & TELEGRAM ---
 BOT_TOKEN = "8941403990:AAGLH_dupqmGoipglhVvRuiPBzvgMqJR3Ms"
 CHAT_ID = "7886716805"
-DB_FILE = "trades_vault_v2.db"  # Fresh clean version to completely fix SQLite error
+DB_FILE = "trades_vault_v2.db"
 
-# --- 1. SQLITE VAULT SETUP (AUTO-MIGRATED) ---
+# --- 1. SQLITE VAULT SETUP ---
 def init_db():
     try:
         conn = sqlite3.connect(DB_FILE, check_same_thread=False)
@@ -65,7 +65,7 @@ def save_vault(trade, exit_price, result, pnl, is_win):
     except Exception:
         pass
 
-# --- 2. MULTI-SOURCE 15M HISTORICAL CANDLES ---
+# --- 2. ACCURATE 15M HISTORICAL CANDLES FETCHER ---
 def get_historical_candles(limit=500):
     endpoints = [
         f"https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=15m&limit={limit}",
@@ -75,13 +75,16 @@ def get_historical_candles(limit=500):
     for url in endpoints:
         try:
             r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3.5).json()
-            if isinstance(r, list) and len(r) > 100:
+            if isinstance(r, list) and len(r) > 50:
                 candles = []
                 for b in r:
+                    open_ts = int(b[0] / 1000)
                     o, h, l, c = float(b[1]), float(b[2]), float(b[3]), float(b[4])
                     if min(o, h, l, c) > 10000:
-                        candles.append({"time": int(b[0]/1000), "open": o, "high": h, "low": l, "close": c})
-                if len(candles) > 100:
+                        # Lock to exact 15-min boundary (900 seconds)
+                        normalized_ts = (open_ts // 900) * 900
+                        candles.append({"time": normalized_ts, "open": o, "high": h, "low": l, "close": c})
+                if len(candles) > 50:
                     return candles
         except Exception:
             continue
@@ -116,24 +119,24 @@ class DynamicExecutionEngine:
             return
         atr = self.calculate_atr(completed, 14)
 
-        # 48H Levels (192 candles of 15m)
+        # 48H Levels (192 x 15m candles)
         slice48 = completed[-192:] if len(completed) >= 192 else completed
         h48, l48 = max(c['high'] for c in slice48), min(c['low'] for c in slice48)
 
-        # 1H Levels (4 candles of 15m)
+        # 1H Levels (4 x 15m candles)
         slice1h = completed[-4:]
         h1h, l1h = max(c['high'] for c in slice1h), min(c['low'] for c in slice1h)
 
-        # 15M Previous Candle Levels
+        # 15M Prev Candle Levels
         prev_bar = completed[-1]
         h15m, l15m = prev_bar['high'], prev_bar['low']
 
         if self.state == "SCANNING":
             # Priority 1: 48H Macro Sweep
             if closed_candle['low'] < l48:
-                self.setup_trigger("LONG", "48-HOUR", "48H Macro SSL Swept -> Institutional Bullish Reclaim Confirmation", l48, closed_candle['low'], closed_candle['time'], 3.0)
+                self.setup_trigger("LONG", "48-HOUR", "48H Macro SSL Swept -> Bullish Reclaim Confirmation", l48, closed_candle['low'], closed_candle['time'], 3.0)
             elif closed_candle['high'] > h48:
-                self.setup_trigger("SHORT", "48-HOUR", "48H Macro BSL Swept -> Institutional Bearish Rejection Confirmation", h48, closed_candle['high'], closed_candle['time'], 3.0)
+                self.setup_trigger("SHORT", "48-HOUR", "48H Macro BSL Swept -> Bearish Rejection Confirmation", h48, closed_candle['high'], closed_candle['time'], 3.0)
 
             # Priority 2: 1H Intermediate Sweep
             elif closed_candle['low'] < l1h:
@@ -225,7 +228,7 @@ if "exec_engine" not in st.session_state:
     st.session_state["exec_engine"] = DynamicExecutionEngine()
 engine = st.session_state["exec_engine"]
 
-# --- 4. 24/7 BACKGROUND WORKER ---
+# --- 4. SAFE 24/7 BACKGROUND WORKER ---
 def run_worker_thread():
     async def kline_listener():
         while True:
@@ -238,7 +241,7 @@ def run_worker_thread():
                                 k = data.get('k', {})
                                 if k.get('x'):
                                     c = {
-                                        "time": int(k['t'] / 1000),
+                                        "time": (int(k['t'] / 1000) // 900) * 900,
                                         "open": float(k['o']), "high": float(k['h']),
                                         "low": float(k['l']), "close": float(k['c'])
                                     }
@@ -279,7 +282,7 @@ if "worker_running" not in st.session_state:
     st.session_state["worker_running"] = True
     threading.Thread(target=run_worker_thread, daemon=True).start()
 
-# --- 5. STREAMLIT FULL-SCREEN TRADING TERMINAL UI ---
+# --- 5. ULTRA-ACCURATE STREAMLIT UI ---
 st.set_page_config(page_title="BTCUSDT DYNAMIC TERMINAL", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown("""
@@ -291,7 +294,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Safe Vault Fetch (Never Crashes Streamlit)
+# Vault Data Fetch
 rows = []
 try:
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
@@ -307,7 +310,6 @@ vault_json = json.dumps([{"time": r[0], "tf": r[1], "dir": r[2], "logic": r[3], 
 
 ui_candles = get_historical_candles(500)
 candles_json = json.dumps(ui_candles)
-
 active_trade_json = json.dumps(engine.active_trade)
 
 ui_html = f"""
@@ -317,7 +319,7 @@ ui_html = f"""
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
     <style>
-        * {{ margin:0; padding:0; box-sizing:border-box; font-family:-apple-system, sans-serif; }}
+        * {{ margin:0; padding:0; box-sizing:border-box; font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
         body {{ background:#080a0f; color:#d1d4dc; overflow:hidden; width:100vw; display:flex; flex-direction:column; }}
         .top-bar {{ display:flex; justify-content:space-between; align-items:center; padding:5px 8px; background:#0d1118; border-bottom:1px solid rgba(255,255,255,0.06); height:38px; font-size:10px; }}
         .badge-live {{ background:#089981; color:#fff; font-size:8px; font-weight:800; padding:2px 4px; border-radius:2px; }}
@@ -359,7 +361,7 @@ ui_html = f"""
             </div>
         </div>
         <div class="bot-bar-2">
-            <div class="info-card"><span style="color:#565f70;">ENGINE</span><span class="c-green">15M CASCADE</span></div>
+            <div class="info-card"><span style="color:#565f70;">ENGINE</span><span class="c-green">15M EXACT</span></div>
             <div class="info-card"><span style="color:#565f70;">ACTIVE SETUP</span><span id="card-setup" class="c-yellow">WAITING SWEEP</span></div>
             <div class="info-card"><span style="color:#565f70;">FORMATS</span><span class="c-cyan">48H • 1H • 15M</span></div>
             <div class="info-card"><span style="color:#565f70;">SHIELD</span><span class="c-green">ARMED 🛡️</span></div>
@@ -380,16 +382,27 @@ ui_html = f"""
         const rawCandles = {candles_json};
         const vaultTrades = {vault_json};
         let activeTrade = {active_trade_json};
-        const localOffsetSeconds = 5.5 * 3600;
+        const localOffsetSeconds = 5.5 * 3600; // Exact IST Offset (+5:30)
 
-        let allCandles = rawCandles.map(c => ({{
-            time: c.time + localOffsetSeconds,
-            open: c.open,
-            high: c.high,
-            low: c.low,
-            close: c.close
-        }}));
+        // Strict 15M alignment helper (900 seconds)
+        function align15m(ts) {{
+            return Math.floor(ts / 900) * 900;
+        }}
 
+        // Deduplicate and align historical candles
+        let candleMap = new Map();
+        rawCandles.forEach(c => {{
+            const alignedTime = align15m(c.time) + localOffsetSeconds;
+            candleMap.set(alignedTime, {{
+                time: alignedTime,
+                open: c.open,
+                high: c.high,
+                low: c.low,
+                close: c.close
+            }});
+        }});
+
+        let allCandles = Array.from(candleMap.values()).sort((a, b) => a.time - b.time);
         let currentBar = allCandles.length > 0 ? {{ ...allCandles[allCandles.length - 1] }} : null;
 
         const container = document.getElementById('chart-container');
@@ -408,7 +421,7 @@ ui_html = f"""
                 borderColor: '#161e2a',
                 timeVisible: true,
                 secondsVisible: false,
-                barSpacing: 8,
+                barSpacing: 9,
                 rightOffset: 3
             }}
         }});
@@ -469,13 +482,14 @@ ui_html = f"""
                 document.getElementById('hud-status').innerText = "SCANNING";
                 document.getElementById('hud-status').className = "c-yellow";
                 document.getElementById('hud-tf').innerText = "CLEAN";
-                document.getElementById('status-line').innerHTML = 'SYSTEM: <span class="c-green">SCANNING 48H • 1H • 15M</span> (NO CLUTTER)';
+                document.getElementById('status-line').innerHTML = 'SYSTEM: <span class="c-green">SCANNING 48H • 1H • 15M</span> (CLEAN SCREEN)';
                 document.getElementById('card-setup').innerText = "WAITING SWEEP";
             }}
         }}
 
         renderDynamicTradeLines();
 
+        // High Accuracy 15M Kline + Real-time Trade Stream
         let wsKline = null;
         let wsTrade = null;
 
@@ -488,8 +502,8 @@ ui_html = f"""
                     const o = parseFloat(k.o), h = parseFloat(k.h), l = parseFloat(k.l), c = parseFloat(k.c);
                     if (o < 20000 || h < 20000 || l < 20000 || c < 20000) return;
 
-                    const candleTime = Math.floor(k.t / 1000) + localOffsetSeconds;
-                    currentBar = {{ time: candleTime, open: o, high: h, low: l, close: c }};
+                    const alignedTime = align15m(Math.floor(k.t / 1000)) + localOffsetSeconds;
+                    currentBar = {{ time: alignedTime, open: o, high: h, low: l, close: c }};
                     candleSeries.update(currentBar);
                 }} catch(e) {{}}
             }};
@@ -505,8 +519,9 @@ ui_html = f"""
                     document.getElementById('hud-live-price').innerText = "$" + livePrice.toFixed(1);
 
                     if (currentBar) {{
-                        if (livePrice > currentBar.high) currentBar.high = livePrice;
-                        if (livePrice < currentBar.low) currentBar.low = livePrice;
+                        let changed = false;
+                        if (livePrice > currentBar.high) {{ currentBar.high = livePrice; changed = true; }}
+                        if (livePrice < currentBar.low) {{ currentBar.low = livePrice; changed = true; }}
                         currentBar.close = livePrice;
                         candleSeries.update(currentBar);
                     }}
