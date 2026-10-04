@@ -13,10 +13,9 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# Har 2.5 second me silent high-frequency tick
-st_autorefresh(interval=2500, limit=None, key="institutional_34_engine_radar")
+# Har 2.5 second me background refresh
+st_autorefresh(interval=2500, limit=None, key="inst_engine_tick")
 
-# Exact Dark Theme + Floating Vault CSS
 st.markdown("""
     <style>
         header, footer, #MainMenu { visibility: hidden !important; height: 0 !important; }
@@ -56,7 +55,7 @@ st.markdown("""
             display: inline-block;
         }
 
-        /* Floating Popup Modal */
+        /* Floating Modal Overlay */
         .modal-overlay {
             position: fixed !important;
             top: 0 !important;
@@ -98,7 +97,7 @@ st.markdown("""
             font-weight: 900;
         }
 
-        /* Bottom Controls Row 1 */
+        /* Bottom Control Bars */
         .bottom-panel-1 {
             display: flex;
             justify-content: space-between;
@@ -129,7 +128,6 @@ st.markdown("""
             font-size: 8px;
         }
 
-        /* Bottom Controls Row 2 */
         .bottom-panel-2 {
             display: grid;
             grid-template-columns: repeat(4, 1fr);
@@ -156,7 +154,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# --- SQLite Trade Vault Database ---
+# Database
 conn = sqlite3.connect('trades_vault.db', check_same_thread=False)
 cur = conn.cursor()
 cur.execute('''
@@ -172,193 +170,110 @@ cur.execute('''
 ''')
 conn.commit()
 
-# Clean mock dummy data if remaining from previous tests
-if 'cleaned_vault' not in st.session_state:
-    cur.execute("SELECT COUNT(*) FROM vault WHERE result LIKE '%(50%)%'")
-    if cur.fetchone()[0] > 0:
-        cur.execute("DELETE FROM vault")
-        conn.commit()
-    st.session_state['cleaned_vault'] = True
-
 cur.execute("SELECT COUNT(*) FROM vault")
 vault_count = cur.fetchone()[0]
 
-# =========================================================================
-# 1. MULTI-TIMEFRAME DATA ENGINE (OHLCV + VOLATILITY)
-# =========================================================================
-def fetch_mtf_data():
+# Multi-Timeframe Data Fetching
+def fetch_candles():
     headers = {'User-Agent': 'Mozilla/5.0'}
     urls = [
-        ("https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=65",
-         "https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=50"),
-        ("https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=65",
-         "https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=50")
+        "https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=70",
+        "https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=70"
     ]
-    for u5, u1h in urls:
+    for u in urls:
         try:
-            r5 = requests.get(u5, headers=headers, timeout=2.5).json()
-            r1 = requests.get(u1h, headers=headers, timeout=2.5).json()
-            if isinstance(r5, list) and len(r5) > 10 and isinstance(r1, list) and len(r1) > 10:
-                df5 = pd.DataFrame(r5, columns=['t','o','h','l','c','v','ct','qa','tr','tb','tq','i'])
-                df1 = pd.DataFrame(r1, columns=['t','o','h','l','c','v','ct','qa','tr','tb','tq','i'])
-                for df in [df5, df1]:
-                    df['time'] = pd.to_datetime(df['t'], unit='ms')
-                    for col in ['o','h','l','c','v']: df[col] = df[col].astype(float)
-                    df.rename(columns={'o':'open','h':'high','l':'low','c':'close','v':'volume'}, inplace=True)
-                return df5, df1
+            res = requests.get(u, headers=headers, timeout=2.0).json()
+            if isinstance(res, list) and len(res) > 10:
+                df = pd.DataFrame(res, columns=['t','o','h','l','c','v','ct','qa','tr','tb','tq','i'])
+                df['time'] = pd.to_datetime(df['t'], unit='ms')
+                for col in ['o','h','l','c','v']: df[col] = df[col].astype(float)
+                df.rename(columns={'o':'open','h':'high','l':'low','c':'close','v':'volume'}, inplace=True)
+                return df
         except Exception:
             continue
-    return pd.DataFrame(), pd.DataFrame()
+    return pd.DataFrame()
 
-df_5m, df_1h = fetch_mtf_data()
-if df_5m.empty:
+df = fetch_candles()
+if df.empty:
     st.stop()
 
-# =========================================================================
-# 2. 48H STRUCTURE + PREVIOUS-DAY ENGINE (PDH / PDL / POC)
-# =========================================================================
-pd_window = df_1h.iloc[-48:-24] if len(df_1h) >= 48 else df_1h.iloc[:24]
-pdh = float(pd_window['high'].max())
-pdl = float(pd_window['low'].min())
-h48 = float(df_1h['high'].max())
-l48 = float(df_1h['low'].min())
+# Indicators & Structure
+df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
+df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
+df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
 
-# =========================================================================
-# 3. REGIME DETECTION + TECHNICAL ENGINES (MOMENTUM / SQUEEZE / VOL)
-# =========================================================================
-# Moving Averages & Bands
-df_5m['ema9'] = df_5m['close'].ewm(span=9, adjust=False).mean()
-df_5m['ema21'] = df_5m['close'].ewm(span=21, adjust=False).mean()
-df_5m['ema50'] = df_5m['close'].ewm(span=50, adjust=False).mean()
-
-# ATR
-df_5m['tr'] = np.maximum(df_5m['high'] - df_5m['low'],
-                         np.maximum(abs(df_5m['high'] - df_5m['close'].shift()),
-                                    abs(df_5m['low'] - df_5m['close'].shift())))
-df_5m['atr'] = df_5m['tr'].rolling(14).mean()
-
-# Bollinger Bands (Squeeze Engine)
-df_5m['bb_mid'] = df_5m['close'].rolling(20).mean()
-df_5m['bb_std'] = df_5m['close'].rolling(20).std()
-df_5m['bb_up'] = df_5m['bb_mid'] + (df_5m['bb_std'] * 2)
-df_5m['bb_low'] = df_5m['bb_mid'] - (df_5m['bb_std'] * 2)
-df_5m['bb_width'] = (df_5m['bb_up'] - df_5m['bb_low']) / df_5m['bb_mid']
-
-# RSI Momentum Engine
-delta = df_5m['close'].diff()
-gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-rs = gain / (loss + 1e-9)
-df_5m['rsi'] = 100 - (100 / (1 + rs))
-
-# Last Bar Variables
-last = df_5m.iloc[-1]
-prev = df_5m.iloc[-2]
+last = df.iloc[-1]
+prev = df.iloc[-2]
 cur_p = round(float(last['close']), 2)
-cur_atr = round(float(last['atr']) if not np.isnan(last['atr']) else 110.0, 2)
-if cur_atr < 35: cur_atr = 95.0
+atr = round(abs(float(last['high']) - float(last['low'])), 2)
+if atr < 35: atr = 85.0
 
-# Regime Detection
-adx_proxy = abs(last['ema9'] - last['ema50']) / cur_atr
-if last['bb_width'] < 0.003:
-    market_regime = "BB SQUEEZE"
-elif adx_proxy > 1.8:
+# Regime
+if abs(last['ema9'] - last['ema50']) > (atr * 1.2):
     market_regime = "TRENDING"
 else:
-    market_regime = "RANGING"
+    market_regime = "PULLBACK REGIME"
 
-# =========================================================================
-# 4. CONFLUENCE AI SCORING (LIQUIDITY SWEEP + MSS + FVG + PULLBACK)
-# =========================================================================
-score = 0
-reasons = []
-
-# (A) Liquidity Sweep Engine
-if prev['low'] <= pdl and last['close'] > pdl:
-    score += 35
-    reasons.append("PDL LIQ SWEEP")
-elif prev['high'] >= pdh and last['close'] < pdh:
-    score -= 35
-    reasons.append("PDH LIQ SWEEP")
-
-# (B) Market Structure Shift (MSS) & Displacement
-swing_high = df_5m['high'].iloc[-7:-2].max()
-swing_low = df_5m['low'].iloc[-7:-2].min()
-
-if last['close'] > swing_high and last['volume'] > df_5m['volume'].iloc[-6:-1].mean():
-    score += 30
-    reasons.append("BULLISH MSS + DISPLACEMENT")
-elif last['close'] < swing_low and last['volume'] > df_5m['volume'].iloc[-6:-1].mean():
-    score -= 30
-    reasons.append("BEARISH MSS + DISPLACEMENT")
-
-# (C) Momentum & EMA Pullback
-if last['ema9'] > last['ema21'] and last['close'] > last['open']:
-    score += 20
-elif last['ema9'] < last['ema21'] and last['close'] < last['open']:
-    score -= 20
-
-# (D) RSI Extreme Reversal
-if last['rsi'] < 32:
-    score += 15
-elif last['rsi'] > 68:
-    score -= 15
-
-# =========================================================================
-# 5. RISK ENGINE, SIGNAL CLASSIFICATION & TARGET LEVELS
-# =========================================================================
-has_signal = False
-radar_status = "MONITORING PULLBACKS"
-entry_txt, sl_txt, tp_txt = "--", "--", "--"
-entry_val, sl_val, tp_val = 0.0, 0.0, 0.0
-sig_tier = "MICRO (5M)"
-
-if score >= 50:
-    has_signal = True
+# Dynamic Institutional Signal Trigger (Active Entry Finder)
+has_signal = True
+if last['close'] >= last['open'] and last['ema9'] >= last['ema21']:
     radar_status = "PRE-SIGNAL LONG"
     entry_val = cur_p
-    sl_val = round(cur_p - (cur_atr * 1.5), 1)
-    tp_val = round(cur_p + (cur_atr * 2.5), 1)
+    sl_val = round(cur_p - (atr * 1.5), 1)
+    tp_val = round(cur_p + (atr * 2.2), 1)
     entry_txt = f"${entry_val}"
     sl_txt = f"${sl_val}"
     tp_txt = f"${tp_val}"
-elif score <= -50:
-    has_signal = True
+elif last['close'] < last['open'] and last['ema9'] <= last['ema21']:
     radar_status = "PRE-SIGNAL SHORT"
     entry_val = cur_p
-    sl_val = round(cur_p + (cur_atr * 1.5), 1)
-    tp_val = round(cur_p - (cur_atr * 2.5), 1)
+    sl_val = round(cur_p + (atr * 1.5), 1)
+    tp_val = round(cur_p - (atr * 2.2), 1)
+    entry_txt = f"${entry_val}"
+    sl_txt = f"${sl_val}"
+    tp_txt = f"${tp_val}"
+else:
+    # Micro breakout default
+    if last['close'] > prev['close']:
+        radar_status = "PRE-SIGNAL LONG"
+        entry_val = cur_p
+        sl_val = round(cur_p - (atr * 1.5), 1)
+        tp_val = round(cur_p + (atr * 2.0), 1)
+    else:
+        radar_status = "PRE-SIGNAL SHORT"
+        entry_val = cur_p
+        sl_val = round(cur_p + (atr * 1.5), 1)
+        tp_val = round(cur_p - (atr * 2.0), 1)
     entry_txt = f"${entry_val}"
     sl_txt = f"${sl_val}"
     tp_txt = f"${tp_val}"
 
-# Active Trade Monitoring against SQLite Vault
-if 'active_trade' in st.session_state:
-    at = st.session_state['active_trade']
-    # TP Hit
-    if (at['dir'] == 'LONG' and cur_p >= at['tp']) or (at['dir'] == 'SHORT' and cur_p <= at['tp']):
-        cur.execute("INSERT INTO vault (timestamp, direction, entry, result, pnl, is_win) VALUES (?, ?, ?, ?, ?, ?)",
-                    (datetime.now().strftime('%H:%M'), at['dir'], at['entry'], "TP HIT 🔥", "(+$0.65)", 1))
-        conn.commit()
-        del st.session_state['active_trade']
-        st.rerun()
-    # SL Hit
-    elif (at['dir'] == 'LONG' and cur_p <= at['sl']) or (at['dir'] == 'SHORT' and cur_p >= at['sl']):
-        cur.execute("INSERT INTO vault (timestamp, direction, entry, result, pnl, is_win) VALUES (?, ?, ?, ?, ?, ?)",
-                    (datetime.now().strftime('%H:%M'), at['dir'], at['entry'], "SL HIT 🛑", "(-$0.80)", 0))
-        conn.commit()
-        del st.session_state['active_trade']
-        st.rerun()
-elif has_signal:
-    # Auto-register new trade into tracker
-    st.session_state['active_trade'] = {
+# Live Position Tracker to Vault Auto-Logger
+if 'active_pos' not in st.session_state:
+    st.session_state['active_pos'] = {
         'dir': 'LONG' if "LONG" in radar_status else 'SHORT',
         'entry': entry_val,
         'sl': sl_val,
         'tp': tp_val
     }
+else:
+    pos = st.session_state['active_pos']
+    # Check TP
+    if (pos['dir'] == 'LONG' and cur_p >= pos['tp']) or (pos['dir'] == 'SHORT' and cur_p <= pos['tp']):
+        cur.execute("INSERT INTO vault (timestamp, direction, entry, result, pnl, is_win) VALUES (?, ?, ?, ?, ?, ?)",
+                    (datetime.now().strftime('%H:%M'), pos['dir'], pos['entry'], "TP HIT 🔥", "(+$0.65)", 1))
+        conn.commit()
+        st.session_state['active_pos'] = {'dir': 'LONG' if "LONG" in radar_status else 'SHORT', 'entry': entry_val, 'sl': sl_val, 'tp': tp_val}
+        st.rerun()
+    # Check SL
+    elif (pos['dir'] == 'LONG' and cur_p <= pos['sl']) or (pos['dir'] == 'SHORT' and cur_p >= pos['sl']):
+        cur.execute("INSERT INTO vault (timestamp, direction, entry, result, pnl, is_win) VALUES (?, ?, ?, ?, ?, ?)",
+                    (datetime.now().strftime('%H:%M'), pos['dir'], pos['entry'], "SL HIT 🛑", "(-$0.80)", 0))
+        conn.commit()
+        st.session_state['active_pos'] = {'dir': 'LONG' if "LONG" in radar_status else 'SHORT', 'entry': entry_val, 'sl': sl_val, 'tp': tp_val}
+        st.rerun()
 
-# --- TOP HUD HEADER ---
+# HUD Header
 query_params = st.query_params
 show_vault = query_params.get("vault", "0") == "1"
 
@@ -389,7 +304,7 @@ st.markdown(f"""
     </div>
 """, unsafe_allow_html=True)
 
-# --- FLOATING POPUP MODAL (VAULT) ---
+# Vault Modal
 if show_vault:
     cur.execute("SELECT timestamp, direction, entry, result, pnl, is_win FROM vault ORDER BY id DESC")
     rows = cur.fetchall()
@@ -399,7 +314,7 @@ if show_vault:
 
     trade_items_html = ""
     if total == 0:
-        trade_items_html = "<div style='font-size:10px; color:#64748b; text-align:center; padding:15px 0;'>No trades yet. Listening for institutional triggers...</div>"
+        trade_items_html = "<div style='font-size:10px; color:#64748b; text-align:center; padding:15px 0;'>No closed trades yet. Monitoring active target fills...</div>"
     else:
         for r in rows:
             clr = "#00e676" if r[5] == 1 else "#ff3b30"
@@ -428,15 +343,15 @@ if show_vault:
         </div>
     """, unsafe_allow_html=True)
 
-# --- RESPONSIVE CANDLESTICK CHART (NO TOUCH ZOOM) ---
+# Chart
 fig = go.Figure()
 
 fig.add_trace(go.Candlestick(
-    x=df_5m['time'],
-    open=df_5m['open'],
-    high=df_5m['high'],
-    low=df_5m['low'],
-    close=df_5m['close'],
+    x=df['time'],
+    open=df['open'],
+    high=df['high'],
+    low=df['low'],
+    close=df['close'],
     increasing_line_color='#00e676',
     decreasing_line_color='#ff3b30',
     increasing_fillcolor='#00e676',
@@ -444,21 +359,20 @@ fig.add_trace(go.Candlestick(
     name="BTCUSDT"
 ))
 
-# Signal Lines (Active on Confluence Trigger)
-if has_signal:
-    fig.add_hline(y=tp_val, line_dash="dash", line_color="#00e676", line_width=1.3,
-                  annotation_text=f"DIRECT TP: {tp_val}", annotation_position="top right",
-                  annotation_font_color="#00e676", annotation_bgcolor="#0c0f14")
+# Signal Lines (Always visible with live targets)
+fig.add_hline(y=tp_val, line_dash="dash", line_color="#00e676", line_width=1.3,
+              annotation_text=f"PRE-SIGNAL DIRECT TP : {tp_val}", annotation_position="top right",
+              annotation_font_color="#00e676", annotation_bgcolor="#0c0f14")
 
-    fig.add_hline(y=entry_val, line_dash="dash", line_color="#00e5ff", line_width=1.3,
-                  annotation_text=f"ENTRY: {entry_val}", annotation_position="right",
-                  annotation_font_color="#00e5ff", annotation_bgcolor="#0c0f14")
+fig.add_hline(y=entry_val, line_dash="dash", line_color="#00e5ff", line_width=1.3,
+              annotation_text=f"PRE-SIGNAL ENTRY : {entry_val}", annotation_position="right",
+              annotation_font_color="#00e5ff", annotation_bgcolor="#0c0f14")
 
-    fig.add_hline(y=sl_val, line_dash="dash", line_color="#ff3b30", line_width=1.3,
-                  annotation_text=f"SL: {sl_val}", annotation_position="bottom right",
-                  annotation_font_color="#ff3b30", annotation_bgcolor="#0c0f14")
+fig.add_hline(y=sl_val, line_dash="dash", line_color="#ff3b30", line_width=1.3,
+              annotation_text=f"PRE-SIGNAL SL : {sl_val}", annotation_position="bottom right",
+              annotation_font_color="#ff3b30", annotation_bgcolor="#0c0f14")
 
-# Real-time Red Price Badge
+# Real-time price badge
 fig.add_hline(y=cur_p, line_dash="dot", line_color="#ff3b30", line_width=1,
               annotation_text=f" {cur_p:.2f} ", annotation_position="right",
               annotation_font_color="#ffffff", annotation_bgcolor="#dc2626")
@@ -495,7 +409,7 @@ st.plotly_chart(
     config={'displayModeBar': False, 'scrollZoom': False, 'doubleClick': False}
 )
 
-# --- DUAL BOTTOM CONTROLS ---
+# Bottom Bars
 st.markdown(f"""
     <div class="bottom-panel-1">
         <div class="panel-grp">
