@@ -61,7 +61,7 @@ def save_vault(trade, exit_price, result, pnl, is_win):
     except Exception:
         pass
 
-# --- 2. MULTI-SOURCE ROBUST DATA FETCHER ---
+# --- 2. MULTI-SOURCE ROBUST HISTORICAL BUFFER ---
 def get_historical_candles(limit=580):
     endpoints = [
         f"https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=5m&limit={limit}",
@@ -72,7 +72,13 @@ def get_historical_candles(limit=580):
         try:
             r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3.5).json()
             if isinstance(r, list) and len(r) > 100:
-                return [{"time": int(b[0]/1000), "open": float(b[1]), "high": float(b[2]), "low": float(b[3]), "close": float(b[4]), "vol": float(b[5])} for b in r]
+                candles = []
+                for b in r:
+                    o, h, l, c = float(b[1]), float(b[2]), float(b[3]), float(b[4])
+                    if min(o, h, l, c) > 10000:  # Data sanity check
+                        candles.append({"time": int(b[0]/1000), "open": o, "high": h, "low": l, "close": c})
+                if len(candles) > 100:
+                    return candles
         except Exception:
             continue
     return []
@@ -194,7 +200,7 @@ if "bg_engine" not in st.session_state:
     st.session_state["bg_engine"] = BotEngine()
 engine = st.session_state["bg_engine"]
 
-# --- 4. SAFE 24/7 BACKGROUND WORKER (ZERO SPAM) ---
+# --- 4. SAFE 24/7 BACKGROUND WORKER ---
 def run_worker_thread():
     async def kline_listener():
         while True:
@@ -209,9 +215,10 @@ def run_worker_thread():
                                     c = {
                                         "time": int(k['t'] / 1000),
                                         "open": float(k['o']), "high": float(k['h']),
-                                        "low": float(k['l']), "close": float(k['c']), "vol": float(k['v'])
+                                        "low": float(k['l']), "close": float(k['c'])
                                     }
-                                    engine.on_closed_candle(c)
+                                    if min(c['open'], c['high'], c['low'], c['close']) > 10000:
+                                        engine.on_closed_candle(c)
             except Exception:
                 await asyncio.sleep(5)
 
@@ -224,7 +231,7 @@ def run_worker_thread():
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 data = json.loads(msg.data)
                                 p = float(data.get('p', 0.0))
-                                if engine.state == "ACTIVE_TRADE" and engine.active_trade:
+                                if p > 10000 and engine.state == "ACTIVE_TRADE" and engine.active_trade:
                                     t = engine.active_trade
                                     if t['dir'] == "LONG":
                                         if p >= t['tp']: engine.resolve_trade("TP HIT 🔥", "+2.5R", 1, p)
@@ -247,7 +254,7 @@ if "worker_running" not in st.session_state:
     st.session_state["worker_running"] = True
     threading.Thread(target=run_worker_thread, daemon=True).start()
 
-# --- 5. STREAMLIT UI (0-BLINK CLIENT ENGINE) ---
+# --- 5. STREAMLIT UI ---
 st.set_page_config(page_title="BTCUSDT RADAR 48H", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown("""
@@ -259,7 +266,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Vault Stats
+# Fetch Vault Stats
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cur = conn.cursor()
 cur.execute("SELECT timestamp, direction, entry, result, pnl, is_win FROM vault ORDER BY id DESC")
@@ -342,24 +349,48 @@ ui_html = f"""
     </div>
 
     <script>
-        const candlesData = {candles_json};
+        const rawCandles = {candles_json};
         const vaultTrades = {vault_json};
 
-        let currentBar = null;
-        if (candlesData.length > 0) {{
-            currentBar = {{ ...candlesData[candlesData.length - 1] }};
-        }}
+        // Indian Standard Time (IST) Offset: UTC + 5:30 (19800 seconds)
+        // Taaki phone me London time (15:30) ki jagah exact local time (21:15) dikhe
+        const localOffsetSeconds = 5.5 * 3600;
+
+        const candlesData = rawCandles.map(c => ({{
+            time: c.time + localOffsetSeconds,
+            open: c.open,
+            high: c.high,
+            low: c.low,
+            close: c.close
+        }}));
+
+        let currentBar = candlesData.length > 0 ? {{ ...candlesData[candlesData.length - 1] }} : null;
 
         const container = document.getElementById('chart-container');
         const chart = LightweightCharts.createChart(container, {{
             layout: {{ background: {{ type: 'solid', color: '#080a0f' }}, textColor: '#64748b', fontSize: 10 }},
-            grid: {{ vertLines: {{ color: 'rgba(255, 255, 255, 0.03)' }}, horzLines: {{ color: 'rgba(255, 255, 255, 0.03)' }} }},
-            rightPriceScale: {{ borderColor: '#161e2a', autoScale: true }},
-            timeScale: {{ borderColor: '#161e2a', timeVisible: true, secondsVisible: false }}
+            grid: {{
+                vertLines: {{ color: 'rgba(255, 255, 255, 0.03)' }},
+                horzLines: {{ color: 'rgba(255, 255, 255, 0.03)' }}
+            }},
+            rightPriceScale: {{
+                borderColor: '#161e2a',
+                autoScale: true,
+                scaleMargins: {{ top: 0.1, bottom: 0.1 }}
+            }},
+            timeScale: {{
+                borderColor: '#161e2a',
+                timeVisible: true,
+                secondsVisible: false,
+                barSpacing: 8,
+                rightOffset: 3
+            }}
         }});
 
         const candleSeries = chart.addCandlestickSeries({{
-            upColor: '#089981', downColor: '#f23645', borderUpColor: '#089981', borderDownColor: '#f23645', wickUpColor: '#089981', wickDownColor: '#f23645'
+            upColor: '#089981', downColor: '#f23645',
+            borderUpColor: '#089981', borderDownColor: '#f23645',
+            wickUpColor: '#089981', wickDownColor: '#f23645'
         }});
 
         if (candlesData.length > 0) {{
@@ -367,45 +398,50 @@ ui_html = f"""
             chart.timeScale().fitContent();
         }}
 
-        // --- DUAL LOW-LATENCY WEBSOCKETS (0-BLINK REAL-TIME ENGINE) ---
+        // --- HIGH INTEGRITY WEBSOCKETS (NO SPIKES, REAL-TIME IST SYNC) ---
         let wsKline = null;
         let wsTrade = null;
 
         function connectStreams() {{
-            // 1. 5M Kline WebSocket
+            // 1. 5M KLINE STREAM
             wsKline = new WebSocket('wss://fstream.binance.com/ws/btcusdt@kline_5m');
             wsKline.onmessage = (event) => {{
-                const res = JSON.parse(event.data);
-                const k = res.k;
-                const candleTime = Math.floor(k.t / 1000);
-                
-                currentBar = {{
-                    time: candleTime,
-                    open: parseFloat(k.o),
-                    high: parseFloat(k.h),
-                    low: parseFloat(k.l),
-                    close: parseFloat(k.c)
-                }};
-                candleSeries.update(currentBar);
-            }};
-            wsKline.onclose = () => {{ setTimeout(connectStreams, 2500); }};
+                try {{
+                    const res = JSON.parse(event.data);
+                    const k = res.k;
+                    const o = parseFloat(k.o), h = parseFloat(k.h), l = parseFloat(k.l), c = parseFloat(k.c);
+                    
+                    // Reject corrupted/zero data to avoid vertical line glitch
+                    if (o < 20000 || h < 20000 || l < 20000 || c < 20000) return;
 
-            // 2. Real-Time Tick Stream for Smooth Price & Candle Update (Zero-Blink)
+                    const candleTime = Math.floor(k.t / 1000) + localOffsetSeconds;
+                    currentBar = {{ time: candleTime, open: o, high: h, low: l, close: c }};
+                    candleSeries.update(currentBar);
+                }} catch(e) {{}}
+            }};
+            wsKline.onclose = () => {{ setTimeout(connectStreams, 2000); }};
+
+            // 2. LIVE PRICE TICK STREAM (0-BLINK WITH STRICT SPIKE FILTER)
             wsTrade = new WebSocket('wss://fstream.binance.com/ws/btcusdt@trade');
             wsTrade.onmessage = (event) => {{
-                const t = JSON.parse(event.data);
-                const livePrice = parseFloat(t.p);
-                document.getElementById('hud-live-price').innerText = "$" + livePrice.toFixed(1);
+                try {{
+                    const t = JSON.parse(event.data);
+                    const livePrice = parseFloat(t.p);
 
-                if (currentBar) {{
-                    let updated = false;
-                    if (livePrice > currentBar.high) {{ currentBar.high = livePrice; updated = true; }}
-                    if (livePrice < currentBar.low) {{ currentBar.low = livePrice; updated = true; }}
-                    currentBar.close = livePrice;
-                    candleSeries.update(currentBar);
-                }}
+                    // Reject any absurd tick to prevent price crash to 0/-10000
+                    if (livePrice < 20000 || livePrice > 300000) return;
+
+                    document.getElementById('hud-live-price').innerText = "$" + livePrice.toFixed(1);
+
+                    if (currentBar) {{
+                        if (livePrice > currentBar.high) currentBar.high = livePrice;
+                        if (livePrice < currentBar.low) currentBar.low = livePrice;
+                        currentBar.close = livePrice;
+                        candleSeries.update(currentBar);
+                    }}
+                }} catch(e) {{}}
             }};
-            wsTrade.onclose = () => {{ setTimeout(connectStreams, 2500); }};
+            wsTrade.onclose = () => {{ setTimeout(connectStreams, 2000); }};
         }}
 
         connectStreams();
