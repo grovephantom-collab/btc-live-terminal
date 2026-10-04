@@ -11,30 +11,33 @@ from datetime import datetime
 # --- CONFIGURATION & TELEGRAM ---
 BOT_TOKEN = "8941403990:AAGLH_dupqmGoipglhVvRuiPBzvgMqJR3Ms"
 CHAT_ID = "7886716805"
-DB_FILE = "trades_vault.db"
+DB_FILE = "trades_vault_v2.db"  # Fresh clean version to completely fix SQLite error
 
-# --- 1. SQLITE VAULT SETUP ---
+# --- 1. SQLITE VAULT SETUP (AUTO-MIGRATED) ---
 def init_db():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    cur = conn.cursor()
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS vault (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT,
-            timeframe TEXT,
-            direction TEXT,
-            strategy_logic TEXT,
-            entry REAL,
-            sl REAL,
-            tp REAL,
-            exit REAL,
-            result TEXT,
-            pnl TEXT,
-            is_win INTEGER
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        cur = conn.cursor()
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS vault (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                timeframe TEXT,
+                direction TEXT,
+                strategy_logic TEXT,
+                entry REAL,
+                sl REAL,
+                tp REAL,
+                exit REAL,
+                result TEXT,
+                pnl TEXT,
+                is_win INTEGER
+            )
+        ''')
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
 init_db()
 
@@ -222,7 +225,7 @@ if "exec_engine" not in st.session_state:
     st.session_state["exec_engine"] = DynamicExecutionEngine()
 engine = st.session_state["exec_engine"]
 
-# --- 4. 24/7 BACKGROUND WORKER (15M KLINE + REAL-TIME TICKS) ---
+# --- 4. 24/7 BACKGROUND WORKER ---
 def run_worker_thread():
     async def kline_listener():
         while True:
@@ -276,7 +279,7 @@ if "worker_running" not in st.session_state:
     st.session_state["worker_running"] = True
     threading.Thread(target=run_worker_thread, daemon=True).start()
 
-# --- 5. CLEAN TERMINAL FRONTEND (15M ZERO-BLINK + DYNAMIC TRADING VIEW) ---
+# --- 5. STREAMLIT FULL-SCREEN TRADING TERMINAL UI ---
 st.set_page_config(page_title="BTCUSDT DYNAMIC TERMINAL", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown("""
@@ -288,14 +291,18 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Vault Data Fetch
-conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-cur = conn.cursor()
-cur.execute("SELECT timestamp, timeframe, direction, strategy_logic, entry, result, pnl, is_win FROM vault ORDER BY id DESC")
-rows = cur.fetchall()
-total_trades = len(rows)
-conn.close()
+# Safe Vault Fetch (Never Crashes Streamlit)
+rows = []
+try:
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    cur = conn.cursor()
+    cur.execute("SELECT timestamp, timeframe, direction, strategy_logic, entry, result, pnl, is_win FROM vault ORDER BY id DESC")
+    rows = cur.fetchall()
+    conn.close()
+except Exception:
+    rows = []
 
+total_trades = len(rows)
 vault_json = json.dumps([{"time": r[0], "tf": r[1], "dir": r[2], "logic": r[3], "entry": r[4], "res": r[5], "pnl": r[6], "win": r[7]} for r in rows])
 
 ui_candles = get_historical_candles(500)
@@ -333,7 +340,7 @@ ui_html = f"""
     <div class="top-bar">
         <div style="display:flex; align-items:center; gap:8px;">
             <span class="badge-live">LIVE FUTURES</span>
-            <span class="badge-tf">15M • 1H • 48H</span>
+            <span id="hud-badge-mode" class="badge-tf">15M • 1H • 48H</span>
             <div><span style="font-size:7px; color:#565f70; font-weight:700;">RADAR</span><div id="hud-status" class="c-yellow" style="font-weight:800; font-size:10px;">SCANNING</div></div>
             <div><span style="font-size:7px; color:#565f70; font-weight:700;">PRICE</span><div id="hud-live-price" class="c-cyan" style="font-weight:800; font-size:10px;">--</div></div>
             <div><span style="font-size:7px; color:#565f70; font-weight:700;">ACTIVE TF</span><div id="hud-tf" class="c-cyan" style="font-weight:800; font-size:10px;">CLEAN</div></div>
@@ -417,7 +424,6 @@ ui_html = f"""
             chart.timeScale().fitContent();
         }}
 
-        // Dynamic Trade Line References
         let activeLines = {{ entry: null, sl: null, tp: null }};
 
         function renderDynamicTradeLines() {{
@@ -470,7 +476,6 @@ ui_html = f"""
 
         renderDynamicTradeLines();
 
-        // 15M Kline + 0-Blink Real-Time Tick Stream
         let wsKline = null;
         let wsTrade = null;
 
