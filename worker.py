@@ -9,10 +9,6 @@ from datetime import datetime, timezone
 import requests
 from flask import Flask, jsonify
 
-# ============================================================
-# BTCUSDT SMC MASTER WORKER (FULL LIQUIDITY SUITE: EQH/EQL/IDM)
-# ============================================================
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] [MASTER-WORKER] %(message)s"
@@ -55,6 +51,7 @@ ENGINE_STATUS = {
 }
 
 GLOBAL_ACTIVE = {
+    "NORMAL": None,
     "EVENT": None
 }
 
@@ -84,7 +81,7 @@ init_db()
 @app.route("/")
 @app.route("/healthz")
 def health():
-    return "BTCUSDT SMC Master V6 Engine Online", 200
+    return "BTCUSDT SMC Master V7 Engine Online", 200
 
 @app.route("/status")
 def api_status():
@@ -105,18 +102,26 @@ def api_poi_zones():
     with LOCK:
         return jsonify(ACTIVE_POI_REGISTRY), 200
 
+@app.route("/events")
+def api_events():
+    with LOCK:
+        return jsonify({
+            "event_active": GLOBAL_ACTIVE["EVENT"] is not None,
+            "event": GLOBAL_ACTIVE["EVENT"]
+        }), 200
+
 @app.route("/active-trades")
 def api_active():
     with LOCK:
         active_list = []
-        if GLOBAL_ACTIVE["EVENT"]:
-            ev = GLOBAL_ACTIVE["EVENT"]
-            active_list.append({
-                "id": ev["id"], "tf": ev["tf"], "dir": ev["dir"],
-                "entry": float(ev["entry"]), "sl": float(ev["sl"]),
-                "tp1": float(ev["tp1"]), "tp2": float(ev["tp2"]), "tp3": float(ev["tp3"]),
-                "setup": ev["setup"], "score": int(ev["score"]), "stage": ev.get("stage", "OPEN")
-            })
+        for k, t in GLOBAL_ACTIVE.items():
+            if t:
+                active_list.append({
+                    "id": t["id"], "type": t["type"], "tf": t["tf"], "dir": t["dir"],
+                    "entry": float(t["entry"]), "sl": float(t["sl"]),
+                    "tp1": float(t["tp1"]), "tp2": float(t["tp2"]), "tp3": float(t["tp3"]),
+                    "setup": t["setup"], "score": int(t["score"]), "stage": t.get("stage", "OPEN")
+                })
 
         try:
             c = db()
@@ -125,7 +130,7 @@ def api_active():
             c.close()
             for r in rows:
                 active_list.append({
-                    "id": r["trade_id"], "tf": r["tf"], "dir": r["direction"],
+                    "id": r["trade_id"], "type": "SNIPER", "tf": r["tf"], "dir": r["direction"],
                     "entry": float(r["entry"]), "sl": float(r["sl"]),
                     "tp1": float(r["tp1"]), "tp2": float(r["tp2"]), "tp3": float(r["tp3"]),
                     "setup": r["setup"], "score": int(r["score"]), "stage": r["stage"]
@@ -163,9 +168,16 @@ def api_vault_data():
             })
 
         active_res = api_active()[0].get_json()
-        return jsonify({"vault": formatted_vault, "active": active_res}), 200
+        with LOCK:
+            pois = list(ACTIVE_POI_REGISTRY)
+
+        return jsonify({
+            "vault": formatted_vault,
+            "active": active_res,
+            "pois": pois
+        }), 200
     except Exception as e:
-        return jsonify({"vault": [], "active": []}), 500
+        return jsonify({"vault": [], "active": [], "pois": []}), 500
 
 # ---------------- 3. TELEGRAM CLIENT ----------------
 def send_telegram(text):
@@ -193,7 +205,7 @@ def db_upsert_trade(t, status="OPEN", exit_p=0.0, res="RUNNING", final_pnl=0.0):
     except Exception as e:
         logging.error(f"DB Error: {e}")
 
-# ---------------- 4. CENTRAL DATA HUB ----------------
+# ---------------- 4. CENTRAL DATA HUB FETCHER ----------------
 def fetch_klines(interval, limit=250):
     try:
         r = requests.get(f"{BASE}/fapi/v1/klines", params={"symbol": SYMBOL, "interval": interval, "limit": limit}, timeout=4).json()
@@ -229,7 +241,7 @@ def sync_central_data_hub():
     except Exception as e:
         logging.warning(f"Hub sync warning: {e}")
 
-# ---------------- 5. ADVANCED SMC & LIQUIDITY MODULES ----------------
+# ---------------- 5. SMC STRUCTURE & LIQUIDITY ----------------
 def atr(candles, period=14):
     if len(candles) < period + 1: return 120.0
     trs = [max(candles[i]["high"] - candles[i]["low"], 
@@ -246,46 +258,6 @@ def confirmed_swings(candles, left=2, right=2):
         if all(l < candles[j]["low"] for j in range(i-left, i)) and all(l <= candles[j]["low"] for j in range(i+1, i+right+1)):
             lows.append((i, l))
     return highs, lows
-
-# NEW: Equal Highs / Equal Lows (EQH / EQL) Detector
-def detect_eqh_eql(candles, tolerance_pct=0.0006):
-    highs, lows = confirmed_swings(candles, 2, 2)
-    eqh, eql = None, None
-    if len(highs) >= 2:
-        h1, h2 = highs[-1][1], highs[-2][1]
-        if abs(h1 - h2) / h1 <= tolerance_pct:
-            eqh = max(h1, h2)
-    if len(lows) >= 2:
-        l1, l2 = lows[-1][1], lows[-2][1]
-        if abs(l1 - l2) / l1 <= tolerance_pct:
-            eql = min(l1, l2)
-    return {"eqh": eqh, "eql": eql}
-
-# NEW: Inducement (IDM) Swept Tracker
-def check_inducement_sweep(candles, direction):
-    highs, lows = confirmed_swings(candles, 1, 1)
-    if len(highs) < 2 or len(lows) < 2: return False
-    cur = candles[-1]
-    if direction == "LONG":
-        idm_low = lows[-1][1]
-        return cur["low"] < idm_low and cur["close"] > idm_low
-    elif direction == "SHORT":
-        idm_high = highs[-1][1]
-        return cur["high"] > idm_high and cur["close"] < idm_high
-    return False
-
-# NEW: Macro Liquidity Void Detector
-def detect_macro_voids(candles, threshold=200.0):
-    voids = []
-    for i in range(len(candles) - 10, len(candles) - 1):
-        c1, c2 = candles[i], candles[i+1]
-        gap_up = c2["low"] - c1["high"]
-        gap_down = c1["low"] - c2["high"]
-        if gap_up >= threshold:
-            voids.append({"type": "VOID_UP", "low": c1["high"], "high": c2["low"]})
-        elif gap_down >= threshold:
-            voids.append({"type": "VOID_DOWN", "low": c2["high"], "high": c1["low"]})
-    return voids
 
 def smc_structure(candles):
     if len(candles) < 25:
@@ -336,48 +308,205 @@ def detect_unmitigated_fvg(candles, lookback=20):
                 return {"dir": "SHORT", "low": bot, "high": top}
     return None
 
-# ---------------- 6. MASTER ENGINE & HTF POI PROVIDER ----------------
-class MasterWorkerEngine:
+def check_5m_confirmation(c5, direction):
+    if len(c5) < 15: return False
+    s5 = smc_structure(c5)
+    cur5 = c5[-1]
+    a5 = atr(c5)
+    disp5 = abs(cur5["close"] - cur5["open"]) >= (0.85 * a5)
+    if direction == "LONG":
+        return (s5["bos"] == "LONG" or s5["choch"] == "LONG") and (disp5 or cur5["close"] > cur5["open"])
+    elif direction == "SHORT":
+        return (s5["bos"] == "SHORT" or s5["choch"] == "SHORT") and (disp5 or cur5["close"] < cur5["open"])
+    return False
+
+# ---------------- 6. TRADE MANAGER ----------------
+class TradeManager:
     def __init__(self):
         self.active_event_key = None
         self.event_cooldown_until = 0.0
 
-    def evaluate_master_setup(self):
+    def manage_positions(self, p, s4, a4):
+        with LOCK:
+            # 1. NORMAL TRADE MANAGEMENT
+            t = GLOBAL_ACTIVE["NORMAL"]
+            if t:
+                if t["dir"] == "LONG":
+                    if p >= t["tp1"] and t["stage"] == "OPEN":
+                        t["stage"] = "TP1_DONE"
+                        t["realized_r"] += 0.333 * 1.0
+                        t["remaining_pct"] = 0.667
+                        t["sl"] = t["entry"]
+                        db_upsert_trade(t, status="OPEN")
+                        send_telegram(f"🎯 <b>[NORMAL] TP1 (+1R) REACHED</b>\n33.3% banked. 🛡 SL moved to BE (${t['entry']:,.2f})")
+
+                    elif p >= t["tp2"] and t["stage"] == "TP1_DONE":
+                        t["stage"] = "TP2_DONE"
+                        t["realized_r"] += 0.333 * 2.0
+                        t["remaining_pct"] = 0.334
+                        t["sl"] = t["tp1"]
+                        db_upsert_trade(t, status="OPEN")
+                        send_telegram(f"🎯 <b>[NORMAL] TP2 (+2R) REACHED</b>\nNext 33.3% banked. 🛡 SL trailed to TP1 (${t['tp1']:,.2f})")
+
+                    if p <= t["sl"]:
+                        if t["stage"] == "OPEN": final_r = -1.0; res = "SL HIT"
+                        elif t["stage"] == "TP1_DONE": final_r = t["realized_r"]; res = "BE EXIT"
+                        else: final_r = t["realized_r"] + (t["remaining_pct"] * 1.0); res = "TP1 TRAIL EXIT"
+                        db_upsert_trade(t, status="CLOSED", exit_p=p, res=res, final_pnl=round(final_r, 3))
+                        send_telegram(f"🏁 <b>[NORMAL] {res}</b> @ ${p:,.2f} | Net: <b>{final_r:+.3f}R</b>")
+                        GLOBAL_ACTIVE["NORMAL"] = None
+
+                    elif p >= t["tp3"] and t["stage"] in ["OPEN", "TP1_DONE", "TP2_DONE"]:
+                        final_r = t["realized_r"] + (t["remaining_pct"] * 3.0)
+                        db_upsert_trade(t, status="CLOSED", exit_p=p, res="TP3 FULL TARGET 🔥", final_pnl=round(final_r, 3))
+                        send_telegram(f"🔥 <b>[NORMAL] FULL TP3 REACHED!</b> @ ${p:,.2f} | Net: <b>+{final_r:.3f}R</b>")
+                        GLOBAL_ACTIVE["NORMAL"] = None
+
+                elif t["dir"] == "SHORT":
+                    if p <= t["tp1"] and t["stage"] == "OPEN":
+                        t["stage"] = "TP1_DONE"
+                        t["realized_r"] += 0.333 * 1.0
+                        t["remaining_pct"] = 0.667
+                        t["sl"] = t["entry"]
+                        db_upsert_trade(t, status="OPEN")
+                        send_telegram(f"🎯 <b>[NORMAL] TP1 (+1R) REACHED</b>\n33.3% banked. 🛡 SL moved to BE (${t['entry']:,.2f})")
+
+                    elif p <= t["tp2"] and t["stage"] == "TP1_DONE":
+                        t["stage"] = "TP2_DONE"
+                        t["realized_r"] += 0.333 * 2.0
+                        t["remaining_pct"] = 0.334
+                        t["sl"] = t["tp1"]
+                        db_upsert_trade(t, status="OPEN")
+                        send_telegram(f"🎯 <b>[NORMAL] TP2 (+2R) REACHED</b>\nNext 33.3% banked. 🛡 SL trailed to TP1 (${t['tp1']:,.2f})")
+
+                    if p >= t["sl"]:
+                        if t["stage"] == "OPEN": final_r = -1.0; res = "SL HIT"
+                        elif t["stage"] == "TP1_DONE": final_r = t["realized_r"]; res = "BE EXIT"
+                        else: final_r = t["realized_r"] + (t["remaining_pct"] * 1.0); res = "TP1 TRAIL EXIT"
+                        db_upsert_trade(t, status="CLOSED", exit_p=p, res=res, final_pnl=round(final_r, 3))
+                        send_telegram(f"🏁 <b>[NORMAL] {res}</b> @ ${p:,.2f} | Net: <b>{final_r:+.3f}R</b>")
+                        GLOBAL_ACTIVE["NORMAL"] = None
+
+                    elif p <= t["tp3"] and t["stage"] in ["OPEN", "TP1_DONE", "TP2_DONE"]:
+                        final_r = t["realized_r"] + (t["remaining_pct"] * 3.0)
+                        db_upsert_trade(t, status="CLOSED", exit_p=p, res="TP3 FULL TARGET 🔥", final_pnl=round(final_r, 3))
+                        send_telegram(f"🔥 <b>[NORMAL] FULL TP3 REACHED!</b> @ ${p:,.2f} | Net: <b>+{final_r:.3f}R</b>")
+                        GLOBAL_ACTIVE["NORMAL"] = None
+
+            # 2. 48H EVENT MANAGEMENT (25% Partials + 4H Trailing Runner)
+            ev = GLOBAL_ACTIVE["EVENT"]
+            if ev:
+                risk = abs(ev["entry"] - ev["sl"]) if abs(ev["entry"] - ev["sl"]) > 0 else 1.0
+                if ev["dir"] == "LONG":
+                    if p >= ev["tp1"] and ev["stage"] == "OPEN":
+                        ev["stage"] = "TP1_DONE"
+                        ev["realized_r"] += 0.25 * 1.0
+                        ev["remaining_pct"] = 0.75
+                        ev["sl"] = ev["entry"]
+                        db_upsert_trade(ev, status="OPEN")
+                        send_telegram(f"⚡ <b>[EVENT] TP1 (+1R)</b> -> 25% banked. SL locked to BE (${ev['entry']:,.2f})")
+
+                    elif p >= ev["tp2"] and ev["stage"] == "TP1_DONE":
+                        ev["stage"] = "TP2_DONE"
+                        ev["realized_r"] += 0.25 * 2.0
+                        ev["remaining_pct"] = 0.50
+                        ev["sl"] = ev["tp1"]
+                        db_upsert_trade(ev, status="OPEN")
+                        send_telegram(f"⚡ <b>[EVENT] TP2 (+2R)</b> -> 25% banked. SL locked to TP1 (${ev['tp1']:,.2f})")
+
+                    elif p >= ev["tp3"] and ev["stage"] == "TP2_DONE":
+                        ev["stage"] = "RUNNER_ACTIVE"
+                        ev["realized_r"] += 0.25 * 4.0
+                        ev["remaining_pct"] = 0.25
+                        db_upsert_trade(ev, status="OPEN")
+                        send_telegram(f"🔥 <b>[EVENT] TP3 (+4R) REACHED</b> -> 75% banked. 25% Runner active!")
+
+                    if ev["stage"] == "RUNNER_ACTIVE" and s4.get("last_low"):
+                        trail_target = s4["last_low"] - (0.5 * a4)
+                        if trail_target > ev["sl"]:
+                            ev["sl"] = trail_target
+                            db_upsert_trade(ev, status="OPEN")
+
+                    if p <= ev["sl"]:
+                        if ev["stage"] == "OPEN": final_r = -1.0; res = "EVENT SL HIT"
+                        elif ev["stage"] == "TP1_DONE": final_r = ev["realized_r"]; res = "BE EXIT"
+                        elif ev["stage"] == "TP2_DONE": final_r = ev["realized_r"] + (ev["remaining_pct"] * 1.0); res = "TP1 LOCK EXIT"
+                        else:
+                            runner_r = (p - ev["entry"]) / risk
+                            final_r = ev["realized_r"] + (ev["remaining_pct"] * runner_r)
+                            res = "4H TRAIL EXIT"
+                        db_upsert_trade(ev, status="CLOSED", exit_p=p, res=res, final_pnl=round(final_r, 3))
+                        send_telegram(f"🏁 <b>[EVENT COMPLETED] {res}</b> @ ${p:,.2f} | Final: <b>{final_r:+.3f}R</b>")
+                        GLOBAL_ACTIVE["EVENT"] = None
+
+                elif ev["dir"] == "SHORT":
+                    if p <= ev["tp1"] and ev["stage"] == "OPEN":
+                        ev["stage"] = "TP1_DONE"
+                        ev["realized_r"] += 0.25 * 1.0
+                        ev["remaining_pct"] = 0.75
+                        ev["sl"] = ev["entry"]
+                        db_upsert_trade(ev, status="OPEN")
+                        send_telegram(f"⚡ <b>[EVENT] TP1 (+1R)</b> -> 25% banked. SL locked to BE (${ev['entry']:,.2f})")
+
+                    elif p <= ev["tp2"] and ev["stage"] == "TP1_DONE":
+                        ev["stage"] = "TP2_DONE"
+                        ev["realized_r"] += 0.25 * 2.0
+                        ev["remaining_pct"] = 0.50
+                        ev["sl"] = ev["tp1"]
+                        db_upsert_trade(ev, status="OPEN")
+                        send_telegram(f"⚡ <b>[EVENT] TP2 (+2R)</b> -> 25% banked. SL locked to TP1 (${ev['tp1']:,.2f})")
+
+                    elif p <= ev["tp3"] and ev["stage"] == "TP2_DONE":
+                        ev["stage"] = "RUNNER_ACTIVE"
+                        ev["realized_r"] += 0.25 * 4.0
+                        ev["remaining_pct"] = 0.25
+                        db_upsert_trade(ev, status="OPEN")
+                        send_telegram(f"🔥 <b>[EVENT] TP3 (+4R) REACHED</b> -> 75% banked. 25% Runner active!")
+
+                    if ev["stage"] == "RUNNER_ACTIVE" and s4.get("last_high"):
+                        trail_target = s4["last_high"] + (0.5 * a4)
+                        if trail_target < ev["sl"]:
+                            ev["sl"] = trail_target
+                            db_upsert_trade(ev, status="OPEN")
+
+                    if p >= ev["sl"]:
+                        if ev["stage"] == "OPEN": final_r = -1.0; res = "EVENT SL HIT"
+                        elif ev["stage"] == "TP1_DONE": final_r = ev["realized_r"]; res = "BE EXIT"
+                        elif ev["stage"] == "TP2_DONE": final_r = ev["realized_r"] + (ev["remaining_pct"] * 1.0); res = "TP1 LOCK EXIT"
+                        else:
+                            runner_r = (ev["entry"] - p) / risk
+                            final_r = ev["realized_r"] + (ev["remaining_pct"] * runner_r)
+                            res = "4H TRAIL EXIT"
+                        db_upsert_trade(ev, status="CLOSED", exit_p=p, res=res, final_pnl=round(final_r, 3))
+                        send_telegram(f"🏁 <b>[EVENT COMPLETED] {res}</b> @ ${p:,.2f} | Final: <b>{final_r:+.3f}R</b>")
+                        GLOBAL_ACTIVE["EVENT"] = None
+
+    def scan_master_and_event(self):
         global ACTIVE_POI_REGISTRY
         with LOCK:
             hub = DATA_HUB
             c15 = hub["klines"].get("15m", [])
+            c5 = hub["klines"].get("5m", [])
             c1h = hub["klines"].get("1h", [])
             c4 = hub["klines"].get("4h", [])
             cd = hub["klines"].get("1d", [])
 
-            if min(len(c15), len(c1h), len(c4)) < 25: return
+            if min(len(c15), len(c5), len(c1h), len(c4)) < 25: return
 
             s15 = smc_structure(c15); s1h = smc_structure(c1h); s4 = smc_structure(c4)
+            sd = smc_structure(cd) if len(cd) > 20 else {}
             cur = c15[-1]
             a15 = atr(c15); a4 = atr(c4)
 
-            # 1. POI IDENTIFICATION + EQH/EQL/IDM ENHANCEMENT
+            # Expose Active POIs to Sniper
             fvg15 = detect_unmitigated_fvg(c15)
             fvg1h = detect_unmitigated_fvg(c1h)
-            eq_data = detect_eqh_eql(c15)
             new_pois = []
-
-            if fvg15 and (s1h["bias"] == ("BULL" if fvg15["dir"] == "LONG" else "BEAR")):
-                new_pois.append({
-                    "type": "15M_FVG", "dir": fvg15["dir"], 
-                    "low": fvg15["low"], "high": fvg15["high"],
-                    "has_eqh_eql": eq_data["eqh"] is not None or eq_data["eql"] is not None
-                })
-            if fvg1h:
-                new_pois.append({
-                    "type": "1H_FVG", "dir": fvg1h["dir"], 
-                    "low": fvg1h["low"], "high": fvg1h["high"],
-                    "has_eqh_eql": False
-                })
+            if fvg15: new_pois.append({"type": "15M_FVG", "dir": fvg15["dir"], "low": fvg15["low"], "high": fvg15["high"]})
+            if fvg1h: new_pois.append({"type": "1H_FVG", "dir": fvg1h["dir"], "low": fvg1h["low"], "high": fvg1h["high"]})
             ACTIVE_POI_REGISTRY = new_pois
 
-            # 2. 48H EVENT ENGINE (Score >= 85)
+            # 48H EVENT SCAN (Score 85+)
             sw48 = liquidity_sweep(c15, 192)
             if sw48 and GLOBAL_ACTIVE["EVENT"] is None:
                 cand_dir = sw48["dir"]
@@ -387,42 +516,33 @@ class MasterWorkerEngine:
                 now = time.time()
                 if event_key != self.active_event_key or now >= self.event_cooldown_until:
                     desired_bias = "BULL" if cand_dir == "LONG" else "BEAR"
-                    if s4.get("bias") == desired_bias and s1h.get("bias") == desired_bias:
+                    if s4.get("bias") == desired_bias and s1h.get("bias") == desired_bias and check_5m_confirmation(c5, cand_dir):
                         sl = (cur["low"] - 1.5 * a15) if cand_dir == "LONG" else (cur["high"] + 1.5 * a15)
                         risk = abs(cur["close"] - sl)
                         evt = {
                             "id": f"EVT_{int(now*1000)}", "created": datetime.now(timezone.utc).strftime("%H:%M:%S"),
-                            "type": "EVENT", "tf": "48H/HTF", "dir": cand_dir, "setup": "48H Sweep + Multi-TF Cascade + Void Purge",
-                            "score": 95, "entry": cur["close"], "sl": sl,
+                            "type": "EVENT", "tf": "48H/HTF", "dir": cand_dir, "setup": "48H Sweep + Multi-TF Alignment",
+                            "score": 90, "entry": cur["close"], "sl": sl,
                             "tp1": cur["close"] + risk if cand_dir == "LONG" else cur["close"] - risk,
                             "tp2": cur["close"] + (2 * risk) if cand_dir == "LONG" else cur["close"] - (2 * risk),
                             "tp3": cur["close"] + (4 * risk) if cand_dir == "LONG" else cur["close"] - (4 * risk),
-                            "realized_r": 0.0, "remaining_pct": 1.0, "stage": "OPEN", "reasons": ["48H Sweep", "Cascade Alignment", "EQ Liquidity Purged"]
+                            "realized_r": 0.0, "remaining_pct": 1.0, "stage": "OPEN", "reasons": ["48H Sweep", "HTF Alignment"]
                         }
                         self.active_event_key = event_key
                         self.event_cooldown_until = now + EVENT_COOLDOWN
                         GLOBAL_ACTIVE["EVENT"] = evt
                         db_upsert_trade(evt, status="OPEN")
-                        
-                        c = db()
-                        c.execute("INSERT OR REPLACE INTO event_locks VALUES (?,?,?,?,?)",
-                                  (event_key, now, cand_dir, 95, "ACTIVE"))
-                        c.commit(); c.close()
-
                         send_telegram(
-                            f"🔥 <b>[48H RARE EVENT SIGNAL]</b>\n\n"
-                            f"<b>{cand_dir}</b> @ ${cur['close']:,.2f}\n"
-                            f"SL: ${sl:,.2f}\n"
-                            f"TP1: ${evt['tp1']:,.2f} | TP2: ${evt['tp2']:,.2f}\n"
-                            f"Score: 95/105"
+                            f"🔥 <b>[EVENT SIGNAL]</b>\n\n<b>{cand_dir}</b> @ ${cur['close']:,.2f}\n"
+                            f"SL: ${sl:,.2f} | TP1: ${evt['tp1']:,.2f} | TP2: ${evt['tp2']:,.2f}\nScore: 90/105"
                         )
 
-def run_master_worker_daemon():
+def run_worker_daemon():
     time.sleep(2)
-    logging.info("🚀 Master Worker with EQH/EQL & IDM Online...")
-    send_telegram("🚀 <b>Master Worker Online</b>\nFull Liquidity Engine Active 24/7.")
+    logging.info("🚀 Production Worker Daemon Live...")
+    send_telegram("🚀 <b>BTCUSDT Master Engine & Hub Online 24/7</b>")
 
-    engine = MasterWorkerEngine()
+    manager = TradeManager()
 
     while True:
         try:
@@ -433,14 +553,20 @@ def run_master_worker_daemon():
                 ENGINE_STATUS["last_price"] = p
                 ENGINE_STATUS["last_scan_time"] = datetime.now(timezone.utc).strftime("%H:%M:%S")
                 ENGINE_STATUS["scans_completed"] += 1
-                engine.evaluate_master_setup()
+
+                c4 = DATA_HUB["klines"].get("4h", [])
+                s4 = smc_structure(c4) if len(c4) > 20 else {}
+                a4 = atr(c4) if len(c4) > 20 else 120.0
+
+                manager.manage_positions(p, s4, a4)
+                manager.scan_master_and_event()
 
             time.sleep(3)
         except Exception as e:
-            logging.error(f"Worker error: {e}\n{traceback.format_exc()}")
+            logging.error(f"Worker daemon error: {e}\n{traceback.format_exc()}")
             time.sleep(4)
 
-threading.Thread(target=run_master_worker_daemon, daemon=True).start()
+threading.Thread(target=run_worker_daemon, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
