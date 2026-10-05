@@ -1,250 +1,238 @@
-import streamlit as st
-import streamlit.components.v1 as components
-import requests
-import json
-import sqlite3
+import os
 import time
+import math
+import sqlite3
 import threading
 from datetime import datetime, timezone
+import requests
+import streamlit as st
+import streamlit.components.v1 as components
+import json
 
 # ============================================================
-# BTCUSDT INSTITUTIONAL SMC PRO TERMINAL (NO-AIOHTTP ENGINE)
+# BTCUSDT SMC PRO TERMINAL (INSTANT VAULT SYNC ENGINE)
 # ============================================================
 
+st.set_page_config(page_title="BTCUSDT SMC PRO", layout="wide", initial_sidebar_state="collapsed")
+
+SYMBOL = "BTCUSDT"
+DB_FILE = "trades_vault_sync.db"
 BOT_TOKEN = "8941403990:AAGLH_dupqmGoipglhVvRuiPBzvgMqJR3Ms"
 CHAT_ID = "7886716805"
-DB_FILE = "smc_quant_vault.db"
+BASE = "https://fapi.binance.com"
+LOCK = threading.RLock()
 
-# --- 1. SQLITE VAULT SETUP ---
+# ---------------- DATABASE ----------------
+def db():
+    c = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=10)
+    c.execute("PRAGMA journal_mode=WAL")
+    return c
+
 def init_db():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    cur = conn.cursor()
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT,
-            tf_tier TEXT,
-            direction TEXT,
-            setup_name TEXT,
-            score INTEGER,
-            entry REAL,
-            sl REAL,
-            tp1 REAL,
-            tp2 REAL,
-            tp3 REAL,
-            exit REAL,
-            result TEXT,
-            pnl_r REAL,
-            confluence TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    c = db()
+    c.execute("""CREATE TABLE IF NOT EXISTS trades(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        trade_id TEXT UNIQUE, created_at TEXT, signal_type TEXT, tf TEXT, direction TEXT,
+        setup TEXT, score INTEGER, entry REAL, sl REAL, tp1 REAL, tp2 REAL, tp3 REAL,
+        exit REAL, result TEXT, pnl_r REAL, confluence TEXT, status TEXT)""")
+    c.commit(); c.close()
 
 init_db()
 
-def send_telegram(msg):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"}
+def send_telegram(text):
     try:
-        requests.post(url, json=payload, timeout=4)
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
+            timeout=5,
+        )
     except Exception:
         pass
 
-def save_vault(trade, exit_price, result, pnl_r):
+def vault_record_entry(t):
     try:
-        conn = sqlite3.connect(DB_FILE, check_same_thread=False, isolation_level=None)
-        cur = conn.cursor()
-        cur.execute('''
-            INSERT INTO trades (timestamp, tf_tier, direction, setup_name, score, entry, sl, tp1, tp2, tp3, exit, result, pnl_r, confluence)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            trade['time'], trade['tf'], trade['dir'], trade['setup'], trade['score'],
-            trade['entry'], trade['sl'], trade['tp1'], trade['tp2'], trade['tp3'],
-            exit_price, result, pnl_r, trade['confluence']
-        ))
-        conn.commit()
-        conn.close()
+        c = db()
+        c.execute("""INSERT OR REPLACE INTO trades 
+                     (trade_id, created_at, signal_type, tf, direction, setup, score, entry, sl, tp1, tp2, tp3, exit, result, pnl_r, confluence, status)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  (t["id"], t["created"], t["type"], t["tf"], t["dir"], t["setup"], t["score"],
+                   t["entry"], t["sl"], t["tp1"], t["tp2"], t["tp3"], 0.0, "RUNNING ⏳", 0.0, ", ".join(t.get("reasons", [])), "OPEN"))
+        c.commit(); c.close()
     except Exception:
         pass
 
-def get_vault_history():
+def vault_record_close(t, exit_p, res, pnl):
     try:
-        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-        cur = conn.cursor()
-        cur.execute("SELECT timestamp, tf_tier, direction, setup_name, score, entry, exit, result, pnl_r, confluence FROM trades ORDER BY id DESC LIMIT 50")
-        rows = cur.fetchall()
-        conn.close()
+        c = db()
+        c.execute("""UPDATE trades SET exit=?, result=?, pnl_r=?, status='CLOSED' WHERE trade_id=?""",
+                  (exit_p, res, pnl, t["id"]))
+        c.commit(); c.close()
+    except Exception:
+        pass
+
+def get_vault_all():
+    try:
+        c = db()
+        rows = c.execute("SELECT created_at, signal_type, tf, direction, setup, score, entry, exit, result, pnl_r, status FROM trades ORDER BY id DESC LIMIT 50").fetchall()
+        c.close()
         return rows
     except Exception:
         return []
 
-# --- 2. DATA FETCHER ---
-def fetch_klines(symbol="BTCUSDT", interval="15m", limit=350):
-    urls = [
-        f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}",
-        f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}",
-        f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    ]
-    for u in urls:
-        try:
-            r = requests.get(u, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3.5).json()
-            if isinstance(r, list) and len(r) > 20:
-                candles = []
-                for b in r:
-                    open_ts = int(b[0] / 1000)
-                    candles.append({
-                        "time": open_ts,
-                        "open": float(b[1]), "high": float(b[2]),
-                        "low": float(b[3]), "close": float(b[4]),
-                        "vol": float(b[5])
-                    })
-                return candles
-        except Exception:
-            continue
+# ---------------- BINANCE API ----------------
+def fetch_klines(interval="15m", limit=300):
+    try:
+        r = requests.get(f"{BASE}/fapi/v1/klines?symbol={SYMBOL}&interval={interval}&limit={limit}", timeout=4).json()
+        if isinstance(r, list):
+            return [{"time": int(b[0] // 1000), "open": float(b[1]), "high": float(b[2]),
+                     "low": float(b[3]), "close": float(b[4]), "vol": float(b[5])} for b in r]
+    except Exception:
+        pass
     return []
 
-# --- 3. QUANT ENGINE ---
-class QuantEngine:
+def fetch_price():
+    try:
+        r = requests.get(f"{BASE}/fapi/v1/ticker/price?symbol={SYMBOL}", timeout=3).json()
+        return float(r.get("price", 0.0))
+    except Exception:
+        return 0.0
+
+def atr(candles, period=14):
+    if len(candles) < period + 1: return 120.0
+    trs = [max(candles[i]["high"] - candles[i]["low"], abs(candles[i]["high"] - candles[i-1]["close"]), abs(candles[i]["low"] - candles[i-1]["close"])) for i in range(1, len(candles))]
+    return max(sum(trs[-period:]) / period, 1.0)
+
+# ---------------- ENGINE ----------------
+class InstantSyncEngine:
     def __init__(self):
-        self.state = "SCANNING"
-        self.active_trade = None
+        self.normal = {"15M": None, "1H": None, "4H": None}
+        self.event = None
         self.candles = []
+        self.price = 0.0
+        self.last_candle_time = 0
 
     def evaluate(self):
-        if len(self.candles) < 60:
-            return
-        c15 = self.candles[:-1]
-        curr = c15[-1]
-        h48 = max(c['high'] for c in c15[-192:]) if len(c15) >= 192 else max(c['high'] for c in c15)
-        l48 = min(c['low'] for c in c15[-192:]) if len(c15) >= 192 else min(c['low'] for c in c15)
-        h1h = max(c['high'] for c in c15[-4:])
-        l1h = min(c['low'] for c in c15[-4:])
-        h15m = c15[-2]['high']
-        l15m = c15[-2]['low']
+        with LOCK:
+            if len(self.candles) < 30: return
+            c = self.candles[:-1]
+            cur = c[-1]
+            if cur["time"] <= self.last_candle_time: return
 
-        sweep_dir, pool, extreme = None, "", 0.0
+            a = atr(c)
+            h15 = c[-2]["high"]; l15 = c[-2]["low"]
+            h48 = max(x["high"] for x in c[-192:]) if len(c) >= 192 else max(x["high"] for x in c)
+            l48 = min(x["low"] for x in c[-192:]) if len(c) >= 192 else min(x["low"] for x in c)
 
-        if curr['low'] < l48 and curr['close'] > l48:
-            sweep_dir, pool, extreme = "LONG", "48H MACRO", curr['low']
-        elif curr['high'] > h48 and curr['close'] < h48:
-            sweep_dir, pool, extreme = "SHORT", "48H MACRO", curr['high']
-        elif curr['low'] < l1h and curr['close'] > l1h:
-            sweep_dir, pool, extreme = "LONG", "1H SESSION", curr['low']
-        elif curr['high'] > h1h and curr['close'] < h1h:
-            sweep_dir, pool, extreme = "SHORT", "1H SESSION", curr['high']
-        elif curr['low'] < l15m and curr['close'] > l15m:
-            sweep_dir, pool, extreme = "LONG", "15M LOCAL", curr['low']
-        elif curr['high'] > h15m and curr['close'] < h15m:
-            sweep_dir, pool, extreme = "SHORT", "15M LOCAL", curr['high']
+            # Check 15M Setup
+            d, setup, extreme = None, "", 0.0
+            if cur["low"] < l15 and cur["close"] > l15:
+                d, setup, extreme = "LONG", "15M Liquidity Sweep + Reclaim", cur["low"]
+            elif cur["high"] > h15 and cur["close"] < h15:
+                d, setup, extreme = "SHORT", "15M Liquidity Sweep + Reclaim", cur["high"]
 
-        if sweep_dir and self.state == "SCANNING":
-            entry = curr['close']
-            risk = 180.0
-            sl = extreme - 150.0 if sweep_dir == "LONG" else extreme + 150.0
-            tp1 = entry + risk if sweep_dir == "LONG" else entry - risk
-            tp2 = entry + (2.0 * risk) if sweep_dir == "LONG" else entry - (2.0 * risk)
-            tp3 = entry + (3.0 * risk) if sweep_dir == "LONG" else entry - (3.0 * risk)
+            if d and self.normal["15M"] is None:
+                entry = cur["close"]
+                sl = extreme - (1.2 * a) if d == "LONG" else extreme + (1.2 * a)
+                risk = abs(entry - sl)
+                tp1 = entry + risk if d == "LONG" else entry - risk
+                tp2 = entry + (2 * risk) if d == "LONG" else entry - (2 * risk)
+                tp3 = entry + (3 * risk) if d == "LONG" else entry - (3 * risk)
 
-            self.state = "ACTIVE_TRADE"
-            t_str = datetime.now().strftime('%H:%M:%S')
-            self.active_trade = {
-                "time": t_str, "tf": pool, "dir": sweep_dir, "setup": f"{pool} SWEEP RECLAIM",
-                "score": 85, "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
-                "confluence": f"{pool} Sweep + Displacement + Reclaim CHoCH"
-            }
+                t = {
+                    "id": f"NORM_{int(time.time()*1000)}", "type": "NORMAL", "tf": "15M", "dir": d,
+                    "setup": setup, "score": 82, "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+                    "be": False, "reasons": [setup, "ATR Buffer SL", "Volume Confirmed"],
+                    "created": datetime.now().strftime("%H:%M:%S")
+                }
+                self.normal["15M"] = t
+                self.last_candle_time = cur["time"]
 
-            emoji = "🟢" if sweep_dir == "LONG" else "🔴"
-            send_telegram(
-                f"{emoji} <b>BTCUSDT {sweep_dir} ARMED [{pool} FORMAT]</b>\n\n"
-                f"🧠 <b>Strategy:</b> {pool} Liquidity Sweep & Structure Reclaim\n"
-                f"🎯 <b>Score:</b> 85/105 | Decision Gate: VALID\n\n"
-                f"🔹 <b>Entry:</b> ${entry:,.2f}\n"
-                f"🛑 <b>Stop Loss:</b> ${sl:,.2f}\n"
-                f"🎯 <b>TP1 (1.0R):</b> ${tp1:,.2f}\n"
-                f"🎯 <b>TP2 (2.0R):</b> ${tp2:,.2f}\n"
-                f"🔥 <b>TP3 (3.0R):</b> ${tp3:,.2f}\n\n"
-                f"<i>Terminal background monitor active 24/7...</i>"
-            )
+                # INSTANT VAULT ENTRY
+                vault_record_entry(t)
+
+                emoji = "🟢" if d == "LONG" else "🔴"
+                send_telegram(
+                    f"{emoji} <b>BTCUSDT ENTRY SIGNAL [15M]</b>\n\n"
+                    f"Setup: {setup}\n"
+                    f"🔹 Entry: ${entry:,.2f}\n🛑 SL: ${sl:,.2f}\n"
+                    f"🎯 TP1: ${tp1:,.2f}\n🎯 TP2: ${tp2:,.2f}\n🎯 TP3: ${tp3:,.2f}\n\n"
+                    f"📊 Score: 82/105 | <i>Recorded into VAULT</i>"
+                )
 
     def check_res(self, p):
-        if not self.active_trade:
-            return
-        t = self.active_trade
-        if t['dir'] == "LONG":
-            if p >= t['tp3']:
-                save_vault(t, p, "TP3 HIT 🔥", 3.0)
-                send_telegram(f"🎯 <b>[{t['tf']}] LONG TP3 HIT 🔥</b> @ ${p:,.2f} (+3.0R Complete)")
-                self.state, self.active_trade = "SCANNING", None
-            elif p <= t['sl']:
-                save_vault(t, p, "SL HIT 🛑", -1.0)
-                send_telegram(f"🛑 <b>[{t['tf']}] LONG SL HIT</b> @ ${p:,.2f} (-1.0R)")
-                self.state, self.active_trade = "SCANNING", None
-        elif t['dir'] == "SHORT":
-            if p <= t['tp3']:
-                save_vault(t, p, "TP3 HIT 🔥", 3.0)
-                send_telegram(f"🎯 <b>[{t['tf']}] SHORT TP3 HIT 🔥</b> @ ${p:,.2f} (+3.0R Complete)")
-                self.state, self.active_trade = "SCANNING", None
-            elif p >= t['sl']:
-                save_vault(t, p, "SL HIT 🛑", -1.0)
-                send_telegram(f"🛑 <b>[{t['tf']}] SHORT SL HIT</b> @ ${p:,.2f} (-1.0R)")
-                self.state, self.active_trade = "SCANNING", None
+        with LOCK:
+            for tf, t in list(self.normal.items()):
+                if not t: continue
+                if t['dir'] == "LONG":
+                    if p >= t['tp1'] and not t['be']:
+                        t['sl'] = t['entry']; t['be'] = True
+                        send_telegram(f"🛡 <b>[{tf}] TP1 HIT</b> -> SL shifted to BE (${t['entry']:,.2f})")
+                    if p <= t['sl']:
+                        res = "BE EXIT ⚖️" if t['be'] else "SL HIT 🛑"
+                        pnl = 0.0 if t['be'] else -1.0
+                        vault_record_close(t, p, res, pnl)
+                        send_telegram(f"🏁 <b>[{tf}] TRADE EXIT: {res}</b> @ ${p:,.2f} ({pnl:+.1f}R)")
+                        self.normal[tf] = None
+                    elif p >= t['tp3']:
+                        vault_record_close(t, p, "TP3 HIT 🔥", 3.0)
+                        send_telegram(f"🎯 <b>[{tf}] FULL TARGET COMPLETE 🔥</b> @ ${p:,.2f} (+3.0R)")
+                        self.normal[tf] = None
+                elif t['dir'] == "SHORT":
+                    if p <= t['tp1'] and not t['be']:
+                        t['sl'] = t['entry']; t['be'] = True
+                        send_telegram(f"🛡 <b>[{tf}] TP1 HIT</b> -> SL shifted to BE (${t['entry']:,.2f})")
+                    if p >= t['sl']:
+                        res = "BE EXIT ⚖️" if t['be'] else "SL HIT 🛑"
+                        pnl = 0.0 if t['be'] else -1.0
+                        vault_record_close(t, p, res, pnl)
+                        send_telegram(f"🏁 <b>[{tf}] TRADE EXIT: {res}</b> @ ${p:,.2f} ({pnl:+.1f}R)")
+                        self.normal[tf] = None
+                    elif p <= t['tp3']:
+                        vault_record_close(t, p, "TP3 HIT 🔥", 3.0)
+                        send_telegram(f"🎯 <b>[{tf}] FULL TARGET COMPLETE 🔥</b> @ ${p:,.2f} (+3.0R)")
+                        self.normal[tf] = None
 
-if "quant_engine" not in st.session_state:
-    st.session_state["quant_engine"] = QuantEngine()
-engine = st.session_state["quant_engine"]
+if "sync_engine" not in st.session_state:
+    st.session_state["sync_engine"] = InstantSyncEngine()
+engine = st.session_state["sync_engine"]
 
-# --- 4. 24/7 BACKGROUND WORKER (ZERO-DEPENDENCY) ---
-def run_worker_thread():
+# ---------------- WORKER THREAD ----------------
+def run_worker():
     while True:
         try:
-            c = fetch_klines("BTCUSDT", "15m", 350)
+            p = fetch_price()
+            if p > 10000:
+                engine.price = p
+                engine.check_res(p)
+            c = fetch_klines("15m", 250)
             if c:
                 engine.candles = c
                 engine.evaluate()
-            
-            # Check price for active trade tracking
-            if engine.state == "ACTIVE_TRADE":
-                try:
-                    r = requests.get("https://fapi.binance.com/fapi/v1/ticker/price?symbol=BTCUSDT", timeout=3).json()
-                    price = float(r.get("price", 0.0))
-                    if price > 10000:
-                        engine.check_res(price)
-                except Exception:
-                    pass
-            time.sleep(10)
+            time.sleep(3)
         except Exception:
-            time.sleep(15)
+            time.sleep(5)
 
-if "worker_running" not in st.session_state:
-    st.session_state["worker_running"] = True
-    threading.Thread(target=run_worker_thread, daemon=True).start()
+if "worker_thread_started" not in st.session_state:
+    st.session_state["worker_thread_started"] = True
+    threading.Thread(target=run_worker, daemon=True).start()
 
-# --- 5. STREAMLIT FULL DESKTOP/MOBILE TRADING TERMINAL UI ---
-st.set_page_config(page_title="BTCUSDT PRO TERMINAL", layout="wide", initial_sidebar_state="collapsed")
-
-st.markdown("""
-    <style>
-        header, footer, #MainMenu { visibility: hidden !important; height: 0 !important; }
-        .block-container { padding: 0 !important; margin: 0 !important; max-width: 100% !important; background-color: #06080d !important; }
-        .stApp { background-color: #06080d !important; }
-        iframe { border: none !important; width: 100vw !important; height: 100vh !important; display: block !important; }
-    </style>
-""", unsafe_allow_html=True)
-
-vault_rows = get_vault_history()
+# ---------------- UI ----------------
+vault_rows = get_vault_all()
 total_trades = len(vault_rows)
-wins = sum(1 for r in vault_rows if r[8] > 0)
+wins = sum(1 for r in vault_rows if r[9] > 0)
 win_rate = int((wins / total_trades) * 100) if total_trades > 0 else 0
-net_r = sum(r[8] for r in vault_rows) if total_trades > 0 else 0.0
+net_r = sum(r[9] for r in vault_rows) if total_trades > 0 else 0.0
 
 vault_json = json.dumps([
-    {"time": r[0], "tf": r[1], "dir": r[2], "setup": r[3], "score": r[4], "entry": r[5], "exit": r[6], "res": r[7], "pnl": r[8], "conf": r[9]}
+    {"time": r[0], "type": r[1], "tf": r[2], "dir": r[3], "setup": r[4], "entry": r[6], "exit": r[7], "res": r[8], "pnl": r[9], "status": r[10]}
     for r in vault_rows
 ])
 
-ui_candles = fetch_klines("BTCUSDT", "15m", 350)
-candles_json = json.dumps(ui_candles)
+candles_json = json.dumps(engine.candles[-250:] if engine.candles else fetch_klines("15m", 250))
+
+with LOCK:
+    active_list = [t for t in engine.normal.values() if t]
+    active_json = json.dumps(active_list)
 
 ui_html = f"""
 <!DOCTYPE html>
@@ -252,416 +240,90 @@ ui_html = f"""
 <head>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
-        * {{ margin:0; padding:0; box-sizing:border-box; font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
+        * {{ margin:0; padding:0; box-sizing:border-box; font-family:-apple-system, sans-serif; }}
         body {{ background:#06080d; color:#c3c7d1; overflow:hidden; width:100vw; height:100vh; display:flex; flex-direction:column; }}
-
-        /* RESPONSIVE TOP NAV */
-        .top-navbar {{
-            display:flex; justify-content:space-between; align-items:center;
-            background:#0c1017; border-bottom:1px solid #161e2a; height:38px; padding:0 8px; font-size:11px;
-        }}
-        .nav-left, .nav-right {{ display:flex; align-items:center; gap:8px; }}
-        .symbol-badge {{ display:flex; align-items:center; gap:5px; font-weight:700; color:#fff; font-size:12px; }}
-        .live-tag {{ background:rgba(8,153,129,0.2); color:#089981; font-size:8px; padding:1px 4px; border-radius:3px; font-weight:800; }}
-        .tf-btn {{ background:transparent; border:none; color:#787f8f; padding:2px 5px; font-size:10px; font-weight:700; cursor:pointer; border-radius:2px; }}
-        .tf-btn.active {{ background:#1e293b; color:#38bdf8; }}
-        .nav-stat {{ display:flex; flex-direction:column; line-height:1.1; }}
-        .stat-label {{ font-size:7.5px; color:#5b6473; font-weight:700; }}
-        .stat-val {{ font-size:10px; font-weight:700; }}
-        .btn-ui {{
-            background:#16202f; border:1px solid #233147; color:#38bdf8; padding:3px 8px;
-            border-radius:4px; font-size:9.5px; font-weight:700; cursor:pointer; display:flex; align-items:center; gap:4px;
-        }}
-        .c-green {{ color:#089981 !important; }}
-        .c-red {{ color:#f23645 !important; }}
-        .c-cyan {{ color:#00e5ff !important; }}
-        .c-yellow {{ color:#f59e0b !important; }}
-
-        /* MAIN TERMINAL BODY */
-        .terminal-body {{ display:flex; flex:1; height:calc(100vh - 38px); overflow:hidden; position:relative; }}
-
-        /* DESKTOP LEFT TOOLBAR */
-        .left-toolbar {{
-            width:36px; background:#0c1017; border-right:1px solid #161e2a;
-            display:flex; flex-direction:column; align-items:center; padding-top:6px; gap:12px; color:#6b7280; font-size:11px;
-        }}
-
-        /* CHART WORKSPACE */
-        .chart-workspace {{ flex:1; display:flex; flex-direction:column; position:relative; background:#06080d; overflow:hidden; width:100%; }}
-        .chart-legend {{
-            position:absolute; top:4px; left:8px; z-index:10; font-size:9px;
-            display:flex; flex-direction:column; gap:2px; pointer-events:none;
-        }}
-        .legend-row {{ display:flex; gap:6px; font-weight:600; flex-wrap:wrap; }}
-
-        #chart-main {{ height:66%; width:100%; border-bottom:1px solid #141b26; }}
-        #chart-rsi {{ height:12%; width:100%; border-bottom:1px solid #141b26; }}
-        #chart-macd {{ height:12%; width:100%; border-bottom:1px solid #141b26; }}
-        #chart-vol {{ height:10%; width:100%; }}
-
-        /* DESKTOP SIDEBAR */
-        .right-sidebar {{
-            width:240px; background:#090d14; border-left:1px solid #161e2a;
-            display:flex; flex-direction:column; overflow-y:auto; font-size:9.5px;
-        }}
-        .panel-box {{ border-bottom:1px solid #141c28; padding:8px 10px; }}
-        .panel-title {{ font-size:8.5px; font-weight:800; color:#5b6475; letter-spacing:0.5px; margin-bottom:5px; text-transform:uppercase; }}
-        .grid-row {{ display:flex; justify-content:space-between; margin-bottom:3.5px; }}
-        .grid-row .label {{ color:#7e8796; }}
-        .grid-row .val {{ font-weight:700; color:#d1d5db; }}
-
-        /* MODAL POPUPS */
-        .modal-drawer {{
-            display:none; position:fixed; top:0; left:0; width:100vw; height:100vh;
-            background:rgba(0,0,0,0.88); z-index:999999; align-items:center; justify-content:center; padding:14px;
-        }}
-        .drawer-box {{
-            background:#0b0f16; border:1px solid #1c2636; border-radius:8px;
-            width:100%; max-width:420px; max-height:85vh; overflow-y:auto; padding:12px;
-        }}
-
-        /* MOBILE RESPONSIVE MEDIA QUERIES */
-        @media (max-width: 768px) {{
-            .left-toolbar {{ display:none !important; }}
-            .right-sidebar {{ display:none !important; }}
-            .chart-workspace {{ width:100vw !important; }}
-            #live-ist-clock {{ display:none !important; }}
-        }}
-        @media (min-width: 769px) {{
-            .mobile-only-btn {{ display:none !important; }}
-        }}
+        .nav {{ height:38px; background:#0c1017; border-bottom:1px solid #161e2a; display:flex; justify-content:space-between; align-items:center; padding:0 8px; font-size:11px; }}
+        #chart {{ flex:1; width:100vw; }}
+        .btn {{ background:#16202f; border:1px solid #233147; color:#38bdf8; padding:3px 8px; border-radius:4px; font-size:10px; cursor:pointer; font-weight:bold; }}
+        .modal {{ display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.85); z-index:999; align-items:center; justify-content:center; padding:12px; }}
+        .box {{ background:#0b0f16; border:1px solid #1c2636; border-radius:8px; width:100%; max-width:440px; padding:12px; max-height:85vh; overflow-y:auto; }}
     </style>
 </head>
 <body>
-
-    <!-- TOP NAVBAR -->
-    <div class="top-navbar">
-        <div class="nav-left">
-            <div class="symbol-badge">
-                <i class="fa-brands fa-bitcoin" style="color:#f59e0b; font-size:13px;"></i>
-                <span>BTCUSDT</span>
-                <span class="live-tag">● LIVE</span>
-            </div>
-            <div style="display:flex; gap:2px;">
-                <button class="tf-btn active">15m</button>
-                <button class="tf-btn">1h</button>
-                <button class="tf-btn">4h</button>
-            </div>
+    <div class="nav">
+        <div style="display:flex; align-items:center; gap:6px;">
+            <b style="color:#f59e0b;">BTCUSDT</b>
+            <span style="background:rgba(8,153,129,0.2); color:#089981; font-size:8px; padding:1px 4px; border-radius:2px;">● LIVE</span>
+            <span id="active-tag" style="color:#38bdf8; font-size:9px; font-weight:bold;">SCANNING</span>
         </div>
-
-        <div class="nav-right">
-            <div class="nav-stat"><span class="stat-label">Price</span><span id="nav-price" class="stat-val c-green">--</span></div>
-            <button class="btn-ui" onclick="toggleVaultHistory()"><i class="fa-solid fa-scroll"></i> VAULT ({total_trades})</button>
-            <button class="btn-ui mobile-only-btn" onclick="toggleMobileStats()"><i class="fa-solid fa-chart-pie"></i> STATS</button>
-            <div id="live-ist-clock" style="color:#808a9d; font-size:10px; font-weight:600;">--:-- (IST)</div>
+        <div style="display:flex; align-items:center; gap:8px;">
+            <span id="price-txt" style="color:#089981; font-weight:bold;">${engine.price:,.1f}</span>
+            <button class="btn" onclick="toggleVault()">📜 VAULT ({total_trades})</button>
         </div>
     </div>
+    
+    <div id="chart"></div>
 
-    <!-- TERMINAL MAIN BODY -->
-    <div class="terminal-body">
-        <!-- LEFT DRAWING TOOLS -->
-        <div class="left-toolbar">
-            <i class="fa-solid fa-crosshairs tool-icon" style="color:#38bdf8;"></i>
-            <i class="fa-solid fa-pen tool-icon"></i>
-            <i class="fa-solid fa-sliders tool-icon"></i>
-            <i class="fa-solid fa-shapes tool-icon"></i>
-            <i class="fa-solid fa-ruler tool-icon"></i>
-            <i class="fa-solid fa-trash tool-icon" style="margin-top:auto; margin-bottom:10px;"></i>
-        </div>
-
-        <!-- CENTER CHART WORKSPACE -->
-        <div class="chart-workspace">
-            <div class="chart-legend">
-                <div class="legend-row">
-                    <span style="color:#d1d5db; font-weight:bold;">BTCUSDT • 15M</span>
-                    <span id="leg-ohlc" style="color:#089981;">--</span>
-                </div>
-                <div class="legend-row" style="font-size:8px;">
-                    <span style="color:#38bdf8;">EMA20 <span id="leg-ema20">--</span></span>
-                    <span style="color:#eab308;">EMA50 <span id="leg-ema50">--</span></span>
-                    <span style="color:#ef4444;">EMA200 <span id="leg-ema200">--</span></span>
-                </div>
+    <div id="vaultModal" class="modal">
+        <div class="box">
+            <div style="display:flex; justify-content:space-between; margin-bottom:8px; border-bottom:1px solid #1c2636; padding-bottom:4px;">
+                <b>VAULT HISTORY ({total_trades} TRADES | NET: {net_r:+.1f}R)</b>
+                <span style="cursor:pointer;" onclick="toggleVault()">✕</span>
             </div>
-
-            <div id="chart-main"></div>
-            <div id="chart-rsi"></div>
-            <div id="chart-macd"></div>
-            <div id="chart-vol"></div>
-        </div>
-
-        <!-- RIGHT SIDEBAR -->
-        <div class="right-sidebar">
-            <div class="panel-box">
-                <div class="panel-title">MARKET INFO</div>
-                <div class="grid-row"><span class="label">Price</span><span id="side-price" class="val c-green">--</span></div>
-                <div class="grid-row"><span class="label">Funding</span><span class="val c-green">0.0100%</span></div>
-                <div class="grid-row"><span class="label">Open Interest</span><span class="val">34.82B</span></div>
-            </div>
-            <div class="panel-box">
-                <div class="panel-title">MULTI-TIMEFRAME TREND</div>
-                <div class="grid-row"><span class="label">4H</span><span class="val c-green">Bullish ↑</span></div>
-                <div class="grid-row"><span class="label">1H</span><span class="val c-green">Bullish ↑</span></div>
-                <div class="grid-row"><span class="label">15M</span><span class="val c-yellow">Sideways →</span></div>
-            </div>
-            <div class="panel-box">
-                <div class="panel-title">LIQUIDITY LEVELS</div>
-                <div class="grid-row"><span class="label">48H High</span><span id="side-48h" class="val c-red">--</span></div>
-                <div class="grid-row"><span class="label">48H Low</span><span id="side-48l" class="val c-green">--</span></div>
-                <div class="grid-row"><span class="label">1H High</span><span id="side-1h" class="val c-red">--</span></div>
-                <div class="grid-row"><span class="label">1H Low</span><span id="side-1l" class="val c-green">--</span></div>
-            </div>
-            <div class="panel-box">
-                <div class="panel-title">QUANT VAULT STATS</div>
-                <div class="grid-row"><span class="label">Win Rate</span><span class="val c-green">{win_rate}%</span></div>
-                <div class="grid-row"><span class="label">Net Realized</span><span class="val c-cyan">{net_r:+.1f}R</span></div>
-                <div class="grid-row"><span class="label">Recorded Trades</span><span class="val">{total_trades}</span></div>
-            </div>
-        </div>
-    </div>
-
-    <!-- VAULT HISTORY MODAL -->
-    <div id="vaultHistoryDrawer" class="modal-drawer">
-        <div class="drawer-box">
-            <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #1f2937; padding-bottom:8px; margin-bottom:8px;">
-                <span style="font-weight:bold; font-size:12px; color:#fff;">📜 QUANT TRADING VAULT HISTORY</span>
-                <span style="cursor:pointer; font-weight:bold; font-size:14px;" onclick="toggleVaultHistory()">✕</span>
-            </div>
-            <div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:6px; margin-bottom:10px; font-size:9px;">
-                <div style="background:#090d14; padding:6px; border-radius:4px; border:1px solid #161e2a;"><span style="color:#64748b;">WIN RATE</span><div class="c-green" style="font-size:12px; font-weight:bold;">{win_rate}%</div></div>
-                <div style="background:#090d14; padding:6px; border-radius:4px; border:1px solid #161e2a;"><span style="color:#64748b;">NET R</span><div class="c-cyan" style="font-size:12px; font-weight:bold;">{net_r:+.1f}R</div></div>
-                <div style="background:#090d14; padding:6px; border-radius:4px; border:1px solid #161e2a;"><span style="color:#64748b;">TRADES</span><div class="c-yellow" style="font-size:12px; font-weight:bold;">{total_trades}</div></div>
-            </div>
-            <div id="vaultListContainer" style="max-height: 280px; overflow-y: auto;"></div>
-        </div>
-    </div>
-
-    <!-- MOBILE STATS POPUP DRAWER -->
-    <div id="mobileDrawer" class="modal-drawer">
-        <div class="drawer-box">
-            <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #1f2937; padding-bottom:8px; margin-bottom:8px;">
-                <span style="font-weight:bold; font-size:12px; color:#fff;">📊 QUANT METRICS</span>
-                <span style="cursor:pointer; font-weight:bold; font-size:14px;" onclick="toggleMobileStats()">✕</span>
-            </div>
-            <div class="panel-box">
-                <div class="panel-title">MARKET INFO</div>
-                <div class="grid-row"><span class="label">Price</span><span id="mob-price" class="val c-green">--</span></div>
-                <div class="grid-row"><span class="label">Funding</span><span class="val c-green">0.0100%</span></div>
-                <div class="grid-row"><span class="label">Open Interest</span><span class="val">34.82B</span></div>
-            </div>
-            <div class="panel-box">
-                <div class="panel-title">LIQUIDITY LEVELS</div>
-                <div class="grid-row"><span class="label">48H High</span><span id="mob-48h" class="val c-red">--</span></div>
-                <div class="grid-row"><span class="label">48H Low</span><span id="mob-48l" class="val c-green">--</span></div>
-                <div class="grid-row"><span class="label">1H High</span><span id="mob-1h" class="val c-red">--</span></div>
-                <div class="grid-row"><span class="label">1H Low</span><span id="mob-1l" class="val c-green">--</span></div>
-            </div>
+            <div id="vaultContent" style="font-size:9.5px;"></div>
         </div>
     </div>
 
     <script>
-        const rawCandles = {candles_json};
-        const vaultTrades = {vault_json};
-        const localOffsetSeconds = 5.5 * 3600;
+        const candles = {candles_json};
+        const activeTrades = {active_json};
+        const vault = {vault_json};
+        const offset = 5.5 * 3600;
 
-        function align15m(ts) {{ return Math.floor(ts / 900) * 900; }}
-
-        let candleMap = new Map();
-        rawCandles.forEach(c => {{
-            const aligned = align15m(c.time) + localOffsetSeconds;
-            candleMap.set(aligned, {{
-                time: aligned, open: c.open, high: c.high, low: c.low, close: c.close, vol: c.vol || 100
-            }});
-        }});
-
-        let allCandles = Array.from(candleMap.values()).sort((a,b) => a.time - b.time);
-        let currentBar = allCandles.length > 0 ? {{ ...allCandles[allCandles.length - 1] }} : null;
-
-        // 1. MAIN CANDLESTICK CHART
-        const mainEl = document.getElementById('chart-main');
-        const mainChart = LightweightCharts.createChart(mainEl, {{
+        const el = document.getElementById('chart');
+        const chart = LightweightCharts.createChart(el, {{
             layout: {{ background: {{ type: 'solid', color: '#06080d' }}, textColor: '#787f8f', fontSize: 10 }},
-            grid: {{ vertLines: {{ color: 'rgba(255, 255, 255, 0.02)' }}, horzLines: {{ color: 'rgba(255, 255, 255, 0.02)' }} }},
-            rightPriceScale: {{ borderColor: '#161e2a', autoScale: true, scaleMargins: {{ top: 0.1, bottom: 0.1 }} }},
-            timeScale: {{ borderColor: '#161e2a', visible: false, barSpacing: 9, rightOffset: 5 }}
-        }});
-
-        const candleSeries = mainChart.addCandlestickSeries({{
-            upColor: '#089981', downColor: '#f23645',
-            borderUpColor: '#089981', borderDownColor: '#f23645',
-            wickUpColor: '#089981', wickDownColor: '#f23645'
-        }});
-        candleSeries.setData(allCandles);
-
-        // EMA Lines
-        const ema20Series = mainChart.addLineSeries({{ color: '#38bdf8', lineWidth: 1.5 }});
-        const ema50Series = mainChart.addLineSeries({{ color: '#eab308', lineWidth: 1.5 }});
-        const ema200Series = mainChart.addLineSeries({{ color: '#ef4444', lineWidth: 1.5 }});
-
-        function calcEmaArr(data, period) {{
-            let k = 2 / (period + 1), ema = data[0].close, res = [];
-            for (let i = 0; i < data.length; i++) {{
-                ema = (data[i].close * k) + (ema * (1 - k));
-                res.push({{ time: data[i].time, value: ema }});
-            }}
-            return res;
-        }}
-        if (allCandles.length > 200) {{
-            ema20Series.setData(calcEmaArr(allCandles, 20));
-            ema50Series.setData(calcEmaArr(allCandles, 50));
-            ema200Series.setData(calcEmaArr(allCandles, 200));
-        }}
-
-        // Dynamic Liquidity Levels
-        if (allCandles.length >= 20) {{
-            let h48 = Math.max(...allCandles.slice(-192).map(c => c.high));
-            let l48 = Math.min(...allCandles.slice(-192).map(c => c.low));
-            let h1 = Math.max(...allCandles.slice(-4).map(c => c.high));
-            let l1 = Math.min(...allCandles.slice(-4).map(c => c.low));
-
-            candleSeries.createPriceLine({{ price: h48, color: '#f23645', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true, title: '48H RESISTANCE' }});
-            candleSeries.createPriceLine({{ price: l48, color: '#089981', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true, title: '48H SUPPORT' }});
-
-            document.getElementById('side-48h').innerText = h48.toFixed(1);
-            document.getElementById('side-48l').innerText = l48.toFixed(1);
-            document.getElementById('side-1h').innerText = h1.toFixed(1);
-            document.getElementById('side-1l').innerText = l1.toFixed(1);
-            document.getElementById('mob-48h').innerText = h48.toFixed(1);
-            document.getElementById('mob-48l').innerText = l48.toFixed(1);
-            document.getElementById('mob-1h').innerText = h1.toFixed(1);
-            document.getElementById('mob-1l').innerText = l1.toFixed(1);
-        }}
-
-        // 2. RSI SUB-CHART
-        const rsiEl = document.getElementById('chart-rsi');
-        const rsiChart = LightweightCharts.createChart(rsiEl, {{
-            layout: {{ background: {{ type: 'solid', color: '#06080d' }}, textColor: '#787f8f', fontSize: 9 }},
-            grid: {{ vertLines: {{ color: 'rgba(255, 255, 255, 0.02)' }}, horzLines: {{ color: 'rgba(255, 255, 255, 0.02)' }} }},
-            rightPriceScale: {{ borderColor: '#161e2a', scaleMargins: {{ top: 0.1, bottom: 0.1 }} }},
-            timeScale: {{ borderColor: '#161e2a', visible: false, barSpacing: 9 }}
-        }});
-        const rsiSeries = rsiChart.addLineSeries({{ color: '#a855f7', lineWidth: 1.5 }});
-        rsiSeries.setData(allCandles.map((c, i) => ({{ time: c.time, value: 50 + 15 * Math.sin(i / 5) }})));
-
-        // 3. MACD SUB-CHART
-        const macdEl = document.getElementById('chart-macd');
-        const macdChart = LightweightCharts.createChart(macdEl, {{
-            layout: {{ background: {{ type: 'solid', color: '#06080d' }}, textColor: '#787f8f', fontSize: 9 }},
-            grid: {{ vertLines: {{ color: 'rgba(255, 255, 255, 0.02)' }}, horzLines: {{ color: 'rgba(255, 255, 255, 0.02)' }} }},
-            rightPriceScale: {{ borderColor: '#161e2a', scaleMargins: {{ top: 0.15, bottom: 0.15 }} }},
-            timeScale: {{ borderColor: '#161e2a', visible: false, barSpacing: 9 }}
-        }});
-        const macdLine = macdChart.addLineSeries({{ color: '#089981', lineWidth: 1.5 }});
-        const macdSig = macdChart.addLineSeries({{ color: '#f59e0b', lineWidth: 1.5 }});
-        macdLine.setData(allCandles.map((c, i) => ({{ time: c.time, value: 12 * Math.cos(i / 6) }})));
-        macdSig.setData(allCandles.map((c, i) => ({{ time: c.time, value: 9 * Math.cos((i-1) / 6) }})));
-
-        // 4. VOLUME SUB-CHART
-        const volEl = document.getElementById('chart-vol');
-        const volChart = LightweightCharts.createChart(volEl, {{
-            layout: {{ background: {{ type: 'solid', color: '#06080d' }}, textColor: '#787f8f', fontSize: 9 }},
-            grid: {{ vertLines: {{ color: 'rgba(255, 255, 255, 0.02)' }}, horzLines: {{ color: 'rgba(255, 255, 255, 0.02)' }} }},
+            grid: {{ vertLines: {{ color: 'rgba(255,255,255,0.02)' }}, horzLines: {{ color: 'rgba(255,255,255,0.02)' }} }},
             rightPriceScale: {{ borderColor: '#161e2a' }},
-            timeScale: {{ borderColor: '#161e2a', visible: true, timeVisible: true, secondsVisible: false, barSpacing: 9, rightOffset: 5 }}
-        }});
-        const volSeries = volChart.addHistogramSeries({{ color: '#26a69a', priceFormat: {{ type: 'volume' }} }});
-        volSeries.setData(allCandles.map(c => ({{
-            time: c.time, value: c.vol, color: c.close >= c.open ? 'rgba(8, 153, 129, 0.5)' : 'rgba(242, 54, 69, 0.5)'
-        }})));
-
-        // SYNC TIMESCALE
-        mainChart.timeScale().subscribeVisibleLogicalRangeChange(r => {{
-            rsiChart.timeScale().setVisibleLogicalRange(r);
-            macdChart.timeScale().setVisibleLogicalRange(r);
-            volChart.timeScale().setVisibleLogicalRange(r);
+            timeScale: {{ borderColor: '#161e2a', timeVisible: true, secondsVisible: false }}
         }});
 
-        window.addEventListener('resize', () => {{
-            const w = mainEl.clientWidth;
-            mainChart.applyOptions({{ width: w }});
-            rsiChart.applyOptions({{ width: w }});
-            macdChart.applyOptions({{ width: w }});
-            volChart.applyOptions({{ width: w }});
-        }});
-
-        // POPUP TOGGLES
-        function toggleMobileStats() {{
-            const drawer = document.getElementById('mobileDrawer');
-            drawer.style.display = drawer.style.display === 'flex' ? 'none' : 'flex';
+        const series = chart.addCandlestickSeries({{ upColor: '#089981', downColor: '#f23645' }});
+        if (candles && candles.length > 0) {{
+            series.setData(candles.map(c => ({{ ...c, time: c.time + offset }})));
         }}
 
-        function toggleVaultHistory() {{
-            const drawer = document.getElementById('vaultHistoryDrawer');
-            if (drawer.style.display === 'flex') {{
-                drawer.style.display = 'none';
-            }} else {{
-                drawer.style.display = 'flex';
-                renderVaultList();
-            }}
-        }}
-
-        function renderVaultList() {{
-            const container = document.getElementById('vaultListContainer');
-            if (!vaultTrades || vaultTrades.length === 0) {{
-                container.innerHTML = '<div style="font-size:10px; color:#64748b; text-align:center; padding:20px;">No trades executed yet. Scanner active...</div>';
-                return;
-            }}
-            let html = '';
-            vaultTrades.forEach(t => {{
-                html += `
-                    <div style="padding:6px 0; border-bottom:1px solid #161e2a; font-size:9.5px;">
-                        <div style="display:flex; justify-content:space-between; margin-bottom:2px;">
-                            <span>${{t.time}} <b style="color:#fbbf24">[${{t.tf}}]</b> <b style="color:${{t.dir === 'LONG' ? '#089981' : '#f43f5e'}}">${{t.dir}}</b> @ ${{t.entry.toFixed(1)}}</span>
-                            <span style="font-weight:bold; color:${{t.pnl >= 0 ? '#089981' : '#f43f5e'}}">${{t.res}} (${{t.pnl >= 0 ? '+' : ''}}${{t.pnl}}R)</span>
-                        </div>
-                        <div style="color:#64748b; font-size:8.5px;">Exit: $${{t.exit.toFixed(1)}} | Score: <b style="color:#38bdf8">${{t.score}}/105</b></div>
-                    </div>`;
+        if (activeTrades && activeTrades.length > 0) {{
+            let tags = [];
+            activeTrades.forEach(t => {{
+                tags.push(`[${{t.tf}}] ${{t.dir}} @ ${{t.entry.toFixed(0)}}`);
+                series.createPriceLine({{ price: t.entry, color: '#38bdf8', lineWidth: 1.5, title: 'ENTRY' }});
+                series.createPriceLine({{ price: t.sl, color: '#f43f5e', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Dashed, title: 'SL' }});
+                series.createPriceLine({{ price: t.tp3, color: '#10b981', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Dashed, title: 'TP3' }});
             }});
-            container.innerHTML = html;
+            document.getElementById('active-tag').innerText = "• ACTIVE: " + tags.join(" | ");
         }}
 
-        // REAL-TIME CLOCK
-        setInterval(() => {{
-            const now = new Date();
-            const istStr = now.toLocaleTimeString('en-GB', {{ timeZone: 'Asia/Kolkata' }}) + " (IST)";
-            const el = document.getElementById('live-ist-clock');
-            if (el) el.innerText = istStr;
-        }}, 1000);
-
-        // REAL-TIME BINANCE WEBSOCKET TICKS (Browser Native - No Python Dependencies)
-        const wsTrade = new WebSocket('wss://fstream.binance.com/ws/btcusdt@trade');
-        wsTrade.onmessage = (event) => {{
-            const t = JSON.parse(event.data);
-            const p = parseFloat(t.p);
-            if (p < 20000 || p > 300000) return;
-
-            const pStr = p.toLocaleString('en-US', {{ minimumFractionDigits: 1, maximumFractionDigits: 1 }});
-            if (document.getElementById('nav-price')) document.getElementById('nav-price').innerText = pStr;
-            if (document.getElementById('side-price')) document.getElementById('side-price').innerText = pStr;
-            if (document.getElementById('mob-price')) document.getElementById('mob-price').innerText = pStr;
-
-            if (currentBar) {{
-                if (p > currentBar.high) currentBar.high = p;
-                if (p < currentBar.low) currentBar.low = p;
-                currentBar.close = p;
-                candleSeries.update(currentBar);
+        function toggleVault() {{
+            const m = document.getElementById('vaultModal');
+            m.style.display = m.style.display === 'flex' ? 'none' : 'flex';
+            if (m.style.display === 'flex') {{
+                let h = '';
+                vault.forEach(v => {{
+                    h += `<div style="padding:6px 0; border-bottom:1px solid #161e2a;">
+                        <div style="display:flex; justify-content:space-between;">
+                            <b>[${{v.tf}}] ${{v.dir}}</b> @ ${{v.entry.toFixed(1)}}
+                            <span style="color:${{v.pnl >= 0 ? '#089981' : '#f43f5e'}}; font-weight:bold;">${{v.res}} (${{v.pnl >= 0 ? '+' : ''}}${{v.pnl}}R)</span>
+                        </div>
+                        <div style="color:#64748b; font-size:8.5px;">Setup: ${{v.setup}} | Status: <b>${{v.status}}</b></div>
+                    </div>`;
+                }});
+                document.getElementById('vaultContent').innerHTML = h || 'No trades recorded yet.';
             }}
-        }};
+        }}
 
-        const wsKline = new WebSocket('wss://fstream.binance.com/ws/btcusdt@kline_15m');
-        wsKline.onmessage = (event) => {{
-            const res = JSON.parse(event.data);
-            const k = res.k;
-            const aligned = align15m(Math.floor(k.t / 1000)) + localOffsetSeconds;
-            currentBar = {{
-                time: aligned,
-                open: parseFloat(k.o), high: parseFloat(k.h),
-                low: parseFloat(k.l), close: parseFloat(k.c),
-                vol: parseFloat(k.v)
-            }};
-            candleSeries.update(currentBar);
-        }};
+        window.addEventListener('resize', () => chart.applyOptions({{ width: el.clientWidth, height: el.clientHeight }}));
     </script>
 </body>
 </html>
