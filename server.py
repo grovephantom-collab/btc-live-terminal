@@ -5,7 +5,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 # ============================================================
-# BTCUSDT SMC PRO DASHBOARD (API DIRECT BINDING)
+# BTCUSDT SMC PRO DASHBOARD (FIXED LIVE TICK CANDLE ENGINE)
 # ============================================================
 
 st.set_page_config(
@@ -28,17 +28,8 @@ def get_render_sync():
         pass
     return [], []
 
-def get_engine_heartbeat():
-    try:
-        r = requests.get(f"{RENDER_URL}/status", timeout=2.5)
-        if r.status_code == 200:
-            return r.json()
-    except Exception:
-        pass
-    return {"status": "offline", "last_scan": "Disconnected"}
-
-# --- 2. MULTI-ENDPOINT CANDLE FALLBACK ---
-def fetch_initial_candles(interval="15m", limit=250):
+# --- 2. FETCH BINANCE CANDLES ---
+def fetch_initial_candles(interval="15m", limit=200):
     urls = [
         f"https://fapi.binance.com/fapi/v1/klines?symbol={SYMBOL}&interval={interval}&limit={limit}",
         f"https://data-api.binance.vision/api/v3/klines?symbol={SYMBOL}&interval={interval}&limit={limit}",
@@ -48,18 +39,19 @@ def fetch_initial_candles(interval="15m", limit=250):
         try:
             r = requests.get(u, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3).json()
             if isinstance(r, list) and len(r) > 20:
+                # Include all candles including current one
                 return [{
                     "time": int(b[0] // 1000),
-                    "open": float(b[1]), "high": float(b[2]),
-                    "low": float(b[3]), "close": float(b[4]),
-                    "vol": float(b[5])
-                } for b in r[:-1]]
+                    "open": float(b[1]),
+                    "high": float(b[2]),
+                    "low": float(b[3]),
+                    "close": float(b[4])
+                } for b in r]
         except Exception:
             continue
     return []
 
 vault_list, active_list = get_render_sync()
-heartbeat = get_engine_heartbeat()
 
 total_trades = len(vault_list)
 wins = sum(1 for r in vault_list if r.get("pnl", 0.0) > 0)
@@ -68,7 +60,7 @@ net_r = sum(r.get("pnl", 0.0) for r in vault_list) if total_trades > 0 else 0.0
 
 vault_json = json.dumps(vault_list)
 active_json = json.dumps(active_list)
-candles = fetch_initial_candles("15m", 250)
+candles = fetch_initial_candles("15m", 200)
 candles_json = json.dumps(candles)
 
 # --- 3. CSS FULLSCREEN SETUP ---
@@ -81,7 +73,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# --- 4. TRADINGVIEW LIGHTWEIGHT CHARTS HTML ---
+# --- 4. TRADINGVIEW LIGHTWEIGHT CHARTS WITH REAL-TIME TICK SYNC ---
 ui_html = f"""
 <!DOCTYPE html>
 <html>
@@ -103,7 +95,7 @@ ui_html = f"""
     <div class="nav">
         <div style="display:flex; align-items:center; gap:6px;">
             <b style="color:#f59e0b;">BTCUSDT</b>
-            <span style="background:rgba(8,153,129,0.2); color:#089981; font-size:8px; padding:1px 4px; border-radius:2px; font-weight:bold;">● LIVE</span>
+            <span style="background:rgba(8,153,129,0.2); color:#089981; font-size:8px; padding:1px 4px; border-radius:2px; font-weight:bold;">● LIVE 15M</span>
             <span id="active-tag" style="color:#38bdf8; font-size:9.5px; font-weight:600;">SCANNING</span>
         </div>
         <div style="display:flex; align-items:center; gap:8px;">
@@ -128,7 +120,6 @@ ui_html = f"""
         const initialCandles = {candles_json};
         const activeTrades = {active_json};
         const vault = {vault_json};
-        const offset = 5.5 * 3600;
 
         const el = document.getElementById('chart-wrap');
         const chart = LightweightCharts.createChart(el, {{
@@ -144,11 +135,14 @@ ui_html = f"""
             wickUpColor: '#089981', wickDownColor: '#f23645'
         }});
 
+        let currentBar = null;
+
         if (initialCandles && initialCandles.length > 0) {{
-            series.setData(initialCandles.map(c => ({{ ...c, time: c.time + offset }})));
+            series.setData(initialCandles);
+            currentBar = {{ ...initialCandles[initialCandles.length - 1] }};
         }}
 
-        // Visual Levels for Active Trades
+        // Render Active Trade Levels
         if (activeTrades && activeTrades.length > 0) {{
             let tags = [];
             activeTrades.forEach(t => {{
@@ -160,28 +154,51 @@ ui_html = f"""
             document.getElementById('active-tag').innerText = "• ACTIVE: " + tags.join(" | ");
         }}
 
-        // Direct WebSocket to Binance
-        const wsTrade = new WebSocket('wss://fstream.binance.com/ws/btcusdt@trade');
-        wsTrade.onmessage = (event) => {{
-            const t = JSON.parse(event.data);
-            const p = parseFloat(t.p);
-            if (p > 10000) {{
-                document.getElementById('price-txt').innerText = '$' + p.toLocaleString('en-US', {{ minimumFractionDigits: 1, maximumFractionDigits: 1 }});
+        // LIVE DIRECT BINANCE 15M KLINE WEBSOCKET
+        const wsKline = new WebSocket('wss://fstream.binance.com/ws/btcusdt@kline_15m');
+        wsKline.onmessage = (event) => {{
+            try {{
+                const data = JSON.parse(event.data);
+                const k = data.k;
+                const candleTime = Math.floor(k.t / 1000);
+                const open = parseFloat(k.o);
+                const high = parseFloat(k.h);
+                const low = parseFloat(k.l);
+                const close = parseFloat(k.c);
+
+                currentBar = {{
+                    time: candleTime,
+                    open: open,
+                    high: high,
+                    low: low,
+                    close: close
+                }};
+
+                // Real-time update to candlestick
+                series.update(currentBar);
+
+                // Update navbar price instantly
+                const priceEl = document.getElementById('price-txt');
+                priceEl.innerText = '$' + close.toLocaleString('en-US', {{ minimumFractionDigits: 1, maximumFractionDigits: 1 }});
+                priceEl.style.color = close >= open ? '#089981' : '#f23645';
+            }} catch(err) {{
+                console.error(err);
             }}
         }};
 
-        const wsKline = new WebSocket('wss://fstream.binance.com/ws/btcusdt@kline_15m');
-        wsKline.onmessage = (event) => {{
-            const res = JSON.parse(event.data);
-            const k = res.k;
-            const alignedTime = Math.floor(k.t / 1000) + offset;
-            series.update({{
-                time: alignedTime,
-                open: parseFloat(k.o),
-                high: parseFloat(k.h),
-                low: parseFloat(k.l),
-                close: parseFloat(k.c)
-            }});
+        // Fallback Trade Ticker for sub-second micro ticks
+        const wsTrade = new WebSocket('wss://fstream.binance.com/ws/btcusdt@trade');
+        wsTrade.onmessage = (event) => {{
+            try {{
+                const t = JSON.parse(event.data);
+                const p = parseFloat(t.p);
+                if (currentBar && p > 10000) {{
+                    currentBar.close = p;
+                    if (p > currentBar.high) currentBar.high = p;
+                    if (p < currentBar.low) currentBar.low = p;
+                    series.update(currentBar);
+                }}
+            }} catch(err) {{}}
         }};
 
         function toggleVault() {{
