@@ -1,322 +1,281 @@
 import os
+import json
 import time
-import math
-import sqlite3
-import logging
-import traceback
-import threading
-from datetime import datetime, timezone
 import requests
+import streamlit as st
+import streamlit.components.v1 as components
 
-# ============================================================
-# BTCUSDT SMC SNIPER ENGINE (IDM + EQ SWEEP INTEGRATED)
-# ============================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [SNIPER-EXEC] %(message)s"
+st.set_page_config(
+    page_title="BTCUSDT SMC PRO",
+    layout="wide",
+    initial_sidebar_state="collapsed"
 )
 
 SYMBOL = "BTCUSDT"
-DB_FILE = os.getenv("DB_FILE", "trades_v5.db")
-WORKER_API = "http://127.0.0.1:10000"
-BASE = "https://fapi.binance.com"
+RENDER_URL = "https://btc-live-terminal-2.onrender.com"
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8941403990:AAGLH_dupqmGoipglhVvRuiPBzvgMqJR3Ms")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7886716805")
-
-SNIPER_MIN_SCORE = 85
-LOCK = threading.RLock()
-
-def send_telegram(text):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
+# 1. Fetch from Render
+def get_render_sync():
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
-            timeout=5,
-        )
-    except Exception as e:
-        logging.error(f"Telegram error: {e}")
-
-def db():
-    c = sqlite3.connect(DB_FILE, timeout=15)
-    c.execute("PRAGMA journal_mode=WAL")
-    return c
-
-def db_upsert_sniper(t, status="OPEN", exit_p=0.0, res="RUNNING", final_pnl=0.0):
-    try:
-        c = db()
-        c.execute("""INSERT OR REPLACE INTO trades 
-                     (trade_id, created_at, signal_type, tf, direction, setup, score, entry, sl, tp1, tp2, tp3, exit, result, pnl_r, realized_r, remaining_pct, stage, confluence, status)
-                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                  (t["id"], t["created"], "SNIPER", "1M/5M", t["dir"], t["setup"], t["score"],
-                   t["entry"], t["sl"], t["tp1"], t["tp2"], t["tp3"], exit_p, res, final_pnl,
-                   t.get("realized_r", 0.0), t.get("remaining_pct", 1.0), t.get("stage", "OPEN"),
-                   ", ".join(t.get("reasons", [])), status))
-        c.commit(); c.close()
-    except Exception as e:
-        logging.error(f"DB Error: {e}")
-
-def fetch_klines(interval="1m", limit=120):
-    try:
-        res = requests.get(f"{BASE}/fapi/v1/klines", params={"symbol": SYMBOL, "interval": interval, "limit": limit}, timeout=4).json()
-        if isinstance(res, list) and len(res) > 20:
-            return [{
-                "time": int(b[0] // 1000), "open": float(b[1]), "high": float(b[2]),
-                "low": float(b[3]), "close": float(b[4]), "vol": float(b[5])
-            } for b in res[:-1]]
+        r = requests.get(f"{RENDER_URL}/vault-data", timeout=3)
+        if r.status_code == 200:
+            d = r.json()
+            return d.get("vault", []), d.get("active", [])
     except Exception:
         pass
-    return []
+    return [], []
 
-def calculate_atr(candles, period=14):
-    if len(candles) < period + 1: return 40.0
-    trs = [max(candles[i]["high"] - candles[i]["low"],
-               abs(candles[i]["high"] - candles[i-1]["close"]),
-               abs(candles[i]["low"] - candles[i-1]["close"])) for i in range(1, len(candles))]
-    return max(sum(trs[-period:]) / period, 1.0)
-
-# GATE: Inducement Check on 1M
-def check_1m_inducement(c1m, direction):
-    if len(c1m) < 10: return False
-    cur = c1m[-1]
-    swings = [c["low"] if direction == "LONG" else c["high"] for c in c1m[-6:-1]]
-    if not swings: return False
-    target = min(swings) if direction == "LONG" else max(swings)
-    if direction == "LONG":
-        return cur["low"] < target and cur["close"] > target
-    else:
-        return cur["high"] > target and cur["close"] < target
-
-def gate_5m_confirmation(c5m, direction):
-    if len(c5m) < 15: return False
-    cur5 = c5m[-1]
-    a5 = calculate_atr(c5m, 14)
-    disp5 = abs(cur5["close"] - cur5["open"]) >= (0.85 * a5)
-    highs = [c["high"] for c in c5m[-12:-2]]
-    lows = [c["low"] for c in c5m[-12:-2]]
-    last_h = max(highs) if highs else cur5["high"]
-    last_l = min(lows) if lows else cur5["low"]
-    if direction == "LONG": return cur5["close"] > last_h and disp5
-    elif direction == "SHORT": return cur5["close"] < last_l and disp5
-    return False
-
-def gate_1m_sweep(c1m, direction, lookback=8):
-    if len(c1m) < lookback + 2: return None
-    ref = c1m[-lookback-1:-1]
-    cur = c1m[-1]
-    hi = max(c["high"] for c in ref)
-    lo = min(c["low"] for c in ref)
-    if direction == "LONG" and cur["low"] < lo and cur["close"] > lo:
-        return {"swept": True, "wick": cur["low"], "level": lo}
-    if direction == "SHORT" and cur["high"] > hi and cur["close"] < hi:
-        return {"swept": True, "wick": cur["high"], "level": hi}
-    return None
-
-def gate_1m_displacement(c1m, direction):
-    if len(c1m) < 15: return False
-    cur = c1m[-1]
-    a1 = calculate_atr(c1m, 14)
-    body = abs(cur["close"] - cur["open"])
-    is_displaced = body >= (1.2 * a1)
-    if direction == "LONG": return is_displaced and (cur["close"] > cur["open"])
-    elif direction == "SHORT": return is_displaced and (cur["close"] < cur["open"])
-    return False
-
-def gate_1m_fvg_and_ce_retest(c1m, direction, current_price):
-    if len(c1m) < 4: return None
-    c1, c2, c3 = c1m[-4], c1m[-3], c1m[-2]
-    cur = c1m[-1]
-    if direction == "LONG":
-        if c3["low"] > c1["high"] and (c3["low"] - c1["high"]) >= 8.0:
-            ce = c1["high"] + ((c3["low"] - c1["high"]) * 0.5)
-            if c3["close"] > c3["low"] and ((cur["low"] <= ce <= cur["high"]) or abs(current_price - ce) <= 8.0):
-                return {"ce": ce}
-    elif direction == "SHORT":
-        if c3["high"] < c1["low"] and (c1["low"] - c3["high"]) >= 8.0:
-            ce = c3["high"] + ((c1["low"] - c3["high"]) * 0.5)
-            if c3["close"] < c3["high"] and ((cur["low"] <= ce <= cur["high"]) or abs(current_price - ce) <= 8.0):
-                return {"ce": ce}
-    return None
-
-class SniperTradeManager:
-    def __init__(self):
-        self.active_trade = None
-        self.last_trade_time = 0
-
-    def manage_positions(self, p):
-        with LOCK:
-            t = self.active_trade
-            if not t: return
-
-            risk = abs(t["entry"] - t["sl"]) if abs(t["entry"] - t["sl"]) > 0 else 1.0
-
-            if t["dir"] == "LONG":
-                if p >= t["tp1"] and t["stage"] == "OPEN":
-                    t["stage"] = "TP1_DONE"
-                    t["realized_r"] += 0.50 * 3.0  # +1.5R
-                    t["remaining_pct"] = 0.50
-                    t["sl"] = t["entry"]
-                    db_upsert_sniper(t, status="OPEN")
-                    send_telegram(f"🎯 <b>[SNIPER] TP1 (+3R) HIT</b>\n50% banked (+1.5R). 🛡 SL moved to <b>BE (${t['entry']:,.2f})</b>")
-
-                elif p >= t["tp2"] and t["stage"] == "TP1_DONE":
-                    t["stage"] = "TP2_DONE"
-                    t["realized_r"] += 0.25 * 6.0  # +1.5R (Total +3.0R)
-                    t["remaining_pct"] = 0.25
-                    t["sl"] = t["tp1"]
-                    db_upsert_sniper(t, status="OPEN")
-                    send_telegram(f"🎯 <b>[SNIPER] TP2 (+6R) HIT</b>\n25% banked (+3.0R Total). 🛡 SL trailed to <b>TP1 (${t['tp1']:,.2f})</b>")
-
-                if p <= t["sl"]:
-                    if t["stage"] == "OPEN": final_r = -1.0; res = "SL HIT"
-                    elif t["stage"] == "TP1_DONE": final_r = t["realized_r"]; res = "BE EXIT"
-                    else: final_r = t["realized_r"] + (t["remaining_pct"] * 3.0); res = "TP1 TRAIL EXIT"
-                    db_upsert_sniper(t, status="CLOSED", exit_p=p, res=res, final_pnl=round(final_r, 3))
-                    send_telegram(f"🏁 <b>[SNIPER CLOSED] {res}</b> @ ${p:,.2f} | Net: <b>{final_r:+.2f}R</b>")
-                    self.active_trade = None
-
-                elif p >= t["tp3"] and t["stage"] in ["OPEN", "TP1_DONE", "TP2_DONE"]:
-                    final_r = t["realized_r"] + (t["remaining_pct"] * 10.0)
-                    db_upsert_sniper(t, status="CLOSED", exit_p=p, res="TP3 10R TARGET 🔥", final_pnl=round(final_r, 3))
-                    send_telegram(f"🔥 <b>[SNIPER FULL 10R TARGET!]</b> @ ${p:,.2f} | Net: <b>+{final_r:.2f}R</b>")
-                    self.active_trade = None
-
-            elif t["dir"] == "SHORT":
-                if p <= t["tp1"] and t["stage"] == "OPEN":
-                    t["stage"] = "TP1_DONE"
-                    t["realized_r"] += 0.50 * 3.0
-                    t["remaining_pct"] = 0.50
-                    t["sl"] = t["entry"]
-                    db_upsert_sniper(t, status="OPEN")
-                    send_telegram(f"🎯 <b>[SNIPER] TP1 (+3R) HIT</b>\n50% banked (+1.5R). 🛡 SL moved to <b>BE (${t['entry']:,.2f})</b>")
-
-                elif p <= t["tp2"] and t["stage"] == "TP1_DONE":
-                    t["stage"] = "TP2_DONE"
-                    t["realized_r"] += 0.25 * 6.0
-                    t["remaining_pct"] = 0.25
-                    t["sl"] = t["tp1"]
-                    db_upsert_sniper(t, status="OPEN")
-                    send_telegram(f"🎯 <b>[SNIPER] TP2 (+6R) HIT</b>\n25% banked (+3.0R Total). 🛡 SL trailed to <b>TP1 (${t['tp1']:,.2f})</b>")
-
-                if p >= t["sl"]:
-                    if t["stage"] == "OPEN": final_r = -1.0; res = "SL HIT"
-                    elif t["stage"] == "TP1_DONE": final_r = t["realized_r"]; res = "BE EXIT"
-                    else: final_r = t["realized_r"] + (t["remaining_pct"] * 3.0); res = "TP1 TRAIL EXIT"
-                    db_upsert_sniper(t, status="CLOSED", exit_p=p, res=res, final_pnl=round(final_r, 3))
-                    send_telegram(f"🏁 <b>[SNIPER CLOSED] {res}</b> @ ${p:,.2f} | Net: <b>{final_r:+.2f}R</b>")
-                    self.active_trade = None
-
-                elif p <= t["tp3"] and t["stage"] in ["OPEN", "TP1_DONE", "TP2_DONE"]:
-                    final_r = t["realized_r"] + (t["remaining_pct"] * 10.0)
-                    db_upsert_sniper(t, status="CLOSED", exit_p=p, res="TP3 10R TARGET 🔥", final_pnl=round(final_r, 3))
-                    send_telegram(f"🔥 <b>[SNIPER FULL 10R TARGET!]</b> @ ${p:,.2f} | Net: <b>+{final_r:.2f}R</b>")
-                    self.active_trade = None
-
-    def scan_sniper_execution(self, poi_data, c5m, c1m, p):
-        with LOCK:
-            if self.active_trade is not None: return
-            now = time.time()
-            if now - self.last_trade_time < 300: return
-
-            direction = poi_data["dir"]
-            if not (poi_data["low"] <= p <= poi_data["high"]): return
-            if not gate_5m_confirmation(c5m, direction): return
-
-            sweep_1m = gate_1m_sweep(c1m, direction)
-            if not sweep_1m: return
-
-            idm_ok = check_1m_inducement(c1m, direction)
-            disp_1m = gate_1m_displacement(c1m, direction)
-            if not disp_1m: return
-
-            fvg_ce = gate_1m_fvg_and_ce_retest(c1m, direction, p)
-            if not fvg_ce: return
-
-            score = 90 if idm_ok else 85
-            entry = fvg_ce["ce"]
-            a1 = calculate_atr(c1m, 14)
-
-            if direction == "LONG":
-                inval = sweep_1m["wick"] - (0.2 * a1)
-                risk = entry - inval
-                if risk < 5.0 or risk > 120.0: return
-                sl = inval
-                tp1 = entry + (3.0 * risk)
-                tp2 = entry + (6.0 * risk)
-                tp3 = entry + (10.0 * risk)
-            else:
-                inval = sweep_1m["wick"] + (0.2 * a1)
-                risk = inval - entry
-                if risk < 5.0 or risk > 120.0: return
-                sl = inval
-                tp1 = entry - (3.0 * risk)
-                tp2 = entry - (6.0 * risk)
-                tp3 = entry - (10.0 * risk)
-
-            snp = {
-                "id": f"SNP_{int(now*1000)}",
-                "created": datetime.now(timezone.utc).strftime("%H:%M:%S"),
-                "dir": direction,
-                "setup": "HTF POI + 5M MSS + IDM Purge + 50% C.E.",
-                "score": score,
-                "entry": round(entry, 2),
-                "sl": round(sl, 2),
-                "tp1": round(tp1, 2),
-                "tp2": round(tp2, 2),
-                "tp3": round(tp3, 2),
-                "realized_r": 0.0,
-                "remaining_pct": 1.0,
-                "stage": "OPEN",
-                "reasons": ["HTF POI", "5M MSS", "1M Sweep", "IDM Purged", "50% C.E. Fill"]
-            }
-
-            self.active_trade = snp
-            self.last_trade_time = now
-            db_upsert_sniper(snp, status="OPEN")
-
-            send_telegram(
-                f"🎯 <b>[SNIPER ENTRY: IDM PURGED]</b>\n\n"
-                f"<b>Direction:</b> {direction}\n"
-                f"🔹 <b>Exact Entry (50% C.E.):</b> ${entry:,.2f}\n"
-                f"🛑 <b>Tight SL:</b> ${sl:,.2f} (Risk: ${risk:.1f})\n"
-                f"🎯 <b>TP1 (3R - 50%):</b> ${tp1:,.2f}\n"
-                f"🎯 <b>TP2 (6R - 25%):</b> ${tp2:,.2f}\n"
-                f"🔥 <b>TP3 (10R - 25%):</b> ${tp3:,.2f}\n\n"
-                f"📊 <b>Score:</b> {score}/100"
-            )
-
-def run_sniper_daemon():
-    time.sleep(3)
-    logging.info("🚀 Sniper Execution with Inducement Gate Online...")
-    manager = SniperTradeManager()
-
-    while True:
+# 2. Fetch Binance Candles with Robust Fallback
+def get_candles(interval="15m", limit=120):
+    urls = [
+        f"https://fapi.binance.com/fapi/v1/klines?symbol={SYMBOL}&interval={interval}&limit={limit}",
+        f"https://api.binance.com/api/v3/klines?symbol={SYMBOL}&interval={interval}&limit={limit}",
+        f"https://data-api.binance.vision/api/v3/klines?symbol={SYMBOL}&interval={interval}&limit={limit}"
+    ]
+    for u in urls:
         try:
-            p_res = requests.get(f"{BASE}/fapi/v1/ticker/price", params={"symbol": SYMBOL}, timeout=3).json()
-            p = float(p_res.get("price", 0.0))
+            r = requests.get(u, headers={"User-Agent": "Mozilla/5.0"}, timeout=3).json()
+            if isinstance(r, list) and len(r) > 10:
+                return [{
+                    "time": int(b[0] // 1000),
+                    "open": float(b[1]),
+                    "high": float(b[2]),
+                    "low": float(b[3]),
+                    "close": float(b[4])
+                } for b in r]
+        except Exception:
+            continue
 
-            if p > 10000:
-                manager.manage_positions(p)
-                poi_list = []
-                try:
-                    r = requests.get(f"{WORKER_API}/poi-zones", timeout=2)
-                    if r.status_code == 200: poi_list = r.json()
-                except Exception:
-                    pass
+    # Synthetic fallback if all APIs are unreachable
+    now = int(time.time())
+    base_p = 85000.0
+    return [{
+        "time": now - (i * 900),
+        "open": base_p,
+        "high": base_p + 100.0,
+        "low": base_p - 100.0,
+        "close": base_p
+    } for i in range(50, -1, -1)]
 
-                c5m = fetch_klines("5m", 30)
-                c1m = fetch_klines("1m", 60)
+vault_list, active_list = get_render_sync()
+candles = get_candles("15m", 120)
 
-                if poi_list and c5m and c1m:
-                    for poi in poi_list:
-                        manager.scan_sniper_execution(poi, c5m, c1m, p)
+total_trades = len(vault_list)
+net_r = sum(float(r.get("pnl", 0) or 0) for r in vault_list)
 
-            time.sleep(4)
-        except Exception as e:
-            logging.error(f"Sniper daemon error: {e}\n{traceback.format_exc()}")
-            time.sleep(4)
+vault_json = json.dumps(vault_list)
+active_json = json.dumps(active_list)
+candles_json = json.dumps(candles)
 
-if __name__ == "__main__":
-    run_sniper_daemon()
+# Clean CSS - No height clash
+st.markdown("""
+    <style>
+    header, footer, #MainMenu { display: none !important; }
+    .block-container { padding: 0 !important; margin: 0 !important; max-width: 100% !important; background: #06080d !important; }
+    .stApp { background: #06080d !important; }
+    iframe { width: 100% !important; height: 95vh !important; border: none !important; }
+    </style>
+""", unsafe_allow_html=True)
+
+HTML_PAYLOAD = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+* {{ margin:0; padding:0; box-sizing:border-box; font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
+html, body {{ width:100%; height:100%; background:#06080d; color:#c3c7d1; overflow:hidden; }}
+#layout {{ width:100%; height:100%; display:flex; flex-direction:column; position:absolute; top:0; left:0; }}
+.nav {{ height:44px; min-height:44px; background:#0c1017; border-bottom:1px solid #161e2a; display:flex; justify-content:space-between; align-items:center; padding:0 12px; font-size:11px; z-index:10; }}
+#chart-container {{ flex:1; width:100%; min-height:300px; position:relative; background:#06080d; }}
+.btn {{ background:#16202f; border:1px solid #233147; color:#38bdf8; padding:5px 10px; border-radius:4px; font-size:10px; cursor:pointer; font-weight:bold; }}
+.modal {{ display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.85); z-index:999; align-items:center; justify-content:center; padding:15px; }}
+.box {{ background:#0b0f16; border:1px solid #1c2636; border-radius:8px; width:100%; max-width:440px; padding:15px; max-height:80vh; overflow-y:auto; }}
+</style>
+</head>
+<body>
+
+<div id="layout">
+    <div class="nav">
+        <div style="display:flex; align-items:center; gap:6px;">
+            <b style="color:#f59e0b; font-size:12px;">BTCUSDT</b>
+            <span style="background:rgba(8,153,129,0.2); color:#089981; font-size:9px; padding:2px 4px; border-radius:3px; font-weight:bold;">● 15M LIVE</span>
+            <span id="active-tag" style="color:#38bdf8; font-size:9px; font-weight:600;">SCANNING</span>
+        </div>
+        <div style="display:flex; align-items:center; gap:8px;">
+            <span id="price-txt" style="color:#089981; font-weight:bold; font-size:12px;">CONNECTING...</span>
+            <button class="btn" onclick="toggleVault()">📜 VAULT (<span id="vault-count">{total_trades}</span>)</button>
+        </div>
+    </div>
+    <div id="chart-container"></div>
+</div>
+
+<div id="vaultModal" class="modal">
+    <div class="box">
+        <div style="display:flex; justify-content:space-between; margin-bottom:10px; border-bottom:1px solid #1c2636; padding-bottom:6px;">
+            <b style="color:#f8fafc; font-size:11px;">VAULT HISTORY ({total_trades} TRADES | NET: {net_r:+.1f}R)</b>
+            <span style="cursor:pointer; color:#94a3b8; font-size:14px; font-weight:bold;" onclick="toggleVault()">✕</span>
+        </div>
+        <div id="vaultContent" style="font-size:10px;"></div>
+    </div>
+</div>
+
+<script>
+let initialCandles = {candles_json};
+let activeTrades = {active_json};
+let vault = {vault_json};
+
+const container = document.getElementById("chart-container");
+const chart = LightweightCharts.createChart(container, {{
+    width: container.clientWidth || window.innerWidth,
+    height: container.clientHeight || (window.innerHeight - 44),
+    layout: {{ background: {{ type: "solid", color: "#06080d" }}, textColor: "#787f8f", fontSize: 10 }},
+    grid: {{ vertLines: {{ color: "rgba(255,255,255,0.02)" }}, horzLines: {{ color: "rgba(255,255,255,0.02)" }} }},
+    rightPriceScale: {{ borderColor: "#161e2a", autoScale: true }},
+    timeScale: {{ borderColor: "#161e2a", timeVisible: true, secondsVisible: false, barSpacing: 8 }}
+}});
+
+const series = chart.addCandlestickSeries({{
+    upColor: "#089981", downColor: "#f23645",
+    borderUpColor: "#089981", borderDownColor: "#f23645",
+    wickUpColor: "#089981", wickDownColor: "#f23645"
+}});
+
+let currentBar = null;
+let priceLines = [];
+
+if (initialCandles && initialCandles.length > 0) {{
+    series.setData(initialCandles);
+    currentBar = {{ ...initialCandles[initialCandles.length - 1] }};
+    const pEl = document.getElementById("price-txt");
+    pEl.innerText = "$" + currentBar.close.toLocaleString("en-US", {{ minimumFractionDigits: 1, maximumFractionDigits: 1 }});
+}}
+
+function renderActiveTrades() {{
+    priceLines.forEach(l => {{ try {{ series.removePriceLine(l); }} catch(e){{}} }});
+    priceLines = [];
+    let tags = [];
+
+    if (activeTrades && activeTrades.length > 0) {{
+        activeTrades.forEach(t => {{
+            const entry = Number(t.entry), sl = Number(t.sl), tp3 = Number(t.tp3);
+            if (!Number.isFinite(entry)) return;
+            tags.push("[" + (t.tf || "15M") + "] " + (t.dir || "") + " @ $" + entry.toFixed(0));
+            priceLines.push(series.createPriceLine({{ price: entry, color: "#38bdf8", lineWidth: 2, title: "ENTRY" }}));
+            if (Number.isFinite(sl)) priceLines.push(series.createPriceLine({{ price: sl, color: "#f43f5e", lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, title: "SL" }}));
+            if (Number.isFinite(tp3)) priceLines.push(series.createPriceLine({{ price: tp3, color: "#10b981", lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, title: "TP3" }}));
+        }});
+    }}
+
+    const tag = document.getElementById("active-tag");
+    tag.innerText = tags.length > 0 ? "• ACTIVE: " + tags.join(" | ") : "SCANNING";
+    tag.style.color = tags.length > 0 ? "#38bdf8" : "#64748b";
+}}
+renderActiveTrades();
+
+// Direct Kline WebSocket
+let wsKline = null;
+function initKlineWS() {{
+    wsKline = new WebSocket("wss://fstream.binance.com/ws/btcusdt@kline_15m");
+    wsKline.onmessage = (e) => {{
+        try {{
+            const k = JSON.parse(e.data).k;
+            currentBar = {{
+                time: Math.floor(k.t / 1000),
+                open: parseFloat(k.o),
+                high: parseFloat(k.h),
+                low: parseFloat(k.l),
+                close: parseFloat(k.c)
+            }};
+            series.update(currentBar);
+            const pEl = document.getElementById("price-txt");
+            pEl.innerText = "$" + currentBar.close.toLocaleString("en-US", {{ minimumFractionDigits: 1, maximumFractionDigits: 1 }});
+            pEl.style.color = currentBar.close >= currentBar.open ? "#089981" : "#f23645";
+        }} catch(err){{}}
+    }};
+    wsKline.onclose = () => {{ setTimeout(initKlineWS, 3000); }};
+}}
+initKlineWS();
+
+// Micro Tick WebSocket
+let wsTrade = null;
+function initTradeWS() {{
+    wsTrade = new WebSocket("wss://fstream.binance.com/ws/btcusdt@trade");
+    wsTrade.onmessage = (e) => {{
+        try {{
+            const p = parseFloat(JSON.parse(e.data).p);
+            if (currentBar && p > 10000) {{
+                currentBar.close = p;
+                if (p > currentBar.high) currentBar.high = p;
+                if (p < currentBar.low) currentBar.low = p;
+                series.update(currentBar);
+                const pEl = document.getElementById("price-txt");
+                pEl.innerText = "$" + p.toLocaleString("en-US", {{ minimumFractionDigits: 1, maximumFractionDigits: 1 }});
+                pEl.style.color = p >= currentBar.open ? "#089981" : "#f23645";
+            }}
+        }} catch(err){{}}
+    }};
+    wsTrade.onclose = () => {{ setTimeout(initTradeWS, 3000); }};
+}}
+initTradeWS();
+
+function renderVault() {{
+    let h = "";
+    if (vault && vault.length > 0) {{
+        vault.forEach(v => {{
+            const pnl = Number(v.pnl || 0);
+            h += `<div style="padding:7px 0; border-bottom:1px solid #161e2a;">
+                <div style="display:flex; justify-content:space-between;">
+                    <b>[${{v.tf || '15M'}}] ${{v.dir || ''}}</b> @ ${{Number(v.entry || 0).toFixed(1)}}
+                    <span style="color:${{pnl >= 0 ? '#089981' : '#f43f5e'}}; font-weight:bold;">${{v.res || v.status || ''}} (${{pnl >= 0 ? '+' : ''}}${{pnl}}R)</span>
+                </div>
+                <div style="color:#64748b; font-size:9px; margin-top:2px;">Setup: ${{v.setup || 'SMC'}}</div>
+            </div>`;
+        }});
+    }} else {{
+        h = '<div style="color:#64748b; padding:10px 0; text-align:center;">No completed trades yet.</div>';
+    }}
+    document.getElementById("vaultContent").innerHTML = h;
+}}
+
+function toggleVault() {{
+    const m = document.getElementById("vaultModal");
+    m.style.display = m.style.display === "flex" ? "none" : "flex";
+    if (m.style.display === "flex") renderVault();
+}}
+
+async function syncRender() {{
+    try {{
+        const res = await fetch("https://btc-live-terminal-2.onrender.com/vault-data", {{ cache: "no-store" }});
+        if (res.ok) {{
+            const data = await res.json();
+            if (data.vault) {{
+                vault = data.vault;
+                document.getElementById("vault-count").innerText = vault.length;
+            }}
+            if (data.active) {{
+                activeTrades = data.active;
+                renderActiveTrades();
+            }}
+        }}
+    }} catch(e){{}}
+}}
+setInterval(syncRender, 4000);
+
+function handleResize() {{
+    const w = container.clientWidth || window.innerWidth;
+    const h = container.clientHeight || (window.innerHeight - 44);
+    if (w > 0 && h > 0) {{
+        chart.applyOptions({{ width: w, height: h }});
+    }}
+}}
+window.addEventListener("resize", handleResize);
+setTimeout(handleResize, 150);
+setTimeout(handleResize, 600);
+</script>
+</body>
+</html>
+"""
+
+components.html(HTML_PAYLOAD, height=920, scrolling=False)
