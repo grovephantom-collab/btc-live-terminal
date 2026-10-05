@@ -10,7 +10,7 @@ import requests
 from flask import Flask, jsonify
 
 # ============================================================
-# BTCUSDT SMC PRODUCTION WORKER + REST API ENGINE (RENDER)
+# BTCUSDT SMC PRODUCTION V2 WORKER ENGINE (WITH INTEGRATED TELEGRAM)
 # ============================================================
 
 logging.basicConfig(
@@ -22,18 +22,19 @@ app = Flask(__name__)
 
 SYMBOL = "BTCUSDT"
 DB_FILE = os.getenv("DB_FILE", "trades_v5.db")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8941403990:AAGLH_dupqmGoipglhVvRuiPBzvgMqJR3Ms")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7886716805")
+
+# Directly mapped credentials
+TELEGRAM_TOKEN = "8941403990:AAGLH_dupqmGoipglhVvRuiPBzvgMqJR3Ms"
+TELEGRAM_CHAT_ID = "7886716805"
 
 NORMAL_MIN = 70
 NORMAL_MAX = 84
 EVENT_MIN = 85
-EVENT_COOLDOWN = 12 * 60 * 60
+EVENT_COOLDOWN = 12 * 60 * 60  # 12 Hours
 BASE = "https://fapi.binance.com"
 
 LOCK = threading.RLock()
 
-# Runtime Engine State accessible by Flask API
 ENGINE_STATUS = {
     "boot_time": datetime.now(timezone.utc).isoformat(),
     "last_scan_time": None,
@@ -49,7 +50,7 @@ GLOBAL_ACTIVE = {
     "EVENT": None
 }
 
-# ---------------- 1. DATABASE ----------------
+# ---------------- 1. PERSISTENT DATABASE ----------------
 def db():
     c = sqlite3.connect(DB_FILE, timeout=15)
     c.execute("PRAGMA journal_mode=WAL")
@@ -61,19 +62,21 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         trade_id TEXT UNIQUE, created_at TEXT, signal_type TEXT, tf TEXT, direction TEXT,
         setup TEXT, score INTEGER, entry REAL, sl REAL, tp1 REAL, tp2 REAL, tp3 REAL,
-        exit REAL, result TEXT, pnl_r REAL, confluence TEXT, status TEXT)""")
+        exit REAL, result TEXT, pnl_r REAL, realized_r REAL, remaining_pct REAL, stage TEXT,
+        confluence TEXT, status TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS event_locks(
         event_key TEXT PRIMARY KEY, created_at TEXT, direction TEXT,
         score INTEGER, status TEXT)""")
-    c.commit(); c.close()
+    c.commit()
+    c.close()
 
 init_db()
 
-# ---------------- 2. FLASK API ROUTES (PROPER DICT FORMAT) ----------------
+# ---------------- 2. FLASK API ENDPOINTS ----------------
 @app.route("/")
 @app.route("/healthz")
 def health():
-    return "BTCUSDT SMC Master Engine Running 24/7", 200
+    return "BTCUSDT SMC Master V2 Engine Running 24/7", 200
 
 @app.route("/status")
 def api_status():
@@ -101,7 +104,8 @@ def api_active():
                     "tp2": float(t["tp2"]),
                     "tp3": float(t["tp3"]),
                     "setup": t["setup"],
-                    "score": int(t["score"])
+                    "score": int(t["score"]),
+                    "stage": t.get("stage", "OPEN")
                 })
         return jsonify(active_list), 200
 
@@ -132,7 +136,6 @@ def api_vault_data():
                 "status": r["status"]
             })
 
-        # Structured active trades
         with LOCK:
             active_list = []
             for k, t in GLOBAL_ACTIVE.items():
@@ -147,7 +150,8 @@ def api_vault_data():
                         "tp2": float(t["tp2"]),
                         "tp3": float(t["tp3"]),
                         "setup": t["setup"],
-                        "score": int(t["score"])
+                        "score": int(t["score"]),
+                        "stage": t.get("stage", "OPEN")
                     })
 
         return jsonify({
@@ -158,7 +162,7 @@ def api_vault_data():
         logging.error(f"Error in /vault-data: {e}")
         return jsonify({"vault": [], "active": []}), 500
 
-# ---------------- 3. TELEGRAM ----------------
+# ---------------- 3. TELEGRAM CLIENT ----------------
 def send_telegram(text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -171,15 +175,18 @@ def send_telegram(text):
     except Exception as e:
         logging.error(f"Telegram dispatch failed: {e}")
 
-def db_upsert_trade(t, status="OPEN", exit_p=0.0, res="RUNNING", pnl=0.0):
+def db_upsert_trade(t, status="OPEN", exit_p=0.0, res="RUNNING", final_pnl=0.0):
     try:
         c = db()
         c.execute("""INSERT OR REPLACE INTO trades 
-                     (trade_id, created_at, signal_type, tf, direction, setup, score, entry, sl, tp1, tp2, tp3, exit, result, pnl_r, confluence, status)
-                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                     (trade_id, created_at, signal_type, tf, direction, setup, score, entry, sl, tp1, tp2, tp3, exit, result, pnl_r, realized_r, remaining_pct, stage, confluence, status)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                   (t["id"], t["created"], t["type"], t["tf"], t["dir"], t["setup"], t["score"],
-                   t["entry"], t["sl"], t["tp1"], t["tp2"], t["tp3"], exit_p, res, pnl, ", ".join(t.get("reasons", [])), status))
-        c.commit(); c.close()
+                   t["entry"], t["sl"], t["tp1"], t["tp2"], t["tp3"], exit_p, res, final_pnl,
+                   t.get("realized_r", 0.0), t.get("remaining_pct", 1.0), t.get("stage", "OPEN"),
+                   ", ".join(t.get("reasons", [])), status))
+        c.commit()
+        c.close()
     except Exception as e:
         logging.error(f"DB Upsert Error: {e}")
 
@@ -254,17 +261,36 @@ def volume_ratio(candles, period=20):
     avg = sum(x["vol"] for x in candles[-period - 1:-1]) / period
     return (candles[-1]["vol"] / avg) if avg > 0 else 1.0
 
-def volume_profile_poc(candles, lookback=60, bin_size=25.0):
+def volume_profile_spectrum(candles, lookback=60, bin_size=25.0):
     recent = candles[-lookback:] if len(candles) >= lookback else candles
     bins = {}
+    tot_vol = 0.0
     for c in recent:
         lo = math.floor(c["low"] / bin_size) * bin_size
         hi = math.ceil(c["high"] / bin_size) * bin_size
         steps = max(1, int(round((hi - lo) / bin_size)))
         share = c["vol"] / steps
         for k in range(steps):
-            bins[lo + k * bin_size] = bins.get(lo + k * bin_size, 0.0) + share
-    return max(bins, key=bins.get) if bins else recent[-1]["close"]
+            price_lvl = lo + k * bin_size
+            bins[price_lvl] = bins.get(price_lvl, 0.0) + share
+            tot_vol += share
+    if not bins:
+        return {"poc": recent[-1]["close"], "vah": recent[-1]["close"], "val": recent[-1]["close"]}
+
+    poc = max(bins, key=bins.get)
+    sorted_levels = sorted(bins.keys())
+    target_vol = tot_vol * 0.70
+    accum = 0.0
+    val, vah = sorted_levels[0], sorted_levels[-1]
+
+    for lvl in sorted_levels:
+        accum += bins[lvl]
+        if accum >= (tot_vol * 0.15) and val == sorted_levels[0]:
+            val = lvl
+        if accum >= target_vol:
+            vah = lvl
+            break
+    return {"poc": poc, "vah": vah, "val": val}
 
 def channel_break(candles, lookback=30):
     if len(candles) < lookback + 5: return None
@@ -313,22 +339,29 @@ def smc_structure(candles):
     highs, lows = confirmed_swings(candles)
     if not highs or not lows:
         return {"bias": "NEUTRAL", "bos": None, "choch": None, "last_high": None, "last_low": None}
-    last_h = highs[-1][1]; last_l = lows[-1][1]
+    
+    last_h = highs[-1][1]
+    last_l = lows[-1][1]
     close = candles[-1]["close"]
+    
     bias = "NEUTRAL"
     if len(highs) >= 2 and len(lows) >= 2:
         if highs[-1][1] > highs[-2][1] and lows[-1][1] > lows[-2][1]: bias = "BULL"
         elif highs[-1][1] < highs[-2][1] and lows[-1][1] < lows[-2][1]: bias = "BEAR"
+
     bos, choch = None, None
     if bias == "BULL":
         if close > last_h: bos = "LONG"
-        if close < last_l: choch = "SHORT"
+        if len(lows) >= 2 and close < lows[-2][1]: choch = "SHORT"
+        elif close < last_l: choch = "SHORT"
     elif bias == "BEAR":
         if close < last_l: bos = "SHORT"
-        if close > last_h: choch = "LONG"
+        if len(highs) >= 2 and close > highs[-2][1]: choch = "LONG"
+        elif close > last_h: choch = "LONG"
     else:
         if close > last_h: bos = "LONG"
         elif close < last_l: bos = "SHORT"
+
     return {"bias": bias, "bos": bos, "choch": choch, "last_high": last_h, "last_low": last_l}
 
 def liquidity_sweep(candles, lookback=10):
@@ -350,7 +383,8 @@ def detect_institutional_fvg(candles):
     return None
 
 def evaluate_score(direction, d):
-    pts = 0; why = []
+    pts = 0
+    why = []
     if d.get("sweep") == direction: pts += 20; why.append("Liquidity Sweep (+20)")
     if d.get("htf_bias") == ("BULL" if direction == "LONG" else "BEAR"): pts += 15; why.append("HTF Bias Alignment (+15)")
     if d.get("structure") == direction: pts += 15; why.append("BOS / CHoCH Trigger (+15)")
@@ -362,7 +396,7 @@ def evaluate_score(direction, d):
     if d.get("rsi_ok"): pts += 7; why.append("RSI Momentum (+7)")
     return min(105, pts), why
 
-# ---------------- 6. ENGINE CONTROLLER (15M / 1H / 4H + EVENT) ----------------
+# ---------------- 6. ENGINE CONTROLLER ----------------
 class AutonomousEngine:
     def __init__(self):
         self.event_lock_until = 0
@@ -374,102 +408,177 @@ class AutonomousEngine:
             c = db()
             c.row_factory = sqlite3.Row
             rows = c.execute("SELECT * FROM trades WHERE status='OPEN'").fetchall()
+            locks = c.execute("SELECT created_at FROM event_locks WHERE status='ACTIVE' ORDER BY rowid DESC LIMIT 1").fetchone()
             c.close()
+
+            if locks:
+                self.event_lock_until = time.time() + EVENT_COOLDOWN
+
             with LOCK:
                 for r in rows:
                     t = {
                         "id": r["trade_id"], "created": r["created_at"], "type": r["signal_type"], "tf": r["tf"], "dir": r["direction"],
                         "setup": r["setup"], "score": r["score"], "entry": r["entry"], "sl": r["sl"],
                         "tp1": r["tp1"], "tp2": r["tp2"], "tp3": r["tp3"],
-                        "tp1_hit": False, "tp2_hit": False, "be": False, "runner_active": False, "reasons": []
+                        "realized_r": r["realized_r"] or 0.0,
+                        "remaining_pct": r["remaining_pct"] if r["remaining_pct"] is not None else 1.0,
+                        "stage": r["stage"] or "OPEN",
+                        "reasons": []
                     }
                     if t["type"] == "EVENT": GLOBAL_ACTIVE["EVENT"] = t
                     else: GLOBAL_ACTIVE[t["tf"]] = t
-            logging.info(f"State recovered: {len(rows)} active trades loaded.")
+            logging.info(f"State successfully recovered. Loaded {len(rows)} active trades.")
         except Exception as e:
             logging.error(f"State recovery error: {e}")
 
-    def manage_positions(self, p, s4):
+    def manage_positions(self, p, s4, a4):
         with LOCK:
             for tf in ["15M", "1H", "4H"]:
                 t = GLOBAL_ACTIVE[tf]
                 if not t: continue
+
                 if t["dir"] == "LONG":
-                    if p >= t["tp1"] and not t["tp1_hit"]:
-                        t["tp1_hit"] = True; t["sl"] = t["entry"]; t["be"] = True
+                    if p >= t["tp1"] and t["stage"] == "OPEN":
+                        t["stage"] = "TP1_DONE"
+                        t["realized_r"] += 0.333 * 1.0
+                        t["remaining_pct"] = 0.667
+                        t["sl"] = t["entry"]
                         db_upsert_trade(t, status="OPEN")
-                        send_telegram(f"🎯 <b>[{tf} NORMAL] TP1 HIT (+1R)</b>\n33% booked. SL locked to BE (${t['entry']:,.2f})")
-                    elif p >= t["tp2"] and not t["tp2_hit"]:
-                        t["tp2_hit"] = True; t["sl"] = t["tp1"]
+                        send_telegram(f"🎯 <b>[{tf} NORMAL] TP1 (+1R) REACHED</b>\n33.3% booked (+0.33R). 🛡 SL moved to <b>BE (${t['entry']:,.2f})</b>")
+
+                    elif p >= t["tp2"] and t["stage"] == "TP1_DONE":
+                        t["stage"] = "TP2_DONE"
+                        t["realized_r"] += 0.333 * 2.0
+                        t["remaining_pct"] = 0.334
+                        t["sl"] = t["tp1"]
                         db_upsert_trade(t, status="OPEN")
-                        send_telegram(f"🎯 <b>[{tf} NORMAL] TP2 HIT (+2R)</b>\n33% booked. SL trailed to TP1 (${t['tp1']:,.2f})")
+                        send_telegram(f"🎯 <b>[{tf} NORMAL] TP2 (+2R) REACHED</b>\nNext 33.3% booked (Total realized: +1.0R). 🛡 SL trailed to <b>TP1 (${t['tp1']:,.2f})</b>")
+
                     if p <= t["sl"]:
-                        res = "BE EXIT" if t["be"] else "SL HIT"
-                        pnl = 0.5 if t["tp1_hit"] else -1.0
-                        db_upsert_trade(t, status="CLOSED", exit_p=p, res=res, pnl=pnl)
-                        send_telegram(f"🏁 <b>[{tf} NORMAL] {res}</b> @ ${p:,.2f} ({pnl:+.1f}R)")
+                        if t["stage"] == "OPEN": final_r = -1.0; res = "SL HIT"
+                        elif t["stage"] == "TP1_DONE": final_r = t["realized_r"]; res = "BE EXIT"
+                        else: final_r = t["realized_r"] + (t["remaining_pct"] * 1.0); res = "TP1 TRAIL EXIT"
+                        db_upsert_trade(t, status="CLOSED", exit_p=p, res=res, final_pnl=round(final_r, 3))
+                        send_telegram(f"🏁 <b>[{tf} NORMAL] {res}</b> @ ${p:,.2f} | Net: <b>{final_r:+.2f}R</b>")
                         GLOBAL_ACTIVE[tf] = None
-                    elif p >= t["tp3"]:
-                        db_upsert_trade(t, status="CLOSED", exit_p=p, res="TP3 FULL TARGET 🔥", pnl=3.0)
-                        send_telegram(f"🔥 <b>[{tf} NORMAL] FULL TP3 REACHED!</b> @ ${p:,.2f} (+3.0R)")
+
+                    elif p >= t["tp3"] and t["stage"] in ["OPEN", "TP1_DONE", "TP2_DONE"]:
+                        final_r = 3.0
+                        db_upsert_trade(t, status="CLOSED", exit_p=p, res="TP3 FULL TARGET 🔥", final_pnl=final_r)
+                        send_telegram(f"🔥 <b>[{tf} NORMAL] FULL TP3 REACHED!</b> @ ${p:,.2f} (+3.0R Total)")
                         GLOBAL_ACTIVE[tf] = None
+
                 elif t["dir"] == "SHORT":
-                    if p <= t["tp1"] and not t["tp1_hit"]:
-                        t["tp1_hit"] = True; t["sl"] = t["entry"]; t["be"] = True
+                    if p <= t["tp1"] and t["stage"] == "OPEN":
+                        t["stage"] = "TP1_DONE"
+                        t["realized_r"] += 0.333 * 1.0
+                        t["remaining_pct"] = 0.667
+                        t["sl"] = t["entry"]
                         db_upsert_trade(t, status="OPEN")
-                        send_telegram(f"🎯 <b>[{tf} NORMAL] TP1 HIT (+1R)</b>\n33% booked. SL locked to BE (${t['entry']:,.2f})")
-                    elif p <= t["tp2"] and not t["tp2_hit"]:
-                        t["tp2_hit"] = True; t["sl"] = t["tp1"]
+                        send_telegram(f"🎯 <b>[{tf} NORMAL] TP1 (+1R) REACHED</b>\n33.3% booked (+0.33R). 🛡 SL moved to <b>BE (${t['entry']:,.2f})</b>")
+
+                    elif p <= t["tp2"] and t["stage"] == "TP1_DONE":
+                        t["stage"] = "TP2_DONE"
+                        t["realized_r"] += 0.333 * 2.0
+                        t["remaining_pct"] = 0.334
+                        t["sl"] = t["tp1"]
                         db_upsert_trade(t, status="OPEN")
-                        send_telegram(f"🎯 <b>[{tf} NORMAL] TP2 HIT (+2R)</b>\n33% booked. SL trailed to TP1 (${t['tp1']:,.2f})")
+                        send_telegram(f"🎯 <b>[{tf} NORMAL] TP2 (+2R) REACHED</b>\nNext 33.3% booked (Total realized: +1.0R). 🛡 SL trailed to <b>TP1 (${t['tp1']:,.2f})</b>")
+
                     if p >= t["sl"]:
-                        res = "BE EXIT" if t["be"] else "SL HIT"
-                        pnl = 0.5 if t["tp1_hit"] else -1.0
-                        db_upsert_trade(t, status="CLOSED", exit_p=p, res=res, pnl=pnl)
-                        send_telegram(f"🏁 <b>[{tf} NORMAL] {res}</b> @ ${p:,.2f} ({pnl:+.1f}R)")
+                        if t["stage"] == "OPEN": final_r = -1.0; res = "SL HIT"
+                        elif t["stage"] == "TP1_DONE": final_r = t["realized_r"]; res = "BE EXIT"
+                        else: final_r = t["realized_r"] + (t["remaining_pct"] * 1.0); res = "TP1 TRAIL EXIT"
+                        db_upsert_trade(t, status="CLOSED", exit_p=p, res=res, final_pnl=round(final_r, 3))
+                        send_telegram(f"🏁 <b>[{tf} NORMAL] {res}</b> @ ${p:,.2f} | Net: <b>{final_r:+.2f}R</b>")
                         GLOBAL_ACTIVE[tf] = None
-                    elif p <= t["tp3"]:
-                        db_upsert_trade(t, status="CLOSED", exit_p=p, res="TP3 FULL TARGET 🔥", pnl=3.0)
-                        send_telegram(f"🔥 <b>[{tf} NORMAL] FULL TP3 REACHED!</b> @ ${p:,.2f} (+3.0R)")
+
+                    elif p <= t["tp3"] and t["stage"] in ["OPEN", "TP1_DONE", "TP2_DONE"]:
+                        final_r = 3.0
+                        db_upsert_trade(t, status="CLOSED", exit_p=p, res="TP3 FULL TARGET 🔥", final_pnl=final_r)
+                        send_telegram(f"🔥 <b>[{tf} NORMAL] FULL TP3 REACHED!</b> @ ${p:,.2f} (+3.0R Total)")
                         GLOBAL_ACTIVE[tf] = None
 
             ev = GLOBAL_ACTIVE["EVENT"]
             if ev:
                 if ev["dir"] == "LONG":
-                    if p >= ev["tp1"] and not ev["be"]:
-                        ev["be"] = True; ev["sl"] = ev["entry"]
+                    if p >= ev["tp1"] and ev["stage"] == "OPEN":
+                        ev["stage"] = "TP1_DONE"
+                        ev["realized_r"] += 0.25 * 1.0
+                        ev["remaining_pct"] = 0.75
+                        ev["sl"] = ev["entry"]
                         db_upsert_trade(ev, status="OPEN")
-                        send_telegram(f"⚡ <b>[EVENT] TP1 HIT</b> -> SL locked to BE (${ev['entry']:,.2f})")
-                    if p >= ev["tp3"] and not ev.get("runner_active"):
-                        ev["runner_active"] = True
-                        send_telegram(f"🔥 <b>[EVENT] TP3 REACHED</b> -> Partials booked. 4H Trail active!")
-                    if ev.get("runner_active") and s4.get("last_low") and s4["last_low"] > ev["sl"]:
-                        ev["sl"] = s4["last_low"]
+                        send_telegram(f"⚡ <b>[EVENT] TP1 (+1R)</b> -> 25% booked. SL locked to BE (${ev['entry']:,.2f})")
+
+                    elif p >= ev["tp2"] and ev["stage"] == "TP1_DONE":
+                        ev["stage"] = "TP2_DONE"
+                        ev["realized_r"] += 0.25 * 2.0
+                        ev["remaining_pct"] = 0.50
+                        ev["sl"] = ev["tp1"]
                         db_upsert_trade(ev, status="OPEN")
-                        send_telegram(f"🛡 <b>[EVENT 4H TRAIL]</b> SL raised to ${ev['sl']:,.2f}")
+                        send_telegram(f"⚡ <b>[EVENT] TP2 (+2R)</b> -> 25% booked. SL locked to TP1 (${ev['tp1']:,.2f})")
+
+                    elif p >= ev["tp3"] and ev["stage"] == "TP2_DONE":
+                        ev["stage"] = "RUNNER_ACTIVE"
+                        ev["realized_r"] += 0.25 * 4.0
+                        ev["remaining_pct"] = 0.25
+                        db_upsert_trade(ev, status="OPEN")
+                        send_telegram(f"🔥 <b>[EVENT] TP3 (+4R) HIT</b> -> 75% total booked (+1.75R). 25% Runner active behind 4H Swing Lows!")
+
+                    if ev["stage"] == "RUNNER_ACTIVE" and s4.get("last_low"):
+                        trail_target = s4["last_low"] - (0.5 * a4)
+                        if trail_target > ev["sl"]:
+                            ev["sl"] = trail_target
+                            db_upsert_trade(ev, status="OPEN")
+                            send_telegram(f"🛡 <b>[EVENT 4H TRAIL]</b> SL raised to ${ev['sl']:,.2f}")
+
                     if p <= ev["sl"]:
-                        res = "4H TRAIL EXIT" if ev.get("runner_active") else ("BE EXIT" if ev["be"] else "EVENT SL HIT")
-                        pnl = 4.5 if ev.get("runner_active") else (0.0 if ev["be"] else -1.0)
-                        db_upsert_trade(ev, status="CLOSED", exit_p=p, res=res, pnl=pnl)
-                        send_telegram(f"🏁 <b>[EVENT FINISHED] {res}</b> @ ${p:,.2f} ({pnl:+.1f}R)")
+                        if ev["stage"] == "OPEN": final_r = -1.0; res = "EVENT SL HIT"
+                        elif ev["stage"] == "TP1_DONE": final_r = ev["realized_r"]; res = "BE EXIT"
+                        elif ev["stage"] == "TP2_DONE": final_r = ev["realized_r"] + (ev["remaining_pct"] * 1.0); res = "TP1 LOCK EXIT"
+                        else: final_r = ev["realized_r"] + (ev["remaining_pct"] * 4.0); res = "4H STRUCTURE TRAIL EXIT"
+                        db_upsert_trade(ev, status="CLOSED", exit_p=p, res=res, final_pnl=round(final_r, 3))
+                        send_telegram(f"🏁 <b>[EVENT COMPLETED] {res}</b> @ ${p:,.2f} | Final: <b>{final_r:+.2f}R</b>")
                         GLOBAL_ACTIVE["EVENT"] = None
+
                 elif ev["dir"] == "SHORT":
-                    if p <= ev["tp1"] and not ev["be"]:
-                        ev["be"] = True; ev["sl"] = ev["entry"]
+                    if p <= ev["tp1"] and ev["stage"] == "OPEN":
+                        ev["stage"] = "TP1_DONE"
+                        ev["realized_r"] += 0.25 * 1.0
+                        ev["remaining_pct"] = 0.75
+                        ev["sl"] = ev["entry"]
                         db_upsert_trade(ev, status="OPEN")
-                        send_telegram(f"⚡ <b>[EVENT] TP1 HIT</b> -> SL locked to BE (${ev['entry']:,.2f})")
-                    if p <= ev["tp3"] and not ev.get("runner_active"):
-                        ev["runner_active"] = True
-                        send_telegram(f"🔥 <b>[EVENT] TP3 REACHED</b> -> Partials booked. 4H Trail active!")
-                    if ev.get("runner_active") and s4.get("last_high") and s4["last_high"] < ev["sl"]:
-                        ev["sl"] = s4["last_high"]
+                        send_telegram(f"⚡ <b>[EVENT] TP1 (+1R)</b> -> 25% booked. SL locked to BE (${ev['entry']:,.2f})")
+
+                    elif p <= ev["tp2"] and ev["stage"] == "TP1_DONE":
+                        ev["stage"] = "TP2_DONE"
+                        ev["realized_r"] += 0.25 * 2.0
+                        ev["remaining_pct"] = 0.50
+                        ev["sl"] = ev["tp1"]
                         db_upsert_trade(ev, status="OPEN")
-                        send_telegram(f"🛡 <b>[EVENT 4H TRAIL]</b> SL lowered to ${ev['sl']:,.2f}")
+                        send_telegram(f"⚡ <b>[EVENT] TP2 (+2R)</b> -> 25% booked. SL locked to TP1 (${ev['tp1']:,.2f})")
+
+                    elif p <= ev["tp3"] and ev["stage"] == "TP2_DONE":
+                        ev["stage"] = "RUNNER_ACTIVE"
+                        ev["realized_r"] += 0.25 * 4.0
+                        ev["remaining_pct"] = 0.25
+                        db_upsert_trade(ev, status="OPEN")
+                        send_telegram(f"🔥 <b>[EVENT] TP3 (+4R) HIT</b> -> 75% total booked (+1.75R). 25% Runner active behind 4H Swing Highs!")
+
+                    if ev["stage"] == "RUNNER_ACTIVE" and s4.get("last_high"):
+                        trail_target = s4["last_high"] + (0.5 * a4)
+                        if trail_target < ev["sl"]:
+                            ev["sl"] = trail_target
+                            db_upsert_trade(ev, status="OPEN")
+                            send_telegram(f"🛡 <b>[EVENT 4H TRAIL]</b> SL lowered to ${ev['sl']:,.2f}")
+
                     if p >= ev["sl"]:
-                        res = "4H TRAIL EXIT" if ev.get("runner_active") else ("BE EXIT" if ev["be"] else "EVENT SL HIT")
-                        pnl = 4.5 if ev.get("runner_active") else (0.0 if ev["be"] else -1.0)
-                        db_upsert_trade(ev, status="CLOSED", exit_p=p, res=res, pnl=pnl)
-                        send_telegram(f"🏁 <b>[EVENT FINISHED] {res}</b> @ ${p:,.2f} ({pnl:+.1f}R)")
+                        if ev["stage"] == "OPEN": final_r = -1.0; res = "EVENT SL HIT"
+                        elif ev["stage"] == "TP1_DONE": final_r = ev["realized_r"]; res = "BE EXIT"
+                        elif ev["stage"] == "TP2_DONE": final_r = ev["realized_r"] + (ev["remaining_pct"] * 1.0); res = "TP1 LOCK EXIT"
+                        else: final_r = ev["realized_r"] + (ev["remaining_pct"] * 4.0); res = "4H STRUCTURE TRAIL EXIT"
+                        db_upsert_trade(ev, status="CLOSED", exit_p=p, res=res, final_pnl=round(final_r, 3))
+                        send_telegram(f"🏁 <b>[EVENT COMPLETED] {res}</b> @ ${p:,.2f} | Final: <b>{final_r:+.2f}R</b>")
                         GLOBAL_ACTIVE["EVENT"] = None
 
     def scan_market(self, candles_map, p, funding_rate, oi_delta):
@@ -478,60 +587,81 @@ class AutonomousEngine:
             c5 = candles_map.get("5m", [])
             c1h = candles_map.get("1h", [])
             c4 = candles_map.get("4h", [])
+            cd = candles_map.get("1d", [])
+
             if min(len(c15), len(c5), len(c1h), len(c4)) < 30: return
             
             s15 = smc_structure(c15); s5 = smc_structure(c5)
             s1h = smc_structure(c1h); s4 = smc_structure(c4)
+            sd = smc_structure(cd) if len(cd) > 20 else {}
+
             a15 = atr(c15); a1h = atr(c1h); a4 = atr(c4)
             vr15 = volume_ratio(c15); rsi15 = calculate_rsi(c15)
             disp15 = abs(c15[-1]["close"] - c15[-1]["open"]) > (1.1 * a15)
-
-            # ---------------- 1. EVENT SCAN (48H SWEEP) ----------------
-            sw48 = liquidity_sweep(c15, 192)
             cur = c15[-1]
+
+            # ---------------- A. 48H RARE EVENT SCAN (SCORE 85+) ----------------
+            sw48 = liquidity_sweep(c15, 192)
             if sw48 and GLOBAL_ACTIVE["EVENT"] is None and time.time() >= self.event_lock_until:
                 cand_dir = sw48["dir"]
-                score, reasons = evaluate_score(cand_dir, {
-                    "sweep": cand_dir, "htf_bias": s4["bias"],
-                    "structure": s15["choch"] or s15["bos"], "fvg": cand_dir,
-                    "displacement": disp15, "volume": vr15, "oi_change": oi_delta,
-                    "funding_ok": True, "rsi_ok": True
-                })
-                if score >= EVENT_MIN:
-                    sl = (cur["low"] - 1.5 * a15) if cand_dir == "LONG" else (cur["high"] + 1.5 * a15)
-                    risk = abs(cur["close"] - sl)
-                    evt = {
-                        "id": f"EVT_{int(time.time()*1000)}", "created": datetime.now(timezone.utc).strftime("%H:%M:%S"),
-                        "type": "EVENT", "tf": "48H/HTF", "dir": cand_dir, "setup": "48H Sweep + MTF Confluence",
-                        "score": score, "entry": cur["close"], "sl": sl,
-                        "tp1": cur["close"] + risk if cand_dir == "LONG" else cur["close"] - risk,
-                        "tp2": cur["close"] + (2 * risk) if cand_dir == "LONG" else cur["close"] - (2 * risk),
-                        "tp3": cur["close"] + (5 * risk) if cand_dir == "LONG" else cur["close"] - (5 * risk),
-                        "tp1_hit": False, "tp2_hit": False, "be": False, "runner_active": False, "reasons": reasons
-                    }
-                    self.event_lock_until = time.time() + EVENT_COOLDOWN
-                    GLOBAL_ACTIVE["EVENT"] = evt
-                    db_upsert_trade(evt, status="OPEN")
-                    send_telegram(
-                        f"⚡ <b>BTCUSDT RARE EVENT SIGNAL</b>\n\n<b>Direction:</b> {cand_dir}\n"
-                        f"🔹 <b>Entry:</b> ${cur['close']:,.2f}\n🛑 <b>SL:</b> ${sl:,.2f}\n"
-                        f"🎯 <b>TP1:</b> ${evt['tp1']:,.2f}\n🎯 <b>TP2:</b> ${evt['tp2']:,.2f}\n🔥 <b>TP3:</b> ${evt['tp3']:,.2f}\n\n"
-                        f"📊 <b>Score:</b> {score}/105\n💡 <b>Confluence:</b> {', '.join(reasons)}"
-                    )
+                desired_bias = "BULL" if cand_dir == "LONG" else "BEAR"
+                
+                htf_cascade = (sd.get("bias") == desired_bias) and \
+                              (s4.get("bias") == desired_bias or s4.get("bos") == cand_dir or s4.get("choch") == cand_dir) and \
+                              (s1h.get("bias") == desired_bias or s1h.get("bos") == cand_dir) and \
+                              (s5.get("bos") == cand_dir or s5.get("choch") == cand_dir)
 
-            # ---------------- 2. 15M NORMAL SCAN ----------------
+                if htf_cascade:
+                    score, reasons = evaluate_score(cand_dir, {
+                        "sweep": cand_dir, "htf_bias": s4["bias"],
+                        "structure": s15["choch"] or s15["bos"], "fvg": cand_dir,
+                        "displacement": disp15, "volume": vr15, "oi_change": oi_delta,
+                        "funding_ok": True, "rsi_ok": True
+                    })
+                    if score >= EVENT_MIN:
+                        sl = (cur["low"] - 1.5 * a15) if cand_dir == "LONG" else (cur["high"] + 1.5 * a15)
+                        risk = abs(cur["close"] - sl)
+                        evt = {
+                            "id": f"EVT_{int(time.time()*1000)}", "created": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+                            "type": "EVENT", "tf": "48H/HTF", "dir": cand_dir, "setup": "48H Sweep + Multi-TF Cascade",
+                            "score": score, "entry": cur["close"], "sl": sl,
+                            "tp1": cur["close"] + risk if cand_dir == "LONG" else cur["close"] - risk,
+                            "tp2": cur["close"] + (2 * risk) if cand_dir == "LONG" else cur["close"] - (2 * risk),
+                            "tp3": cur["close"] + (4 * risk) if cand_dir == "LONG" else cur["close"] - (4 * risk),
+                            "realized_r": 0.0, "remaining_pct": 1.0, "stage": "OPEN", "reasons": reasons
+                        }
+                        self.event_lock_until = time.time() + EVENT_COOLDOWN
+                        GLOBAL_ACTIVE["EVENT"] = evt
+                        db_upsert_trade(evt, status="OPEN")
+                        
+                        c = db()
+                        c.execute("INSERT OR REPLACE INTO event_locks VALUES (?,?,?,?,?)",
+                                  (f"EVT_{cand_dir}_{int(cur['time']//3600)}", evt["created"], cand_dir, score, "ACTIVE"))
+                        c.commit(); c.close()
+
+                        send_telegram(
+                            f"⚡ <b>BTCUSDT RARE EVENT SIGNAL</b>\n\n"
+                            f"<b>Direction:</b> {cand_dir}\n<b>Setup:</b> 48H Sweep + Multi-TF Cascade\n\n"
+                            f"🔹 <b>Entry:</b> ${cur['close']:,.2f}\n🛑 <b>SL:</b> ${sl:,.2f}\n"
+                            f"🎯 <b>TP1 (25%):</b> ${evt['tp1']:,.2f}\n🎯 <b>TP2 (25%):</b> ${evt['tp2']:,.2f}\n🔥 <b>TP3 (25%):</b> ${evt['tp3']:,.2f}\n"
+                            f"🏃 <b>Runner (25%):</b> 4H Structure Trail\n\n"
+                            f"📊 <b>Score:</b> {score}/105\n💡 <b>Confluence:</b> {', '.join(reasons)}"
+                        )
+
+            # ---------------- B. 15M NORMAL SETUP ----------------
             if GLOBAL_ACTIVE["15M"] is None and self.last_signal_time["15M"] != cur["time"]:
                 sw15 = liquidity_sweep(c15, 6)
                 fvg15 = detect_institutional_fvg(c15)
                 cand_dir, setup_name = None, ""
-                if sw15: cand_dir, setup_name = sw15["dir"], "15M Liquidity Sweep + Shift"
-                elif s15["choch"]: cand_dir, setup_name = s15["choch"], "15M CHoCH Market Structure Shift"
-                elif fvg15: cand_dir, setup_name = fvg15["dir"], "Institutional FVG Imbalance Fill"
+                if sw15: cand_dir, setup_name = sw15["dir"], "15M Liquidity Sweep + 5M MSS"
+                elif s15["choch"]: cand_dir, setup_name = s15["choch"], "15M CHoCH Shift + 5M Confirm"
+                elif fvg15: cand_dir, setup_name = fvg15["dir"], "Institutional FVG Fill + 5M MSS"
 
-                if cand_dir:
+                if cand_dir and (s5["bos"] == cand_dir or s5["choch"] == cand_dir):
                     funding_ok = (cand_dir == "LONG" and funding_rate <= 0.0001) or (cand_dir == "SHORT" and funding_rate >= -0.0001)
                     rsi_ok = (cand_dir == "LONG" and 35 <= rsi15 <= 60) or (cand_dir == "SHORT" and 40 <= rsi15 <= 65)
                     struct_dir = s15["choch"] or s15["bos"] or s5["bos"]
+
                     score, reasons = evaluate_score(cand_dir, {
                         "sweep": sw15["dir"] if sw15 else None, "htf_bias": s1h["bias"],
                         "structure": struct_dir, "fvg": fvg15["dir"] if fvg15 else None,
@@ -548,7 +678,7 @@ class AutonomousEngine:
                             "tp1": cur["close"] + risk if cand_dir == "LONG" else cur["close"] - risk,
                             "tp2": cur["close"] + (2 * risk) if cand_dir == "LONG" else cur["close"] - (2 * risk),
                             "tp3": cur["close"] + (3 * risk) if cand_dir == "LONG" else cur["close"] - (3 * risk),
-                            "tp1_hit": False, "tp2_hit": False, "be": False, "runner_active": False, "reasons": reasons
+                            "realized_r": 0.0, "remaining_pct": 1.0, "stage": "OPEN", "reasons": reasons
                         }
                         self.last_signal_time["15M"] = cur["time"]
                         GLOBAL_ACTIVE["15M"] = t
@@ -557,21 +687,21 @@ class AutonomousEngine:
                         send_telegram(
                             f"{emoji} <b>BTCUSDT SMC ENTRY SIGNAL [15M]</b>\n\n<b>Direction:</b> {cand_dir}\n<b>Setup:</b> {setup_name}\n\n"
                             f"🔹 <b>Entry:</b> ${cur['close']:,.2f}\n🛑 <b>SL:</b> ${sl:,.2f}\n"
-                            f"🎯 <b>TP1:</b> ${t['tp1']:,.2f}\n🎯 <b>TP2:</b> ${t['tp2']:,.2f}\n🎯 <b>TP3:</b> ${t['tp3']:,.2f}\n\n"
+                            f"🎯 <b>TP1 (33%):</b> ${t['tp1']:,.2f}\n🎯 <b>TP2 (33%):</b> ${t['tp2']:,.2f}\n🎯 <b>TP3 (34%):</b> ${t['tp3']:,.2f}\n\n"
                             f"📊 <b>Score:</b> {score}/105\n💡 <b>Confluence:</b> {', '.join(reasons)}"
                         )
 
-            # ---------------- 3. 1H NORMAL SCAN (BOS + VOLUME PROFILE POC) ----------------
+            # ---------------- C. 1H NORMAL SETUP ----------------
             cur1h = c1h[-1]
             if GLOBAL_ACTIVE["1H"] is None and self.last_signal_time["1H"] != cur1h["time"]:
-                poc = volume_profile_poc(c1h, 60)
+                vp = volume_profile_spectrum(c1h, 60)
                 d1h = None
-                if cur1h["low"] <= poc and cur1h["close"] > poc and s1h["bos"] == "LONG": d1h = "LONG"
-                elif cur1h["high"] >= poc and cur1h["close"] < poc and s1h["bos"] == "SHORT": d1h = "SHORT"
+                if cur1h["low"] <= vp["val"] and cur1h["close"] > vp["val"] and s1h["bias"] == "BULL": d1h = "LONG"
+                elif cur1h["high"] >= vp["vah"] and cur1h["close"] < vp["vah"] and s1h["bias"] == "BEAR": d1h = "SHORT"
 
-                if d1h and s5["bos"] == d1h:
+                if d1h and (s5["bos"] == d1h or s5["choch"] == d1h):
                     score, reasons = evaluate_score(d1h, {
-                        "sweep": None, "htf_bias": s4["bias"], "structure": s1h["bos"],
+                        "sweep": None, "htf_bias": s4["bias"], "structure": s1h["bos"] or s1h["choch"],
                         "fvg": None, "displacement": True, "volume": volume_ratio(c1h),
                         "oi_change": oi_delta, "funding_ok": True, "rsi_ok": True
                     })
@@ -580,33 +710,33 @@ class AutonomousEngine:
                         risk = abs(cur1h["close"] - sl)
                         t = {
                             "id": f"NRM_1H_{int(time.time()*1000)}", "created": datetime.now(timezone.utc).strftime("%H:%M:%S"),
-                            "type": "NORMAL", "tf": "1H", "dir": d1h, "setup": "1H BOS + Volume Profile POC",
+                            "type": "NORMAL", "tf": "1H", "dir": d1h, "setup": "1H Value Area Rejection + 5M MSS",
                             "score": score, "entry": cur1h["close"], "sl": sl,
                             "tp1": cur1h["close"] + risk if d1h == "LONG" else cur1h["close"] - risk,
                             "tp2": cur1h["close"] + (2 * risk) if d1h == "LONG" else cur1h["close"] - (2 * risk),
                             "tp3": cur1h["close"] + (3 * risk) if d1h == "LONG" else cur1h["close"] - (3 * risk),
-                            "tp1_hit": False, "tp2_hit": False, "be": False, "runner_active": False, "reasons": reasons
+                            "realized_r": 0.0, "remaining_pct": 1.0, "stage": "OPEN", "reasons": reasons
                         }
                         self.last_signal_time["1H"] = cur1h["time"]
                         GLOBAL_ACTIVE["1H"] = t
                         db_upsert_trade(t, status="OPEN")
                         emoji = "🟢" if d1h == "LONG" else "🔴"
                         send_telegram(
-                            f"{emoji} <b>BTCUSDT SMC ENTRY SIGNAL [1H]</b>\n\n<b>Direction:</b> {d1h}\n<b>Setup:</b> 1H BOS + VP POC\n\n"
+                            f"{emoji} <b>BTCUSDT SMC ENTRY SIGNAL [1H]</b>\n\n<b>Direction:</b> {d1h}\n<b>Setup:</b> Value Area Rejection\n\n"
                             f"🔹 <b>Entry:</b> ${cur1h['close']:,.2f}\n🛑 <b>SL:</b> ${sl:,.2f}\n"
-                            f"🎯 <b>TP1:</b> ${t['tp1']:,.2f}\n🎯 <b>TP2:</b> ${t['tp2']:,.2f}\n🎯 <b>TP3:</b> ${t['tp3']:,.2f}\n\n"
+                            f"🎯 <b>TP1 (33%):</b> ${t['tp1']:,.2f}\n🎯 <b>TP2 (33%):</b> ${t['tp2']:,.2f}\n🎯 <b>TP3 (34%):</b> ${t['tp3']:,.2f}\n\n"
                             f"📊 <b>Score:</b> {score}/105\n💡 <b>Confluence:</b> {', '.join(reasons)}"
                         )
 
-            # ---------------- 4. 4H NORMAL SCAN (CHANNEL BREAK + FIB POCKET) ----------------
+            # ---------------- D. 4H NORMAL SETUP ----------------
             cur4h = c4[-1]
             if GLOBAL_ACTIVE["4H"] is None and self.last_signal_time["4H"] != cur4h["time"]:
                 ch = channel_break(c4, 30)
                 fib = fib_pocket(c4, 80)
-                if ch and fib and ch == fib["dir"] and s5["bos"] == ch:
+                if ch and fib and ch == fib["dir"] and (s5["bos"] == ch or s5["choch"] == ch):
                     d4h = ch
                     score, reasons = evaluate_score(d4h, {
-                        "sweep": None, "htf_bias": s4["bias"], "structure": s4["bos"],
+                        "sweep": None, "htf_bias": sd.get("bias", "NEUTRAL"), "structure": s4["bos"] or s4["choch"],
                         "fvg": None, "displacement": True, "volume": volume_ratio(c4),
                         "oi_change": oi_delta, "funding_ok": True, "rsi_ok": True
                     })
@@ -620,7 +750,7 @@ class AutonomousEngine:
                             "tp1": cur4h["close"] + risk if d4h == "LONG" else cur4h["close"] - risk,
                             "tp2": cur4h["close"] + (2 * risk) if d4h == "LONG" else cur4h["close"] - (2 * risk),
                             "tp3": cur4h["close"] + (3 * risk) if d4h == "LONG" else cur4h["close"] - (3 * risk),
-                            "tp1_hit": False, "tp2_hit": False, "be": False, "runner_active": False, "reasons": reasons
+                            "realized_r": 0.0, "remaining_pct": 1.0, "stage": "OPEN", "reasons": reasons
                         }
                         self.last_signal_time["4H"] = cur4h["time"]
                         GLOBAL_ACTIVE["4H"] = t
@@ -629,11 +759,11 @@ class AutonomousEngine:
                         send_telegram(
                             f"{emoji} <b>BTCUSDT SMC ENTRY SIGNAL [4H]</b>\n\n<b>Direction:</b> {d4h}\n<b>Setup:</b> Channel Break + Fib Pocket\n\n"
                             f"🔹 <b>Entry:</b> ${cur4h['close']:,.2f}\n🛑 <b>SL:</b> ${sl:,.2f}\n"
-                            f"🎯 <b>TP1:</b> ${t['tp1']:,.2f}\n🎯 <b>TP2:</b> ${t['tp2']:,.2f}\n🎯 <b>TP3:</b> ${t['tp3']:,.2f}\n\n"
+                            f"🎯 <b>TP1 (33%):</b> ${t['tp1']:,.2f}\n🎯 <b>TP2 (33%):</b> ${t['tp2']:,.2f}\n🎯 <b>TP3 (34%):</b> ${t['tp3']:,.2f}\n\n"
                             f"📊 <b>Score:</b> {score}/105\n💡 <b>Confluence:</b> {', '.join(reasons)}"
                         )
 
-# ---------------- 7. BACKGROUND SCANNER THREAD ----------------
+# ---------------- 7. CONTINUOUS BACKGROUND THREAD ----------------
 def run_worker_thread():
     time.sleep(2)
     logging.info("🚀 Production SMC V2 Worker Initialized...")
@@ -641,13 +771,16 @@ def run_worker_thread():
 
     engine = AutonomousEngine()
     candles_map = {}
-    last_pull = 0; last_meta_pull = 0
-    funding = 0.0; oi_delta = 0.0
+    last_pull = 0
+    last_meta_pull = 0
+    funding = 0.0
+    oi_delta = 0.0
 
     while True:
         try:
             p = fetch_price()
             now = time.time()
+            
             if now - last_pull >= 15:
                 for tf in ["5m", "15m", "1h", "4h", "1d"]:
                     k = fetch_klines(tf, 250)
@@ -666,7 +799,9 @@ def run_worker_thread():
 
                 c4 = candles_map.get("4h", [])
                 s4 = smc_structure(c4) if len(c4) > 20 else {}
-                engine.manage_positions(p, s4)
+                a4 = atr(c4) if len(c4) > 20 else 120.0
+
+                engine.manage_positions(p, s4, a4)
                 engine.scan_market(candles_map, p, funding, oi_delta)
 
             time.sleep(3)
