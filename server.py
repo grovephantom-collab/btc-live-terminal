@@ -5,7 +5,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 # ============================================================
-# BTCUSDT SMC PRO DASHBOARD (LIVE SYNC TERMINAL)
+# BTCUSDT SMC PRO DASHBOARD (API DIRECT BINDING)
 # ============================================================
 
 st.set_page_config(
@@ -17,8 +17,8 @@ st.set_page_config(
 SYMBOL = "BTCUSDT"
 RENDER_URL = "https://btc-live-terminal-2.onrender.com"
 
-# --- 1. FETCH VAULT & ACTIVE TRADES FROM RENDER ---
-def get_vault_data():
+# --- 1. FETCH DIRECT STRUCTURED JSON FROM RENDER ---
+def get_render_sync():
     try:
         r = requests.get(f"{RENDER_URL}/vault-data", timeout=3.5)
         if r.status_code == 200:
@@ -28,7 +28,16 @@ def get_vault_data():
         pass
     return [], []
 
-# --- 2. FALLBACK BINANCE CANDLES ---
+def get_engine_heartbeat():
+    try:
+        r = requests.get(f"{RENDER_URL}/status", timeout=2.5)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return {"status": "offline", "last_scan": "Disconnected"}
+
+# --- 2. MULTI-ENDPOINT CANDLE FALLBACK ---
 def fetch_initial_candles(interval="15m", limit=250):
     urls = [
         f"https://fapi.binance.com/fapi/v1/klines?symbol={SYMBOL}&interval={interval}&limit={limit}",
@@ -49,33 +58,18 @@ def fetch_initial_candles(interval="15m", limit=250):
             continue
     return []
 
-vault_rows, active_rows = get_vault_data()
+vault_list, active_list = get_render_sync()
+heartbeat = get_engine_heartbeat()
 
-total_trades = len(vault_rows)
-wins = sum(1 for r in vault_rows if r[9] and r[9] > 0)
+total_trades = len(vault_list)
+wins = sum(1 for r in vault_list if r.get("pnl", 0.0) > 0)
 win_rate = int((wins / total_trades) * 100) if total_trades > 0 else 0
-net_r = sum(r[9] for r in vault_rows if r[9]) if total_trades > 0 else 0.0
+net_r = sum(r.get("pnl", 0.0) for r in vault_list) if total_trades > 0 else 0.0
 
-active_trades = []
-for r in active_rows:
-    active_trades.append({
-        "id": r[0], "tf": r[1], "dir": r[2], "entry": r[3],
-        "sl": r[4], "tp1": r[5], "tp2": r[6], "tp3": r[7],
-        "setup": r[8], "score": r[9]
-    })
-
-vault_json = json.dumps([
-    {
-        "time": r[0], "type": r[1], "tf": r[2], "dir": r[3],
-        "setup": r[4], "entry": r[6], "exit": r[7], "res": r[8],
-        "pnl": r[9], "status": r[10]
-    }
-    for r in vault_rows
-])
-
+vault_json = json.dumps(vault_list)
+active_json = json.dumps(active_list)
 candles = fetch_initial_candles("15m", 250)
 candles_json = json.dumps(candles)
-active_json = json.dumps(active_trades)
 
 # --- 3. CSS FULLSCREEN SETUP ---
 st.markdown("""
@@ -102,7 +96,7 @@ ui_html = f"""
         .btn {{ background:#16202f; border:1px solid #233147; color:#38bdf8; padding:4px 9px; border-radius:4px; font-size:10px; cursor:pointer; font-weight:bold; }}
         .btn:hover {{ background:#202d42; }}
         .modal {{ display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.85); z-index:999; align-items:center; justify-content:center; padding:12px; }}
-        .box {{ background:#0b0f16; border:1px solid #1c2636; border-radius:8px; width:100%; max-width:440px; padding:14px; max-height:85vh; overflow-y:auto; }}
+        .box {{ background:#0b0f16; border:1px solid #1c2636; border-radius:8px; width:100%; max-width:460px; padding:14px; max-height:85vh; overflow-y:auto; }}
     </style>
 </head>
 <body>
@@ -166,7 +160,7 @@ ui_html = f"""
             document.getElementById('active-tag').innerText = "• ACTIVE: " + tags.join(" | ");
         }}
 
-        // Live WebSockets
+        // Direct WebSocket to Binance
         const wsTrade = new WebSocket('wss://fstream.binance.com/ws/btcusdt@trade');
         wsTrade.onmessage = (event) => {{
             const t = JSON.parse(event.data);
@@ -196,10 +190,12 @@ ui_html = f"""
             if (m.style.display === 'flex') {{
                 let h = '';
                 vault.forEach(v => {{
+                    const pnlColor = v.pnl >= 0 ? '#089981' : '#f43f5e';
+                    const sign = v.pnl >= 0 ? '+' : '';
                     h += `<div style="padding:6px 0; border-bottom:1px solid #161e2a;">
                         <div style="display:flex; justify-content:space-between;">
                             <b>[${{v.tf}}] ${{v.dir}}</b> @ ${{v.entry ? v.entry.toFixed(1) : '-'}}
-                            <span style="color:${{v.pnl >= 0 ? '#089981' : '#f43f5e'}}; font-weight:bold;">${{v.res || v.status}} (${{v.pnl >= 0 ? '+' : ''}}${{v.pnl || 0}}R)</span>
+                            <span style="color:${{pnlColor}}; font-weight:bold;">${{v.res || v.status}} (${{sign}}${{v.pnl}}R)</span>
                         </div>
                         <div style="color:#64748b; font-size:9px;">Setup: ${{v.setup}} | Status: <b>${{v.status}}</b></div>
                     </div>`;
