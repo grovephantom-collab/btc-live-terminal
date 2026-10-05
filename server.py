@@ -3,20 +3,19 @@ import streamlit.components.v1 as components
 import requests
 import json
 import sqlite3
-import asyncio
-import aiohttp
+import time
 import threading
 from datetime import datetime, timezone
 
 # ============================================================
-# BTCUSDT INSTITUTIONAL SMC PRO TERMINAL (WITH PERSISTENT VAULT)
+# BTCUSDT INSTITUTIONAL SMC PRO TERMINAL (NO-AIOHTTP ENGINE)
 # ============================================================
 
 BOT_TOKEN = "8941403990:AAGLH_dupqmGoipglhVvRuiPBzvgMqJR3Ms"
 CHAT_ID = "7886716805"
 DB_FILE = "smc_quant_vault.db"
 
-# --- 1. PERSISTENT SQLITE VAULT SETUP ---
+# --- 1. SQLITE VAULT SETUP ---
 def init_db():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     cur = conn.cursor()
@@ -105,7 +104,7 @@ def fetch_klines(symbol="BTCUSDT", interval="15m", limit=350):
             continue
     return []
 
-# --- 3. 24/7 BACKGROUND QUANT ENGINE ---
+# --- 3. QUANT ENGINE ---
 class QuantEngine:
     def __init__(self):
         self.state = "SCANNING"
@@ -195,58 +194,33 @@ if "quant_engine" not in st.session_state:
     st.session_state["quant_engine"] = QuantEngine()
 engine = st.session_state["quant_engine"]
 
-# --- 4. 24/7 BACKGROUND ASYNC WORKER ---
+# --- 4. 24/7 BACKGROUND WORKER (ZERO-DEPENDENCY) ---
 def run_worker_thread():
-    async def kline_listener():
-        while True:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect("wss://fstream.binance.com/ws/btcusdt@kline_15m") as ws:
-                        async for msg in ws:
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                data = json.loads(msg.data)
-                                k = data.get('k', {})
-                                if k.get('x'):
-                                    c = {
-                                        "time": (int(k['t'] / 1000) // 900) * 900,
-                                        "open": float(k['o']), "high": float(k['h']),
-                                        "low": float(k['l']), "close": float(k['c']),
-                                        "vol": float(k['v'])
-                                    }
-                                    if min(c['open'], c['high'], c['low'], c['close']) > 10000:
-                                        engine.candles.append(c)
-                                        if len(engine.candles) > 400: engine.candles.pop(0)
-                                        engine.evaluate()
-            except Exception:
-                await asyncio.sleep(5)
-
-    async def trade_listener():
-        while True:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect("wss://fstream.binance.com/ws/btcusdt@trade") as ws:
-                        async for msg in ws:
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                data = json.loads(msg.data)
-                                p = float(data.get('p', 0.0))
-                                if p > 10000:
-                                    engine.check_res(p)
-            except Exception:
-                await asyncio.sleep(5)
-
-    async def runner():
-        engine.candles = fetch_klines("BTCUSDT", "15m", 350)
-        await asyncio.gather(kline_listener(), trade_listener())
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(runner())
+    while True:
+        try:
+            c = fetch_klines("BTCUSDT", "15m", 350)
+            if c:
+                engine.candles = c
+                engine.evaluate()
+            
+            # Check price for active trade tracking
+            if engine.state == "ACTIVE_TRADE":
+                try:
+                    r = requests.get("https://fapi.binance.com/fapi/v1/ticker/price?symbol=BTCUSDT", timeout=3).json()
+                    price = float(r.get("price", 0.0))
+                    if price > 10000:
+                        engine.check_res(price)
+                except Exception:
+                    pass
+            time.sleep(10)
+        except Exception:
+            time.sleep(15)
 
 if "worker_running" not in st.session_state:
     st.session_state["worker_running"] = True
     threading.Thread(target=run_worker_thread, daemon=True).start()
 
-# --- 5. STREAMLIT ULTRA-RESPONSIVE ADAPTIVE UI ---
+# --- 5. STREAMLIT FULL DESKTOP/MOBILE TRADING TERMINAL UI ---
 st.set_page_config(page_title="BTCUSDT PRO TERMINAL", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown("""
@@ -378,10 +352,10 @@ ui_html = f"""
         </div>
 
         <div class="nav-right">
-            <div class="nav-stat"><span class="stat-label">Price</span><span id="nav-price" class="stat-val c-green">104,628.4</span></div>
+            <div class="nav-stat"><span class="stat-label">Price</span><span id="nav-price" class="stat-val c-green">--</span></div>
             <button class="btn-ui" onclick="toggleVaultHistory()"><i class="fa-solid fa-scroll"></i> VAULT ({total_trades})</button>
             <button class="btn-ui mobile-only-btn" onclick="toggleMobileStats()"><i class="fa-solid fa-chart-pie"></i> STATS</button>
-            <div id="live-ist-clock" style="color:#808a9d; font-size:10px; font-weight:600;">12:34 (IST)</div>
+            <div id="live-ist-clock" style="color:#808a9d; font-size:10px; font-weight:600;">--:-- (IST)</div>
         </div>
     </div>
 
@@ -402,12 +376,12 @@ ui_html = f"""
             <div class="chart-legend">
                 <div class="legend-row">
                     <span style="color:#d1d5db; font-weight:bold;">BTCUSDT • 15M</span>
-                    <span id="leg-ohlc" style="color:#089981;">O 104,612.3 H 104,689.5 L 104,589.1 C 104,628.4</span>
+                    <span id="leg-ohlc" style="color:#089981;">--</span>
                 </div>
                 <div class="legend-row" style="font-size:8px;">
-                    <span style="color:#38bdf8;">EMA20 <span id="leg-ema20">104,521</span></span>
-                    <span style="color:#eab308;">EMA50 <span id="leg-ema50">104,488</span></span>
-                    <span style="color:#ef4444;">EMA200 <span id="leg-ema200">103,972</span></span>
+                    <span style="color:#38bdf8;">EMA20 <span id="leg-ema20">--</span></span>
+                    <span style="color:#eab308;">EMA50 <span id="leg-ema50">--</span></span>
+                    <span style="color:#ef4444;">EMA200 <span id="leg-ema200">--</span></span>
                 </div>
             </div>
 
@@ -421,7 +395,7 @@ ui_html = f"""
         <div class="right-sidebar">
             <div class="panel-box">
                 <div class="panel-title">MARKET INFO</div>
-                <div class="grid-row"><span class="label">Price</span><span id="side-price" class="val c-green">104,628.4</span></div>
+                <div class="grid-row"><span class="label">Price</span><span id="side-price" class="val c-green">--</span></div>
                 <div class="grid-row"><span class="label">Funding</span><span class="val c-green">0.0100%</span></div>
                 <div class="grid-row"><span class="label">Open Interest</span><span class="val">34.82B</span></div>
             </div>
@@ -433,10 +407,10 @@ ui_html = f"""
             </div>
             <div class="panel-box">
                 <div class="panel-title">LIQUIDITY LEVELS</div>
-                <div class="grid-row"><span class="label">48H High</span><span id="side-48h" class="val c-red">107,248.6</span></div>
-                <div class="grid-row"><span class="label">48H Low</span><span id="side-48l" class="val c-green">102,340.7</span></div>
-                <div class="grid-row"><span class="label">1H High</span><span id="side-1h" class="val c-red">105,420.3</span></div>
-                <div class="grid-row"><span class="label">1H Low</span><span id="side-1l" class="val c-green">103,860.5</span></div>
+                <div class="grid-row"><span class="label">48H High</span><span id="side-48h" class="val c-red">--</span></div>
+                <div class="grid-row"><span class="label">48H Low</span><span id="side-48l" class="val c-green">--</span></div>
+                <div class="grid-row"><span class="label">1H High</span><span id="side-1h" class="val c-red">--</span></div>
+                <div class="grid-row"><span class="label">1H Low</span><span id="side-1l" class="val c-green">--</span></div>
             </div>
             <div class="panel-box">
                 <div class="panel-title">QUANT VAULT STATS</div>
@@ -472,7 +446,7 @@ ui_html = f"""
             </div>
             <div class="panel-box">
                 <div class="panel-title">MARKET INFO</div>
-                <div class="grid-row"><span class="label">Price</span><span id="mob-price" class="val c-green">104,628.4</span></div>
+                <div class="grid-row"><span class="label">Price</span><span id="mob-price" class="val c-green">--</span></div>
                 <div class="grid-row"><span class="label">Funding</span><span class="val c-green">0.0100%</span></div>
                 <div class="grid-row"><span class="label">Open Interest</span><span class="val">34.82B</span></div>
             </div>
@@ -540,22 +514,24 @@ ui_html = f"""
         }}
 
         // Dynamic Liquidity Levels
-        let h48 = Math.max(...allCandles.slice(-192).map(c => c.high));
-        let l48 = Math.min(...allCandles.slice(-192).map(c => c.low));
-        let h1 = Math.max(...allCandles.slice(-4).map(c => c.high));
-        let l1 = Math.min(...allCandles.slice(-4).map(c => c.low));
+        if (allCandles.length >= 20) {{
+            let h48 = Math.max(...allCandles.slice(-192).map(c => c.high));
+            let l48 = Math.min(...allCandles.slice(-192).map(c => c.low));
+            let h1 = Math.max(...allCandles.slice(-4).map(c => c.high));
+            let l1 = Math.min(...allCandles.slice(-4).map(c => c.low));
 
-        candleSeries.createPriceLine({{ price: h48, color: '#f23645', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true, title: '48H RESISTANCE' }});
-        candleSeries.createPriceLine({{ price: l48, color: '#089981', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true, title: '48H SUPPORT' }});
+            candleSeries.createPriceLine({{ price: h48, color: '#f23645', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true, title: '48H RESISTANCE' }});
+            candleSeries.createPriceLine({{ price: l48, color: '#089981', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true, title: '48H SUPPORT' }});
 
-        document.getElementById('side-48h').innerText = h48.toFixed(1);
-        document.getElementById('side-48l').innerText = l48.toFixed(1);
-        document.getElementById('side-1h').innerText = h1.toFixed(1);
-        document.getElementById('side-1l').innerText = l1.toFixed(1);
-        document.getElementById('mob-48h').innerText = h48.toFixed(1);
-        document.getElementById('mob-48l').innerText = l48.toFixed(1);
-        document.getElementById('mob-1h').innerText = h1.toFixed(1);
-        document.getElementById('mob-1l').innerText = l1.toFixed(1);
+            document.getElementById('side-48h').innerText = h48.toFixed(1);
+            document.getElementById('side-48l').innerText = l48.toFixed(1);
+            document.getElementById('side-1h').innerText = h1.toFixed(1);
+            document.getElementById('side-1l').innerText = l1.toFixed(1);
+            document.getElementById('mob-48h').innerText = h48.toFixed(1);
+            document.getElementById('mob-48l').innerText = l48.toFixed(1);
+            document.getElementById('mob-1h').innerText = h1.toFixed(1);
+            document.getElementById('mob-1l').innerText = l1.toFixed(1);
+        }}
 
         // 2. RSI SUB-CHART
         const rsiEl = document.getElementById('chart-rsi');
@@ -645,7 +621,15 @@ ui_html = f"""
             container.innerHTML = html;
         }}
 
-        // REAL-TIME WEBSOCKET TICKS
+        // REAL-TIME CLOCK
+        setInterval(() => {{
+            const now = new Date();
+            const istStr = now.toLocaleTimeString('en-GB', {{ timeZone: 'Asia/Kolkata' }}) + " (IST)";
+            const el = document.getElementById('live-ist-clock');
+            if (el) el.innerText = istStr;
+        }}, 1000);
+
+        // REAL-TIME BINANCE WEBSOCKET TICKS (Browser Native - No Python Dependencies)
         const wsTrade = new WebSocket('wss://fstream.binance.com/ws/btcusdt@trade');
         wsTrade.onmessage = (event) => {{
             const t = JSON.parse(event.data);
@@ -653,9 +637,9 @@ ui_html = f"""
             if (p < 20000 || p > 300000) return;
 
             const pStr = p.toLocaleString('en-US', {{ minimumFractionDigits: 1, maximumFractionDigits: 1 }});
-            document.getElementById('nav-price').innerText = pStr;
-            document.getElementById('side-price').innerText = pStr;
-            document.getElementById('mob-price').innerText = pStr;
+            if (document.getElementById('nav-price')) document.getElementById('nav-price').innerText = pStr;
+            if (document.getElementById('side-price')) document.getElementById('side-price').innerText = pStr;
+            if (document.getElementById('mob-price')) document.getElementById('mob-price').innerText = pStr;
 
             if (currentBar) {{
                 if (p > currentBar.high) currentBar.high = p;
