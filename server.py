@@ -1,288 +1,297 @@
-import os
-import time
-import math
-import sqlite3
-import logging
-import traceback
-import threading
-from datetime import datetime, timezone
-import requests
+import streamlit as st
+import streamlit.components.v1 as components
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [SNIPER] %(message)s"
+st.set_page_config(
+    page_title="BTCUSDT PRO TERMINAL",
+    layout="wide",
+    initial_sidebar_state="collapsed"
 )
 
-SYMBOL = "BTCUSDT"
-DB_FILE = os.getenv("DB_FILE", "trades_v5.db")
-WORKER_API = "http://127.0.0.1:10000"
-BASE = "https://fapi.binance.com"
+# Streamlit default padding wipeout
+st.markdown("""
+<style>
+    header, footer, #MainMenu { display: none !important; }
+    .block-container { padding: 0px !important; margin: 0px !important; max-width: 100% !important; }
+    .stApp { background-color: #06080d !important; }
+    iframe { width: 100% !important; min-height: 650px !important; border: none !important; }
+</style>
+""", unsafe_allow_html=True)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8941403990:AAGLH_dupqmGoipglhVvRuiPBzvgMqJR3Ms")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7886716805")
+# Complete Self-Contained Mobile Terminal (Zero Crash / Zero 0px Blank Screen)
+TERMINAL_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>BTCUSDT Terminal</title>
+<style>
+    * { margin: 0; padding: 0; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    html, body { width: 100%; height: 100%; background: #06080d; color: #c3c7d1; overflow-x: hidden; }
+    
+    /* Top Header Bar */
+    .header {
+        height: 48px;
+        background: #0c1017;
+        border-bottom: 1px solid #161e2a;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0 10px;
+    }
+    .badge {
+        background: rgba(8, 153, 129, 0.2);
+        color: #089981;
+        font-size: 10px;
+        font-weight: 700;
+        padding: 2px 6px;
+        border-radius: 4px;
+    }
+    .signal-status {
+        color: #38bdf8;
+        font-size: 10px;
+        font-weight: 600;
+        margin-left: 6px;
+    }
+    .price-badge {
+        font-size: 14px;
+        font-weight: 800;
+        color: #089981;
+    }
+    .vault-btn {
+        background: #16202f;
+        border: 1px solid #233147;
+        color: #38bdf8;
+        font-size: 11px;
+        font-weight: 700;
+        padding: 5px 9px;
+        border-radius: 4px;
+        cursor: pointer;
+    }
 
-LOCK = threading.RLock()
+    /* Timeframe Selector */
+    .tf-bar {
+        height: 36px;
+        background: #080c12;
+        border-bottom: 1px solid #161e2a;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 0 10px;
+        overflow-x: auto;
+    }
+    .tf-btn {
+        background: #111823;
+        border: 1px solid #1c2636;
+        color: #787f8f;
+        font-size: 10px;
+        font-weight: 700;
+        padding: 3px 8px;
+        border-radius: 4px;
+        cursor: pointer;
+    }
+    .tf-btn.active {
+        background: #38bdf8;
+        color: #06080d;
+        border-color: #38bdf8;
+    }
 
-def send_telegram(text):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
-            timeout=5,
-        )
-    except Exception as e:
-        logging.error(f"Telegram error: {e}")
+    /* Fixed Height Chart Frame (Cannot Collapse to 0px) */
+    #chart-box {
+        width: 100%;
+        height: 520px;
+        min-height: 520px;
+        position: relative;
+        background: #06080d;
+    }
 
-def db():
-    c = sqlite3.connect(DB_FILE, timeout=15)
-    c.execute("PRAGMA journal_mode=WAL")
-    return c
+    /* Vault Modal */
+    .modal {
+        display: none;
+        position: fixed;
+        top: 0; left: 0;
+        width: 100vw; height: 100vh;
+        background: rgba(0,0,0,0.85);
+        z-index: 9999;
+        align-items: center;
+        justify-content: center;
+        padding: 15px;
+    }
+    .modal-box {
+        background: #0b0f16;
+        border: 1px solid #1c2636;
+        border-radius: 8px;
+        width: 100%;
+        max-width: 440px;
+        max-height: 80vh;
+        padding: 14px;
+        overflow-y: auto;
+    }
+</style>
+</head>
+<body>
 
-def db_upsert_sniper(t, status="OPEN", exit_p=0.0, res="RUNNING", final_pnl=0.0):
-    try:
-        c = db()
-        c.execute("""INSERT OR REPLACE INTO trades 
-                     (trade_id, created_at, signal_type, tf, direction, setup, score, entry, sl, tp1, tp2, tp3, exit, result, pnl_r, realized_r, remaining_pct, stage, confluence, status)
-                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                  (t["id"], t["created"], "SNIPER", "1M/5M", t["dir"], t["setup"], t["score"],
-                   t["entry"], t["sl"], t["tp1"], t["tp2"], t["tp3"], exit_p, res, final_pnl,
-                   t.get("realized_r", 0.0), t.get("remaining_pct", 1.0), t.get("stage", "OPEN"),
-                   ", ".join(t.get("reasons", [])), status))
-        c.commit(); c.close()
-    except Exception as e:
-        logging.error(f"DB Error: {e}")
+<!-- Navigation Header -->
+<div class="header">
+    <div style="display:flex; align-items:center;">
+        <span style="color:#f59e0b; font-weight:800; font-size:13px; margin-right:6px;">BTCUSDT</span>
+        <span class="badge">● FUTURES</span>
+        <span id="active-tag" class="signal-status">ACTIVE: SCANNING</span>
+    </div>
+    <div style="display:flex; align-items:center; gap:8px;">
+        <span id="live-price" class="price-badge">$---.--</span>
+        <button class="vault-btn" onclick="openVault()">📜 VAULT (<span id="vault-count">0</span>)</button>
+    </div>
+</div>
 
-def fetch_klines(interval="1m", limit=120):
-    try:
-        res = requests.get(f"{BASE}/fapi/v1/klines", params={"symbol": SYMBOL, "interval": interval, "limit": limit}, timeout=4).json()
-        if isinstance(res, list) and len(res) > 20:
-            return [{
-                "time": int(b[0] // 1000), "open": float(b[1]), "high": float(b[2]),
-                "low": float(b[3]), "close": float(b[4]), "vol": float(b[5])
-            } for b in res[:-1]]
-    except Exception:
-        pass
-    return []
+<!-- Timeframe Buttons -->
+<div class="tf-bar">
+    <button class="tf-btn" onclick="setTF('1')">1M</button>
+    <button class="tf-btn" onclick="setTF('5')">5M</button>
+    <button class="tf-btn active" onclick="setTF('15')">15M</button>
+    <button class="tf-btn" onclick="setTF('60')">1H</button>
+    <button class="tf-btn" onclick="setTF('240')">4H</button>
+    <button class="tf-btn" onclick="setTF('D')">1D</button>
+</div>
 
-def calculate_atr(candles, period=14):
-    if len(candles) < period + 1: return 40.0
-    trs = [max(candles[i]["high"] - candles[i]["low"],
-               abs(candles[i]["high"] - candles[i-1]["close"]),
-               abs(candles[i]["low"] - candles[i-1]["close"])) for i in range(1, len(candles))]
-    return max(sum(trs[-period:]) / period, 1.0)
+<!-- Live Chart Frame (Self Sustained) -->
+<div id="chart-box">
+    <div id="tv-widget-container" style="width:100%; height:100%;"></div>
+</div>
 
-def gate_5m_sweep_and_mss(c5m, direction):
-    if len(c5m) < 15: return False
-    cur5 = c5m[-1]
-    a5 = calculate_atr(c5m, 14)
-    disp5 = abs(cur5["close"] - cur5["open"]) >= (0.85 * a5)
-    highs = [c["high"] for c in c5m[-10:-2]]
-    lows = [c["low"] for c in c5m[-10:-2]]
-    last_h = max(highs) if highs else cur5["high"]
-    last_l = min(lows) if lows else cur5["low"]
-    if direction == "LONG": return cur5["close"] > last_h and disp5
-    elif direction == "SHORT": return cur5["close"] < last_l and disp5
-    return False
+<!-- Vault Modal -->
+<div id="vaultModal" class="modal">
+    <div class="modal-box">
+        <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #1c2636; padding-bottom:8px; margin-bottom:10px;">
+            <b style="color:#f8fafc; font-size:12px;">SIGNAL & VAULT HISTORY</b>
+            <span style="color:#94a3b8; font-size:16px; cursor:pointer;" onclick="closeVault()">✕</span>
+        </div>
+        <div id="vault-items" style="font-size:11px;">
+            <div style="color:#64748b; text-align:center; padding:15px;">Scanning for SMC entries...</div>
+        </div>
+    </div>
+</div>
 
-def gate_1m_sweep(c1m, direction, lookback=8):
-    if len(c1m) < lookback + 2: return None
-    ref = c1m[-lookback-1:-1]
-    cur = c1m[-1]
-    hi = max(c["high"] for c in ref)
-    lo = min(c["low"] for c in ref)
-    if direction == "LONG" and cur["low"] < lo and cur["close"] > lo:
-        return {"swept": True, "wick": cur["low"]}
-    if direction == "SHORT" and cur["high"] > hi and cur["close"] < hi:
-        return {"swept": True, "wick": cur["high"]}
-    return None
+<!-- TradingView Native CDN (100% Reliable across all mobile devices) -->
+<script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+<script type="text/javascript">
+    let tvWidget = null;
+    let currentInterval = "15";
 
-def gate_1m_displacement(c1m, direction):
-    if len(c1m) < 15: return False
-    cur = c1m[-1]
-    a1 = calculate_atr(c1m, 14)
-    body = abs(cur["close"] - cur["open"])
-    is_displaced = body >= (1.2 * a1)
-    if direction == "LONG": return is_displaced and (cur["close"] > cur["open"])
-    elif direction == "SHORT": return is_displaced and (cur["close"] < cur["open"])
-    return False
+    // 1. Initialize Safe TradingView Chart Widget
+    function loadChart(interval) {
+        currentInterval = interval;
+        const container = document.getElementById("tv-widget-container");
+        container.innerHTML = "";
 
-def gate_1m_fvg_and_ce(c1m, direction, current_price):
-    if len(c1m) < 4: return None
-    c1, c2, c3 = c1m[-4], c1m[-3], c1m[-2]
-    cur = c1m[-1]
-    if direction == "LONG":
-        if c3["low"] > c1["high"] and (c3["low"] - c1["high"]) >= 8.0:
-            ce = c1["high"] + ((c3["low"] - c1["high"]) * 0.5)
-            if (cur["low"] <= ce <= cur["high"]) or abs(current_price - ce) <= 8.0:
-                return {"ce": ce}
-    elif direction == "SHORT":
-        if c3["high"] < c1["low"] and (c1["low"] - c3["high"]) >= 8.0:
-            ce = c3["high"] + ((c1["low"] - c3["high"]) * 0.5)
-            if (cur["low"] <= ce <= cur["high"]) or abs(current_price - ce) <= 8.0:
-                return {"ce": ce}
-    return None
+        tvWidget = new TradingView.widget({
+            "autosize": true,
+            "symbol": "BINANCE:BTCUSDT.P",
+            "interval": interval,
+            "timezone": "Asia/Kolkata",
+            "theme": "dark",
+            "style": "1",
+            "locale": "en",
+            "toolbar_bg": "#06080d",
+            "enable_publishing": false,
+            "hide_top_toolbar": true,
+            "hide_legend": false,
+            "save_image": false,
+            "container_id": "tv-widget-container",
+            "backgroundColor": "#06080d",
+            "gridColor": "rgba(255, 255, 255, 0.03)",
+            "disabled_features": [
+                "use_localstorage_for_settings",
+                "header_widget",
+                "left_toolbar",
+                "control_bar",
+                "timeframes_toolbar"
+            ]
+        });
+    }
 
-class SniperRefinerEngine:
-    def __init__(self):
-        self.active_trade = None
-        self.last_trade_time = 0
+    loadChart("15");
 
-    def manage_positions(self, p):
-        with LOCK:
-            t = self.active_trade
-            if not t: return
+    function setTF(tf) {
+        document.querySelectorAll(".tf-btn").forEach(btn => btn.classList.remove("active"));
+        event.target.classList.add("active");
+        loadChart(tf);
+    }
 
-            risk = abs(t["entry"] - t["sl"]) if abs(t["entry"] - t["sl"]) > 0 else 1.0
+    // 2. Direct Binance Futures Sub-Second Price Stream
+    const ws = new WebSocket("wss://fstream.binance.com/ws/btcusdt@trade");
+    const pEl = document.getElementById("live-price");
+    let lastP = 0;
 
-            if t["dir"] == "LONG":
-                if p >= t["tp1"] and t["stage"] == "OPEN":
-                    t["stage"] = "TP1_DONE"
-                    t["realized_r"] += 0.50 * 3.0
-                    t["remaining_pct"] = 0.50
-                    t["sl"] = t["entry"]
-                    db_upsert_sniper(t, status="OPEN")
-                    send_telegram(f"🎯 <b>[SNIPER] TP1 (+3R) HIT</b>\n50% banked. 🛡 SL to BE (${t['entry']:,.2f})")
+    ws.onmessage = (event) => {
+        try {
+            const data = JSON.parse(event.data);
+            const p = parseFloat(data.p);
+            if (p > 1000) {
+                pEl.innerText = "$" + p.toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+                pEl.style.color = p >= lastP ? "#089981" : "#f43f5e";
+                lastP = p;
+            }
+        } catch(e) {}
+    };
 
-                elif p >= t["tp2"] and t["stage"] == "TP1_DONE":
-                    t["stage"] = "TP2_DONE"
-                    t["realized_r"] += 0.25 * 6.0
-                    t["remaining_pct"] = 0.25
-                    t["sl"] = t["tp1"]
-                    db_upsert_sniper(t, status="OPEN")
-                    send_telegram(f"🎯 <b>[SNIPER] TP2 (+6R) HIT</b>\n25% banked. 🛡 SL trailed to TP1 (${t['tp1']:,.2f})")
+    ws.onclose = () => {
+        setTimeout(() => { location.reload(); }, 5000);
+    };
 
-                if p <= t["sl"]:
-                    if t["stage"] == "OPEN": final_r = -1.0; res = "SL HIT"
-                    elif t["stage"] == "TP1_DONE": final_r = t["realized_r"]; res = "BE EXIT"
-                    else: final_r = t["realized_r"] + (t["remaining_pct"] * 3.0); res = "TP1 TRAIL EXIT"
-                    db_upsert_sniper(t, status="CLOSED", exit_p=p, res=res, final_pnl=round(final_r, 3))
-                    send_telegram(f"🏁 <b>[SNIPER CLOSED] {res}</b> @ ${p:,.2f} | Net: <b>{final_r:+.2f}R</b>")
-                    self.active_trade = None
+    // 3. Render 4-Second Auto-Sync with Signals & Vault
+    async function syncBackend() {
+        try {
+            const res = await fetch("https://btc-live-terminal-2.onrender.com/vault-data", { cache: "no-store" });
+            if (!res.ok) return;
+            const data = await res.json();
 
-                elif p >= t["tp3"] and t["stage"] in ["OPEN", "TP1_DONE", "TP2_DONE"]:
-                    final_r = t["realized_r"] + (t["remaining_pct"] * 10.0)
-                    db_upsert_sniper(t, status="CLOSED", exit_p=p, res="TP3 10R TARGET 🔥", final_pnl=round(final_r, 3))
-                    send_telegram(f"🔥 <b>[SNIPER FULL 10R TARGET!]</b> @ ${p:,.2f} | Net: <b>+{final_r:.2f}R</b>")
-                    self.active_trade = None
-
-            elif t["dir"] == "SHORT":
-                if p <= t["tp1"] and t["stage"] == "OPEN":
-                    t["stage"] = "TP1_DONE"
-                    t["realized_r"] += 0.50 * 3.0
-                    t["remaining_pct"] = 0.50
-                    t["sl"] = t["entry"]
-                    db_upsert_sniper(t, status="OPEN")
-                    send_telegram(f"🎯 <b>[SNIPER] TP1 (+3R) HIT</b>\n50% banked. 🛡 SL to BE (${t['entry']:,.2f})")
-
-                elif p <= t["tp2"] and t["stage"] == "TP1_DONE":
-                    t["stage"] = "TP2_DONE"
-                    t["realized_r"] += 0.25 * 6.0
-                    t["remaining_pct"] = 0.25
-                    t["sl"] = t["tp1"]
-                    db_upsert_sniper(t, status="OPEN")
-                    send_telegram(f"🎯 <b>[SNIPER] TP2 (+6R) HIT</b>\n25% banked. 🛡 SL trailed to TP1 (${t['tp1']:,.2f})")
-
-                if p >= t["sl"]:
-                    if t["stage"] == "OPEN": final_r = -1.0; res = "SL HIT"
-                    elif t["stage"] == "TP1_DONE": final_r = t["realized_r"]; res = "BE EXIT"
-                    else: final_r = t["realized_r"] + (t["remaining_pct"] * 3.0); res = "TP1 TRAIL EXIT"
-                    db_upsert_sniper(t, status="CLOSED", exit_p=p, res=res, final_pnl=round(final_r, 3))
-                    send_telegram(f"🏁 <b>[SNIPER CLOSED] {res}</b> @ ${p:,.2f} | Net: <b>{final_r:+.2f}R</b>")
-                    self.active_trade = None
-
-                elif p <= t["tp3"] and t["stage"] in ["OPEN", "TP1_DONE", "TP2_DONE"]:
-                    final_r = t["realized_r"] + (t["remaining_pct"] * 10.0)
-                    db_upsert_sniper(t, status="CLOSED", exit_p=p, res="TP3 10R TARGET 🔥", final_pnl=round(final_r, 3))
-                    send_telegram(f"🔥 <b>[SNIPER FULL 10R TARGET!]</b> @ ${p:,.2f} | Net: <b>+{final_r:.2f}R</b>")
-                    self.active_trade = None
-
-    def scan_sniper(self, poi_data, c5m, c1m, p):
-        with LOCK:
-            if self.active_trade is not None: return
-            now = time.time()
-            if now - self.last_trade_time < 300: return
-
-            direction = poi_data["dir"]
-            # 1. HTF POI Validation
-            if not (poi_data["low"] <= p <= poi_data["high"]): return
-            # 2. 5M Sweep / MSS
-            if not gate_5m_sweep_and_mss(c5m, direction): return
-            # 3. 1M Sweep
-            sw1 = gate_1m_sweep(c1m, direction)
-            if not sw1: return
-            # 4. 1M Displacement
-            if not gate_1m_displacement(c1m, direction): return
-            # 5. 1M FVG & 50% C.E. Retest
-            fvg_res = gate_1m_fvg_and_ce(c1m, direction, p)
-            if not fvg_res: return
-
-            # Exact Entry
-            entry = fvg_res["ce"]
-            a1 = calculate_atr(c1m, 14)
-
-            if direction == "LONG":
-                sl = sw1["wick"] - (0.2 * a1)
-                risk = entry - sl
-                if risk < 5.0 or risk > 120.0: return
-                tp1 = entry + (3.0 * risk)
-                tp2 = entry + (6.0 * risk)
-                tp3 = entry + (10.0 * risk)
-            else:
-                sl = sw1["wick"] + (0.2 * a1)
-                risk = sl - entry
-                if risk < 5.0 or risk > 120.0: return
-                tp1 = entry - (3.0 * risk)
-                tp2 = entry - (6.0 * risk)
-                tp3 = entry - (10.0 * risk)
-
-            snp = {
-                "id": f"SNP_{int(now*1000)}", "created": datetime.now(timezone.utc).strftime("%H:%M:%S"),
-                "dir": direction, "setup": "HTF POI + 5M MSS + 1M Sweep & C.E.", "score": 92,
-                "entry": round(entry, 2), "sl": round(sl, 2),
-                "tp1": round(tp1, 2), "tp2": round(tp2, 2), "tp3": round(tp3, 2),
-                "realized_r": 0.0, "remaining_pct": 1.0, "stage": "OPEN",
-                "reasons": ["HTF POI", "5M MSS", "1M Sweep", "1M Disp", "50% C.E."]
+            // Active Trade Badge Update
+            const activeTag = document.getElementById("active-tag");
+            if (data.active && data.active.length > 0) {
+                const t = data.active[0];
+                activeTag.innerText = "ACTIVE: [" + (t.type || "TRADE") + "] " + t.dir + " @ $" + Number(t.entry).toFixed(0);
+                activeTag.style.color = "#38bdf8";
+            } else {
+                activeTag.innerText = "ACTIVE: SCANNING";
+                activeTag.style.color = "#64748b";
             }
 
-            self.active_trade = snp
-            self.last_trade_time = now
-            db_upsert_sniper(snp, status="OPEN")
-            send_telegram(
-                f"🎯 <b>[SNIPER EXACT ENTRY]</b>\n\n<b>{direction}</b> @ ${entry:,.2f}\n"
-                f"SL: ${sl:,.2f} (Risk: ${risk:.1f})\nTP1 (3R): ${tp1:,.2f} | TP2 (6R): ${tp2:,.2f} | TP3 (10R): ${tp3:,.2f}"
-            )
+            // Vault Counter & List Update
+            if (data.vault) {
+                document.getElementById("vault-count").innerText = data.vault.length;
+                let html = "";
+                if (data.vault.length === 0) {
+                    html = '<div style="color:#64748b; text-align:center; padding:15px;">No completed trades yet.</div>';
+                } else {
+                    data.vault.forEach(v => {
+                        const pnl = Number(v.pnl || 0);
+                        html += `
+                            <div style="padding:8px 0; border-bottom:1px solid #161e2a;">
+                                <div style="display:flex; justify-content:space-between;">
+                                    <b style="color:#f8fafc;">[${v.tf || '15M'}] ${v.dir || ''} @ $${Number(v.entry || 0).toFixed(1)}</b>
+                                    <span style="color:${pnl >= 0 ? '#089981' : '#f43f5e'}; font-weight:800;">
+                                        ${v.res || v.status} (${pnl >= 0 ? '+' : ''}${pnl}R)
+                                    </span>
+                                </div>
+                                <div style="color:#64748b; font-size:10px; margin-top:2px;">Setup: ${v.setup || 'SMC'}</div>
+                            </div>
+                        `;
+                    });
+                }
+                document.getElementById("vault-items").innerHTML = html;
+            }
+        } catch(e) {}
+    }
 
-def run_sniper_daemon():
-    time.sleep(3)
-    logging.info("🚀 Sniper Execution Daemon Live...")
-    engine = SniperRefinerEngine()
+    setInterval(syncBackend, 4000);
+    syncBackend();
 
-    while True:
-        try:
-            p_res = requests.get(f"{BASE}/fapi/v1/ticker/price", params={"symbol": SYMBOL}, timeout=3).json()
-            p = float(p_res.get("price", 0.0))
+    function openVault() { document.getElementById("vaultModal").style.display = "flex"; }
+    function closeVault() { document.getElementById("vaultModal").style.display = "none"; }
+</script>
+</body>
+</html>
+"""
 
-            if p > 10000:
-                engine.manage_positions(p)
-                pois = []
-                try:
-                    r = requests.get(f"{WORKER_API}/poi-zones", timeout=2)
-                    if r.status_code == 200: pois = r.json()
-                except Exception:
-                    pass
-
-                c5m = fetch_klines("5m", 30)
-                c1m = fetch_klines("1m", 60)
-
-                if pois and c5m and c1m:
-                    for poi in pois:
-                        engine.scan_sniper(poi, c5m, c1m, p)
-
-            time.sleep(4)
-        except Exception as e:
-            logging.error(f"Sniper error: {e}\n{traceback.format_exc()}")
-            time.sleep(4)
-
-if __name__ == "__main__":
-    run_sniper_daemon()
+components.html(TERMINAL_HTML, height=650, scrolling=False)
