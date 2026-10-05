@@ -2,8 +2,15 @@ import os
 import time
 import math
 import sqlite3
+import threading
 from datetime import datetime, timezone
 import requests
+import http.server
+import socketserver
+
+# ============================================================
+# BTCUSDT 24/7 AUTONOMOUS WORKER ENGINE (WITH RENDER PORT SUPPORT)
+# ============================================================
 
 SYMBOL = "BTCUSDT"
 DB_FILE = os.getenv("DB_FILE", "trades_v5.db")
@@ -16,6 +23,16 @@ EVENT_MIN = 85
 EVENT_COOLDOWN = 12 * 60 * 60
 BASE = "https://fapi.binance.com"
 
+# --- 1. RENDER PORT BINDING (Fixes "No open ports detected" error) ---
+def start_dummy_port():
+    port = int(os.environ.get("PORT", 10000))
+    handler = http.server.SimpleHTTPRequestHandler
+    with socketserver.TCPServer(("", port), handler) as httpd:
+        httpd.serve_forever()
+
+threading.Thread(target=start_dummy_port, daemon=True).start()
+
+# --- 2. DATABASE ---
 def db():
     c = sqlite3.connect(DB_FILE, timeout=10)
     c.execute("PRAGMA journal_mode=WAL")
@@ -35,6 +52,7 @@ def init_db():
 
 init_db()
 
+# --- 3. TELEGRAM ---
 def send_telegram(text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -59,6 +77,7 @@ def save_vault(t, exit_p, res, pnl):
     except Exception:
         pass
 
+# --- 4. DATA ENGINE ---
 def futures_get(path, params=None, timeout=4):
     try:
         r = requests.get(BASE + path, params=params or {}, timeout=timeout)
@@ -81,11 +100,6 @@ def fetch_price():
     try: return float(x["price"])
     except Exception: return 0.0
 
-def fetch_funding():
-    x = futures_get("/fapi/v1/premiumIndex", {"symbol": SYMBOL})
-    try: return float(x["lastFundingRate"])
-    except Exception: return 0.0
-
 def fetch_oi():
     x = futures_get("/fapi/v1/openInterest", {"symbol": SYMBOL})
     try: return float(x["openInterest"])
@@ -102,6 +116,7 @@ def volume_ratio(candles, period=20):
     avg = sum(x["vol"] for x in candles[-period - 1:-1]) / period
     return candles[-1]["vol"] / avg if avg else 1.0
 
+# --- 5. SMC STRUCTURE ---
 def confirmed_swings(candles, left=2, right=2):
     highs, lows = [], []
     for i in range(left, len(candles) - right):
@@ -200,7 +215,7 @@ def score(direction, d):
     if d.get("rsi_ok"): pts += 5; why.append("RSI momentum +5")
     return min(105, pts), why
 
-# Standalone 24/7 Execution Loop
+# --- 6. 24/7 BACKGROUND EXECUTION LOOP ---
 print("🚀 BTCUSDT Autonomous Worker Initialized. Running 24/7...")
 send_telegram("🚀 <b>BTCUSDT SMC Worker Started</b> | 24/7 Autonomous Background Scanning Active.")
 
@@ -231,7 +246,7 @@ while True:
             oi = fetch_oi()
             last_derivatives = now
 
-        # Active Trade Management
+        # Active Trade Management (BE + Trailing)
         if price > 10000:
             for tf, t in list(normal.items()):
                 if not t: continue
@@ -434,5 +449,5 @@ while True:
                         )
 
         time.sleep(3)
-    except Exception as e:
+    except Exception:
         time.sleep(5)
