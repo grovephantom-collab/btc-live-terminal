@@ -11,7 +11,7 @@ from flask import Flask, jsonify
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [TOP-LEVEL-QUANT] %(message)s"
+    format="%(asctime)s [%(levelname)s] [SMC-QUANT-CORE] %(message)s"
 )
 
 app = Flask(__name__)
@@ -22,16 +22,19 @@ BASE = "https://fapi.binance.com"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8941403990:AAGLH_dupqmGoipglhVvRuiPBzvgMqJR3Ms")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7886716805")
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 
 LOCK = threading.RLock()
 STARTED_FLAG = False
 
-# ---------------- TOP-LEVEL MARKET DATA HUB ----------------
+# ---------------- QUANT DATA HUB ----------------
 DATA_HUB = {
     "price": 0.0,
     "funding_rate": 0.0,
     "book_imbalance": 0.0,
     "oi_delta": 0.0,
+    "open_interest": 0.0,
+    "recent_liquidations": {"long_vol": 0.0, "short_vol": 0.0},
     "session_tag": "ASIAN",
     "klines": {"1m": [], "5m": [], "15m": [], "1h": [], "4h": [], "1d": []},
     "last_sync": 0.0
@@ -41,7 +44,7 @@ ACTIVE_TRADES = []
 ACTIVE_POIS = []
 
 def db():
-    c = sqlite3.connect(DB_FILE, timeout=25)
+    c = sqlite3.connect(DB_FILE, timeout=30)
     c.execute("PRAGMA journal_mode=WAL")
     return c
 
@@ -97,7 +100,7 @@ def send_telegram(text):
 @app.route("/")
 @app.route("/healthz")
 def health():
-    return "BTCUSDT Top-Level Candle Engine Active 24/7", 200
+    return "BTCUSDT Institutional Engine Live 24/7", 200
 
 @app.route("/price")
 def api_price():
@@ -105,6 +108,7 @@ def api_price():
         "symbol": SYMBOL,
         "price": DATA_HUB["price"],
         "funding": DATA_HUB["funding_rate"],
+        "imbalance": DATA_HUB["book_imbalance"],
         "session": DATA_HUB["session_tag"]
     }), 200
 
@@ -126,16 +130,20 @@ def api_vault_data():
     except Exception:
         return jsonify({"vault": [], "active": [], "pois": []}), 500
 
-# ---------------- TOP-LEVEL CANDLESTICK & FOOTPRINT MATH ----------------
+# ---------------- SAFE FETCH WITH BUFFER GUARD ----------------
 def fetch_klines(interval, limit=80):
     try:
         r = requests.get(f"{BASE}/fapi/v1/klines", params={"symbol": SYMBOL, "interval": interval, "limit": limit}, timeout=4).json()
         if isinstance(r, list) and len(r) > 10:
-            return [{
-                "time": int(b[0] // 1000), "open": float(b[1]), "high": float(b[2]),
-                "low": float(b[3]), "close": float(b[4]), "vol": float(b[5]),
-                "quote_vol": float(b[7]), "trades": int(b[8]), "taker_buy_vol": float(b[9])
-            } for b in r[:-1]]
+            parsed = []
+            for b in r[:-1]:
+                if len(b) >= 10:
+                    parsed.append({
+                        "time": int(b[0] // 1000), "open": float(b[1]), "high": float(b[2]),
+                        "low": float(b[3]), "close": float(b[4]), "vol": float(b[5]),
+                        "taker_buy_vol": float(b[9])
+                    })
+            return parsed
     except Exception:
         pass
     return []
@@ -148,20 +156,13 @@ def get_current_session():
     return "US POST-MARKET"
 
 def analyze_candle_mechanics(c):
-    """
-    Decodes candle internals:
-    - Absorption Ratio (Wick vs Body)
-    - Taker Delta (Aggressive Buying vs Aggressive Selling)
-    - Institutional Displacement Body Ratio
-    """
     total_range = max(c["high"] - c["low"], 0.1)
     body = abs(c["close"] - c["open"])
     body_ratio = body / total_range
     
-    # Aggressive Volume Delta
     taker_buy = c.get("taker_buy_vol", 0.0)
     total_vol = max(c.get("vol", 1.0), 1.0)
-    taker_sell = total_vol - taker_buy
+    taker_sell = max(total_vol - taker_buy, 0.0)
     volume_delta = (taker_buy - taker_sell) / total_vol
 
     upper_wick = c["high"] - max(c["open"], c["close"])
@@ -169,12 +170,10 @@ def analyze_candle_mechanics(c):
 
     return {
         "body_ratio": body_ratio,
-        "upper_wick_ratio": upper_wick / total_range,
-        "lower_wick_ratio": lower_wick / total_range,
         "volume_delta": volume_delta,
-        "is_displacement": (body_ratio >= 0.70),
-        "bullish_absorption": (lower_wick / total_range >= 0.55 and volume_delta < 0.0), # Aggressive sellers got absorbed by limit buyers
-        "bearish_absorption": (upper_wick / total_range >= 0.55 and volume_delta > 0.0)  # Aggressive buyers got absorbed by limit sellers
+        "is_displacement": (body_ratio >= 0.65),
+        "bullish_absorption": (lower_wick / total_range >= 0.50 and volume_delta < 0.0),
+        "bearish_absorption": (upper_wick / total_range >= 0.50 and volume_delta > 0.0)
     }
 
 def calculate_atr(candles, period=14):
@@ -183,7 +182,26 @@ def calculate_atr(candles, period=14):
            for i, c in enumerate(candles) if i > 0]
     return max(sum(trs[-period:]) / period, 1.0)
 
-# ---------------- MARKET HUB SYNC ----------------
+def detect_sweep(candles, lookback=8):
+    if len(candles) < lookback + 2: return None
+    ref = candles[-lookback-1:-1]
+    cur = candles[-1]
+    hi, lo = max(c["high"] for c in ref), min(c["low"] for c in ref)
+    if cur["low"] < lo and cur["close"] > lo: return {"dir": "LONG", "wick": cur["low"], "level": lo}
+    if cur["high"] > hi and cur["close"] < hi: return {"dir": "SHORT", "wick": cur["high"], "level": hi}
+    return None
+
+def detect_fvg(candles):
+    if len(candles) < 4: return None
+    c1, c3 = candles[-4], candles[-2]
+    cur = candles[-1]
+    if c3["low"] > c1["high"] and (c3["low"] - c1["high"]) >= 5.0:
+        if cur["low"] <= c3["low"]: return {"dir": "LONG", "low": c1["high"], "high": c3["low"]}
+    if c3["high"] < c1["low"] and (c1["low"] - c3["high"]) >= 5.0:
+        if cur["high"] >= c3["high"]: return {"dir": "SHORT", "low": c3["high"], "high": c1["low"]}
+    return None
+
+# ---------------- MARKET SYNC ----------------
 def sync_market_hub():
     global DATA_HUB
     try:
@@ -194,22 +212,30 @@ def sync_market_hub():
             k = fetch_klines(tf, 70)
             if k: DATA_HUB["klines"][tf] = k
 
-        # Derivatives & Order Book Depth
+        # Funding Rate
         fr_res = requests.get(f"{BASE}/fapi/v1/premiumIndex", params={"symbol": SYMBOL}, timeout=3).json()
         DATA_HUB["funding_rate"] = float(fr_res.get("lastFundingRate", 0.0))
 
+        # Order Book Imbalance
         depth_res = requests.get(f"{BASE}/fapi/v1/depth", params={"symbol": SYMBOL, "limit": 20}, timeout=3).json()
         bids = sum(float(b[1]) for b in depth_res.get("bids", []))
         asks = sum(float(a[1]) for a in depth_res.get("asks", []))
         if bids + asks > 0:
             DATA_HUB["book_imbalance"] = round((bids - asks) / (bids + asks), 3)
 
+        # Open Interest
+        oi_res = requests.get(f"{BASE}/fapi/v1/openInterest", params={"symbol": SYMBOL}, timeout=3).json()
+        cur_oi = float(oi_res.get("openInterest", 0.0))
+        if DATA_HUB["open_interest"] > 0:
+            DATA_HUB["oi_delta"] = cur_oi - DATA_HUB["open_interest"]
+        DATA_HUB["open_interest"] = cur_oi
+
         DATA_HUB["session_tag"] = get_current_session()
         DATA_HUB["last_sync"] = time.time()
     except Exception as e:
-        logging.warning(f"Market hub sync warning: {e}")
+        logging.warning(f"Sync warning: {e}")
 
-# ---------------- POSITION TRAILING & LIFECYCLE ----------------
+# ---------------- MANAGE POSITIONS ----------------
 def manage_positions(p):
     global ACTIVE_TRADES
     with LOCK:
@@ -220,7 +246,7 @@ def manage_positions(p):
                 if p >= t["tp1"] and t["stage"] == "OPEN":
                     t["stage"] = "TP1_DONE"
                     t["realized_r"] += 0.50 * 2.0
-                    t["sl"] = entry # Breakeven
+                    t["sl"] = entry
                     send_telegram(f"🎯 <b>[{t['type']}] TP1 HIT (+2R)</b>\n50% secured. 🛡 SL moved to <b>Breakeven (${entry:,.2f})</b>")
                 elif p >= t["tp2"] and t["stage"] == "TP1_DONE":
                     t["stage"] = "TP2_DONE"
@@ -243,7 +269,7 @@ def manage_positions(p):
                 if p <= t["tp1"] and t["stage"] == "OPEN":
                     t["stage"] = "TP1_DONE"
                     t["realized_r"] += 0.50 * 2.0
-                    t["sl"] = entry # Breakeven
+                    t["sl"] = entry
                     send_telegram(f"🎯 <b>[{t['type']}] TP1 HIT (+2R)</b>\n50% secured. 🛡 SL moved to <b>Breakeven (${entry:,.2f})</b>")
                 elif p <= t["tp2"] and t["stage"] == "TP1_DONE":
                     t["stage"] = "TP2_DONE"
@@ -277,9 +303,9 @@ def save_closed(t, exit_p, res, pnl):
         c.commit()
         c.close()
     except Exception as e:
-        logging.error(f"DB close save error: {e}")
+        logging.error(f"DB save error: {e}")
 
-# ---------------- TOP-LEVEL INSTITUTIONAL CANDLE SCANNER ----------------
+# ---------------- QUANT SCANNER ----------------
 LAST_SCAN_TIME = 0
 
 def master_execution_scan():
@@ -287,24 +313,20 @@ def master_execution_scan():
     with LOCK:
         if len(ACTIVE_TRADES) >= 2: return
         now = time.time()
-        if now - LAST_SCAN_TIME < 40: return
+        if now - LAST_SCAN_TIME < 30: return
 
         c15 = DATA_HUB["klines"].get("15m", [])
-        c5 = DATA_HUB["klines"].get("5m", [])
         c1 = DATA_HUB["klines"].get("1m", [])
         c4h = DATA_HUB["klines"].get("4h", [])
         p = DATA_HUB["price"]
 
-        if len(c15) < 25 or len(c1) < 15: return
+        if len(c15) < 20 or len(c1) < 15: return
 
-        # Candle Physics Analysis on Last Closed 15M Bar
         cur15 = c15[-1]
         phys = analyze_candle_mechanics(cur15)
         a15 = calculate_atr(c15, 14)
-        a1 = calculate_atr(c1, 14)
 
-        # High/Low Ranges
-        ref15 = c15[-12:-1]
+        ref15 = c15[-10:-1]
         hi15, lo15 = max(x["high"] for x in ref15), min(x["low"] for x in ref15)
 
         direction = None
@@ -312,7 +334,7 @@ def master_execution_scan():
         category = "NORMAL"
         setup_note = ""
 
-        # 1. CANDLE ABSORPTION PURGE (Highest Winrate Pattern)
+        # Setup 1: Candle Absorption Purge (Sniper)
         if cur15["low"] < lo15 and phys["bullish_absorption"]:
             direction = "LONG"
             setup_id = "INST_15M_ABSORPTION_SWEEP"
@@ -324,19 +346,19 @@ def master_execution_scan():
             category = "SNIPER"
             setup_note = "Institutional Absorption (Buyers Exhausted at Highs)"
 
-        # 2. DISPLACEMENT EXPANSION (True Breakout Confirmation)
-        elif phys["is_displacement"] and cur15["close"] > hi15 and phys["volume_delta"] > 0.20:
+        # Setup 2: Displacement Expansion (>65% Body)
+        elif phys["is_displacement"] and cur15["close"] > hi15 and phys["volume_delta"] > 0.15:
             direction = "LONG"
             setup_id = "INST_15M_EXPANSION_DISPLACEMENT"
             category = "NORMAL"
-            setup_note = "Full Body Displacement (>70% Expansion)"
-        elif phys["is_displacement"] and cur15["close"] < lo15 and phys["volume_delta"] < -0.20:
+            setup_note = "Displacement Candle Expansion"
+        elif phys["is_displacement"] and cur15["close"] < lo15 and phys["volume_delta"] < -0.15:
             direction = "SHORT"
             setup_id = "INST_15M_EXPANSION_DISPLACEMENT"
             category = "NORMAL"
-            setup_note = "Full Body Displacement (>70% Expansion)"
+            setup_note = "Displacement Candle Expansion"
 
-        # 3. HTF SESSION EXTREME LIQUIDITY RUNNER
+        # Setup 3: 4H Macro Sweep Runner
         elif len(c4h) > 10:
             c4h_cur = c4h[-1]
             c4h_ref = c4h[-8:-1]
@@ -354,7 +376,6 @@ def master_execution_scan():
 
         if not direction: return
 
-        # Database Gatekeeper
         c = db()
         strat_info = c.execute("SELECT stage, kelly_fraction FROM quantitative_strategies WHERE strategy_id=?", (setup_id,)).fetchone()
         c.close()
@@ -410,12 +431,23 @@ def master_execution_scan():
             f"🧬 <b>Strategy ID:</b> {setup_id}"
         )
 
-# ---------------- ENGINE RUNNERS ----------------
+# ---------------- KEEP-ALIVE DAEMON (PREVENTS SLEEP ON RENDER) ----------------
+def keep_alive_ping():
+    time.sleep(60)
+    while True:
+        try:
+            url = RENDER_EXTERNAL_URL or "http://127.0.0.1:10000/healthz"
+            requests.get(url, timeout=5)
+        except Exception:
+            pass
+        time.sleep(600) # Ping every 10 minutes
+
+# ---------------- EXECUTION RUNNER ----------------
 def master_loop():
     global STARTED_FLAG
     time.sleep(3)
     if not STARTED_FLAG:
-        send_telegram("🏛 <b>Top-Level Candlestick Physics Engine Live</b>\nFootprint Absorption, Displacement & Session Liquidity active.")
+        send_telegram("🏛 <b>BTC Institutional Engine Live 24/7</b>\nSelf-KeepAlive & Candle Physics Active.")
         STARTED_FLAG = True
 
     while True:
@@ -427,10 +459,11 @@ def master_loop():
                 master_execution_scan()
             time.sleep(3)
         except Exception as e:
-            logging.error(f"Loop execution warning: {e}")
+            logging.error(f"Loop warning: {e}")
             time.sleep(4)
 
 threading.Thread(target=master_loop, daemon=True).start()
+threading.Thread(target=keep_alive_ping, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
