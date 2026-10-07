@@ -9,14 +9,12 @@ from flask import Flask, jsonify
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [BYBIT-ENGINE-LIVE] %(message)s"
+    format="%(asctime)s [%(levelname)s] [COINBASE-US-ENGINE] %(message)s"
 )
 
 app = Flask(__name__)
 
-SYMBOL = "BTCUSDT"
 DB_FILE = os.getenv("DB_FILE", "trades_v5.db")
-
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8941403990:AAGLH_dupqmGoipglhVvRuiPBzvgMqJR3Ms")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7886716805")
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
@@ -25,7 +23,8 @@ LOCK = threading.RLock()
 STARTED_FLAG = False
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json"
 }
 
 DATA_HUB = {
@@ -72,7 +71,7 @@ def send_telegram(text):
 @app.route("/")
 @app.route("/healthz")
 def health():
-    return "Gautam Jha 2.0 Live Engine Active", 200
+    return "BTC Institutional Engine 100% Active", 200
 
 @app.route("/vault-data")
 def api_vault_data():
@@ -100,62 +99,70 @@ def api_vault_data():
     except Exception:
         return jsonify({"vault": [], "active": [], "pois": []}), 500
 
-# Bybit Live Ticker Feed (Bypasses Render Geoblocks)
-def fetch_bybit_price():
-    url = "https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT"
+# 1. COINBASE US LIVE PRICE (100% Bypass for Render Cloud)
+def fetch_coinbase_price():
     try:
+        url = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
         r = requests.get(url, headers=HEADERS, timeout=4).json()
-        list_data = r.get("result", {}).get("list", [])
-        if list_data:
-            return float(list_data[0]["lastPrice"])
+        if "data" in r and "amount" in r["data"]:
+            return float(r["data"]["amount"])
     except Exception as e:
-        logging.warning(f"Bybit price error: {e}")
+        logging.warning(f"Coinbase price err: {e}")
+    
+    # Backup: Kraken US
+    try:
+        r2 = requests.get("https://api.kraken.com/0/public/Ticker?pair=XBTUSD", headers=HEADERS, timeout=4).json()
+        res = r2.get("result", {})
+        pair = next(iter(res.values()))
+        return float(pair["c"][0])
+    except Exception:
+        pass
     return 0.0
 
-# Bybit Daily High/Low (PDH / PDL)
-def fetch_bybit_daily():
-    url = "https://api.bybit.com/v5/market/kline?category=linear&symbol=BTCUSDT&interval=D&limit=3"
+# 2. COINBASE CANDLES (15M Timeframe)
+def fetch_coinbase_15m():
     try:
+        # Granularity 900 = 15 minutes
+        url = "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=900"
         r = requests.get(url, headers=HEADERS, timeout=4).json()
-        raw = r.get("result", {}).get("list", [])
-        if len(raw) >= 2:
-            prev_d = raw[1] # [startTime, open, high, low, close, volume, turnover]
-            return float(prev_d[2]), float(prev_d[3])
-    except Exception as e:
-        logging.warning(f"Bybit daily error: {e}")
-    return 0.0, 0.0
-
-# Bybit 15M Candles
-def fetch_bybit_15m():
-    url = "https://api.bybit.com/v5/market/kline?category=linear&symbol=BTCUSDT&interval=15&limit=40"
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=4).json()
-        raw = r.get("result", {}).get("list", [])
-        if len(raw) > 10:
+        if isinstance(r, list) and len(r) > 10:
             parsed = []
-            # Bybit sends latest first, so reverse to chronological order
-            for b in reversed(raw[1:]): # Exclude current running candle
+            # Coinbase format: [time, low, high, open, close, volume] (newest first)
+            for b in reversed(r[1:45]): # reverse to chronological
                 parsed.append({
-                    "time": int(b[0]) // 1000,
-                    "open": float(b[1]),
+                    "time": int(b[0]),
+                    "low": float(b[1]),
                     "high": float(b[2]),
-                    "low": float(b[3]),
+                    "open": float(b[3]),
                     "close": float(b[4]),
                     "vol": float(b[5])
                 })
             return parsed
     except Exception as e:
-        logging.warning(f"Bybit 15m error: {e}")
+        logging.warning(f"Coinbase 15m err: {e}")
     return []
+
+# 3. DAILY HIGH / LOW (PDH / PDL)
+def fetch_coinbase_daily():
+    try:
+        # Granularity 86400 = 1 Day
+        url = "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=86400"
+        r = requests.get(url, headers=HEADERS, timeout=4).json()
+        if isinstance(r, list) and len(r) >= 2:
+            prev_d = r[1] # completed previous day
+            return float(prev_d[2]), float(prev_d[1]) # High, Low
+    except Exception as e:
+        logging.warning(f"Coinbase daily err: {e}")
+    return 0.0, 0.0
 
 def get_current_session():
     utc_hr = datetime.now(timezone.utc).hour
-    if 0 <= utc_hr < 7: return "ASIAN (RANGE)"
-    elif 7 <= utc_hr < 13: return "LONDON (TRAP / EXPANSION)"
-    elif 13 <= utc_hr < 21: return "NEW YORK (TREND ENGINE)"
+    if 0 <= utc_hr < 7: return "ASIAN RANGE"
+    elif 7 <= utc_hr < 13: return "LONDON TRAP/EXPANSION"
+    elif 13 <= utc_hr < 21: return "NEW YORK TREND"
     return "SESSION CLOSE"
 
-# ---------------- GAUTAM JHA 2.0 STRATEGY SCANNER ----------------
+# ---------------- GAUTAM JHA 2.0 LOGIC ENGINE ----------------
 def scan_masterclass_2_setups(c15, pdh, pdl, p):
     if len(c15) < 15 or p <= 1000.0: 
         return None
@@ -172,7 +179,7 @@ def scan_masterclass_2_setups(c15, pdh, pdl, p):
     swing_high = max(x["high"] for x in ref)
     swing_low = min(x["low"] for x in ref)
 
-    # 1. 2.0 PDL REVERSAL TRAP
+    # Setup 1: 2.0 PDL REVERSAL TRAP
     if pdl > 0 and cur["low"] < pdl and cur["close"] > pdl:
         if cur["close"] > prev["high"] or (lower_wick / candle_range >= 0.28):
             sl = round(cur["low"] - 25.0, 2)
@@ -190,7 +197,7 @@ def scan_masterclass_2_setups(c15, pdh, pdl, p):
                     "tp3": round(p + (5.0 * risk), 2)
                 }
 
-    # 2. 2.0 PDH REVERSAL TRAP
+    # Setup 2: 2.0 PDH REVERSAL TRAP
     if pdh > 0 and cur["high"] > pdh and cur["close"] < pdh:
         if cur["close"] < prev["low"] or (upper_wick / candle_range >= 0.28):
             sl = round(cur["high"] + 25.0, 2)
@@ -208,7 +215,7 @@ def scan_masterclass_2_setups(c15, pdh, pdl, p):
                     "tp3": round(p - (5.0 * risk), 2)
                 }
 
-    # 3. 1.0 SWING HIGH / LOW HUNT
+    # Setup 3: 1.0 SWING SWEEPS
     if cur["low"] < swing_low and cur["close"] > swing_low and cur["close"] > cur["open"]:
         sl = round(cur["low"] - 25.0, 2)
         risk = p - sl
@@ -241,7 +248,7 @@ def scan_masterclass_2_setups(c15, pdh, pdl, p):
                 "tp3": round(p - (5.0 * risk), 2)
             }
 
-    # 4. MOMENTUM EXPANSION (Trend Run)
+    # Setup 4: MOMENTUM EXPANSION (Waterfall Breakdown / Breakout)
     if body / candle_range >= 0.58:
         if cur["close"] > swing_high and cur["close"] > cur["open"]:
             sl = round(cur["open"] - 25.0, 2)
@@ -279,16 +286,16 @@ def scan_masterclass_2_setups(c15, pdh, pdl, p):
 def sync_market_hub():
     global DATA_HUB, ACTIVE_POIS
     try:
-        p = fetch_bybit_price()
+        p = fetch_coinbase_price()
         if p > 0.0:
             DATA_HUB["price"] = p
 
-        pdh, pdl = fetch_bybit_daily()
+        pdh, pdl = fetch_coinbase_daily()
         if pdh > 0.0 and pdl > 0.0:
             DATA_HUB["pdh"] = pdh
             DATA_HUB["pdl"] = pdl
 
-        k15 = fetch_bybit_15m()
+        k15 = fetch_coinbase_15m()
         if k15:
             DATA_HUB["klines_15m"] = k15
             ref = k15[-14:]
@@ -303,7 +310,7 @@ def sync_market_hub():
         DATA_HUB["session_tag"] = get_current_session()
         DATA_HUB["last_sync"] = time.time()
     except Exception as e:
-        logging.warning(f"Sync issue: {e}")
+        logging.warning(f"Sync loop error: {e}")
 
 def manage_positions(p):
     global ACTIVE_TRADES
@@ -437,7 +444,7 @@ def master_loop():
     global STARTED_FLAG
     time.sleep(3)
     if not STARTED_FLAG:
-        send_telegram("🚀 <b>GAUTAM JHA ENGINE UNBLOCKED (BYBIT FEED)</b>\nReal-time Data Active. Monitoring 15M Traps.")
+        send_telegram("🚀 <b>GAUTAM JHA ENGINE UNBLOCKED (COINBASE ROUTE)</b>\nReal-time Data Connected. 24/7 Scanning Active.")
         STARTED_FLAG = True
 
     while True:
