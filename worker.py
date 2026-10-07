@@ -1,6 +1,5 @@
 import os
 import time
-import math
 import sqlite3
 import logging
 import threading
@@ -10,7 +9,7 @@ from flask import Flask, jsonify
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [PRO-TRADER-AI-ENGINE] %(message)s"
+    format="%(asctime)s [%(levelname)s] [GAUTAM-JHA-2.0] %(message)s"
 )
 
 app = Flask(__name__)
@@ -28,10 +27,10 @@ STARTED_FLAG = False
 
 DATA_HUB = {
     "price": 0.0,
-    "funding_rate": 0.0,
-    "book_imbalance": 0.0,
+    "pdh": 0.0,
+    "pdl": 0.0,
     "session_tag": "ASIAN",
-    "klines": {"15m": []},
+    "klines_15m": [],
     "last_sync": 0.0
 }
 
@@ -70,7 +69,7 @@ def send_telegram(text):
 @app.route("/")
 @app.route("/healthz")
 def health():
-    return "BTC Institutional AI Engine Active", 200
+    return "Gautam Jha 2.0 Engine Live", 200
 
 @app.route("/vault-data")
 def api_vault_data():
@@ -96,20 +95,29 @@ def api_vault_data():
     except Exception:
         return jsonify({"vault": [], "active": [], "pois": []}), 500
 
-def fetch_klines(interval="15m", limit=60):
+def fetch_daily_pdh_pdl():
+    try:
+        r = requests.get(f"{BASE}/fapi/v1/klines", params={"symbol": SYMBOL, "interval": "1d", "limit": 3}, timeout=4).json()
+        if isinstance(r, list) and len(r) >= 2:
+            prev_day = r[-2] # Completed previous day candle
+            return float(prev_day[2]), float(prev_day[3])
+    except Exception:
+        pass
+    return 0.0, 0.0
+
+def fetch_klines(interval="15m", limit=50):
     try:
         r = requests.get(f"{BASE}/fapi/v1/klines", params={"symbol": SYMBOL, "interval": interval, "limit": limit}, timeout=4).json()
         if isinstance(r, list) and len(r) > 10:
             parsed = []
-            for b in r[:-1]:
+            for b in r[:-1]: # Closed candles only
                 parsed.append({
                     "time": int(b[0] // 1000), 
                     "open": float(b[1]), 
-                    "high": float(b[2]),
+                    "high": float(b[2]), 
                     "low": float(b[3]), 
                     "close": float(b[4]), 
-                    "vol": float(b[5]),
-                    "taker_buy": float(b[9]) if len(b) > 9 else float(b[5]) * 0.5
+                    "vol": float(b[5])
                 })
             return parsed
     except Exception:
@@ -118,116 +126,130 @@ def fetch_klines(interval="15m", limit=60):
 
 def get_current_session():
     utc_hr = datetime.now(timezone.utc).hour
-    if 0 <= utc_hr < 7: return "ASIAN (RANGE ACCUMULATION)"
-    elif 7 <= utc_hr < 13: return "LONDON (MANIPULATION / EXPANSION)"
-    elif 13 <= utc_hr < 21: return "NEW YORK (TREND EXECUTION)"
-    return "US CLOSE"
+    if 0 <= utc_hr < 7: return "ASIAN (RANGE)"
+    elif 7 <= utc_hr < 13: return "LONDON (TRAP / EXPANSION)"
+    elif 13 <= utc_hr < 21: return "NEW YORK (TREND ENGINE)"
+    return "SESSION CLOSE"
 
-def calculate_atr(candles, period=14):
-    if len(candles) < period + 1: return 60.0
-    trs = [max(c["high"] - c["low"], abs(c["high"] - candles[i-1]["close"]), abs(c["low"] - candles[i-1]["close"])) 
-           for i, c in enumerate(candles) if i > 0]
-    return max(sum(trs[-period:]) / period, 15.0)
-
-# ================= PRO TRADER REASONING MATRIX =================
-def evaluate_pro_trader_narrative(candles, current_price):
-    if len(candles) < 20: 
+# ---------------- GAUTAM JHA 2.0 DECISION MATRIX ----------------
+def scan_masterclass_2_setups(c15, pdh, pdl, p):
+    if len(c15) < 15: 
         return None
 
-    cur = candles[-1]
-    prev = candles[-2]
-    atr = calculate_atr(candles, 14)
+    cur = c15[-1]
+    prev = c15[-2]
 
-    # 1. Structural Benchmarks
-    swing_pool = candles[-15:-1]
-    swing_high = max(x["high"] for x in swing_pool)
-    swing_low = min(x["low"] for x in swing_pool)
-    avg_vol = sum(x["vol"] for x in swing_pool) / len(swing_pool)
-
-    # Candle Anatomy
-    total_range = max(cur["high"] - cur["low"], 1.0)
+    candle_range = max(cur["high"] - cur["low"], 1.0)
     body = abs(cur["close"] - cur["open"])
-    upper_wick = cur["high"] - max(cur["open"], cur["close"])
     lower_wick = min(cur["open"], cur["close"]) - cur["low"]
-    
-    vol_surge = cur["vol"] > (1.2 * avg_vol)
-    bullish_candle = cur["close"] > cur["open"]
-    bearish_candle = cur["close"] < cur["open"]
+    upper_wick = cur["high"] - max(cur["open"], cur["close"])
 
-    long_score = 0
-    short_score = 0
-    signals_notes = []
+    ref = c15[-14:-2]
+    swing_high = max(x["high"] for x in ref)
+    swing_low = min(x["low"] for x in ref)
 
-    # CONTEXT 1: LIQUIDITY SWEEP & SPRING TRAP (Institutional Reversal)
-    if cur["low"] < swing_low and cur["close"] > swing_low:
-        long_score += 45
-        signals_notes.append("SSL Swept (Retail Stop Runs Absorbed)")
-        if lower_wick / total_range >= 0.35:
-            long_score += 25
-            signals_notes.append("Rejection Wick Confirmed")
-    
-    if cur["high"] > swing_high and cur["close"] < swing_high:
-        short_score += 45
-        signals_notes.append("BSL Swept (Retail Breakout Buyers Trapped)")
-        if upper_wick / total_range >= 0.35:
-            short_score += 25
-            signals_notes.append("Bearish Exhaustion Wick Confirmed")
+    # 1. STRATEGY 2.0: PREVIOUS DAY LOW (PDL) REVERSAL TRAP
+    if pdl > 0 and cur["low"] < pdl and cur["close"] > pdl:
+        if cur["close"] > prev["high"] or (lower_wick / candle_range >= 0.35):
+            sl = round(cur["low"] - 25.0, 2)
+            risk = p - sl
+            if 40.0 <= risk <= 650.0:
+                return {
+                    "dir": "LONG",
+                    "category": "2.0_PDL_TRAP",
+                    "setup": "Masterclass 2.0: PDL Swept + Green Confirmation (Retail Sellers Trapped)",
+                    "entry": p,
+                    "sl": sl,
+                    "risk": risk,
+                    "tp1": round(p + (2.0 * risk), 2),
+                    "tp2": round(p + (3.5 * risk), 2),
+                    "tp3": round(p + (5.0 * risk), 2)
+                }
 
-    # CONTEXT 2: WATERFALL MOMENTUM & DISPLACEMENT EXPANSION (Trend Run)
-    if bearish_candle and body / total_range >= 0.60 and cur["close"] < swing_low:
-        short_score += 55
-        signals_notes.append("Institutional Waterfall Displacement below Range")
-        if vol_surge:
-            short_score += 20
-            signals_notes.append("High Volume Panic Dump")
+    # 2. STRATEGY 2.0: PREVIOUS DAY HIGH (PDH) REVERSAL TRAP
+    if pdh > 0 and cur["high"] > pdh and cur["close"] < pdh:
+        if cur["close"] < prev["low"] or (upper_wick / candle_range >= 0.35):
+            sl = round(cur["high"] + 25.0, 2)
+            risk = sl - p
+            if 40.0 <= risk <= 650.0:
+                return {
+                    "dir": "SHORT",
+                    "category": "2.0_PDH_TRAP",
+                    "setup": "Masterclass 2.0: PDH Swept + Red Confirmation (Retail Buyers Trapped)",
+                    "entry": p,
+                    "sl": sl,
+                    "risk": risk,
+                    "tp1": round(p - (2.0 * risk), 2),
+                    "tp2": round(p - (3.5 * risk), 2),
+                    "tp3": round(p - (5.0 * risk), 2)
+                }
 
-    if bullish_candle and body / total_range >= 0.60 and cur["close"] > swing_high:
-        long_score += 55
-        signals_notes.append("Institutional Breakout Expansion above Range")
-        if vol_surge:
-            long_score += 20
-            signals_notes.append("High Volume Aggressive Bid Expansion")
+    # 3. STRATEGY 1.0: SWING HIGH/LOW LIQUIDITY HUNT
+    if cur["low"] < swing_low and cur["close"] > swing_low and cur["close"] > cur["open"]:
+        sl = round(cur["low"] - 25.0, 2)
+        risk = p - sl
+        if 40.0 <= risk <= 650.0:
+            return {
+                "dir": "LONG",
+                "category": "1.0_SWING_SWEEP",
+                "setup": "Masterclass 1.0: Liquidity Hunt at Support Swing + Reversal Close",
+                "entry": p,
+                "sl": sl,
+                "risk": risk,
+                "tp1": round(p + (2.0 * risk), 2),
+                "tp2": round(p + (3.5 * risk), 2),
+                "tp3": round(p + (5.0 * risk), 2)
+            }
 
-    # CONTEXT 3: FVG IMBALANCE TAPS (SMC Continuation)
-    c1, c3 = candles[-3], cur
-    if c3["low"] > c1["high"] and (c3["low"] - c1["high"]) > 10.0:
-        if cur["close"] > c3["open"]:
-            long_score += 30
-            signals_notes.append("Bullish FVG Continuation")
-    elif c1["low"] > c3["high"] and (c1["low"] - c3["high"]) > 10.0:
-        if cur["close"] < c3["open"]:
-            short_score += 30
-            signals_notes.append("Bearish FVG Continuation")
+    if cur["high"] > swing_high and cur["close"] < swing_high and cur["close"] < cur["open"]:
+        sl = round(cur["high"] + 25.0, 2)
+        risk = sl - p
+        if 40.0 <= risk <= 650.0:
+            return {
+                "dir": "SHORT",
+                "category": "1.0_SWING_SWEEP",
+                "setup": "Masterclass 1.0: Liquidity Hunt at Resistance Swing + Rejection Close",
+                "entry": p,
+                "sl": sl,
+                "risk": risk,
+                "tp1": round(p - (2.0 * risk), 2),
+                "tp2": round(p - (3.5 * risk), 2),
+                "tp3": round(p - (5.0 * risk), 2)
+            }
 
-    # Decision Threshold
-    if long_score >= 65 and long_score > short_score:
-        risk_dist = max(min(1.2 * atr, 650.0), 40.0)
-        return {
-            "dir": "LONG",
-            "score": min(long_score, 99),
-            "category": "PRO_SMC_LONG",
-            "setup": " + ".join(signals_notes),
-            "entry": current_price,
-            "sl": round(current_price - risk_dist, 2),
-            "risk": round(risk_dist, 2),
-            "tp1": round(current_price + (2.0 * risk_dist), 2),
-            "tp2": round(current_price + (3.5 * risk_dist), 2),
-            "tp3": round(current_price + (5.0 * risk_dist), 2)
-        }
-    elif short_score >= 65 and short_score > long_score:
-        risk_dist = max(min(1.2 * atr, 650.0), 40.0)
-        return {
-            "dir": "SHORT",
-            "score": min(short_score, 99),
-            "category": "PRO_SMC_SHORT",
-            "setup": " + ".join(signals_notes),
-            "entry": current_price,
-            "sl": round(current_price + risk_dist, 2),
-            "risk": round(risk_dist, 2),
-            "tp1": round(current_price - (2.0 * risk_dist), 2),
-            "tp2": round(current_price - (3.5 * risk_dist), 2),
-            "tp3": round(current_price - (5.0 * risk_dist), 2)
-        }
+    # 4. TREND MOMENTUM BREAKOUT (Solid Body Expansion)
+    if body / candle_range >= 0.65:
+        if cur["close"] > swing_high and cur["close"] > cur["open"]:
+            sl = round(cur["open"] - 25.0, 2)
+            risk = p - sl
+            if 40.0 <= risk <= 650.0:
+                return {
+                    "dir": "LONG",
+                    "category": "2.0_MOMENTUM_RUN",
+                    "setup": "Institutional Momentum Breakout (Closing above Resistance)",
+                    "entry": p,
+                    "sl": sl,
+                    "risk": risk,
+                    "tp1": round(p + (2.0 * risk), 2),
+                    "tp2": round(p + (3.5 * risk), 2),
+                    "tp3": round(p + (5.0 * risk), 2)
+                }
+        elif cur["close"] < swing_low and cur["close"] < cur["open"]:
+            sl = round(cur["open"] + 25.0, 2)
+            risk = sl - p
+            if 40.0 <= risk <= 650.0:
+                return {
+                    "dir": "SHORT",
+                    "category": "2.0_MOMENTUM_RUN",
+                    "setup": "Institutional Waterfall Breakdown (Closing below Support)",
+                    "entry": p,
+                    "sl": sl,
+                    "risk": risk,
+                    "tp1": round(p - (2.0 * risk), 2),
+                    "tp2": round(p - (3.5 * risk), 2),
+                    "tp3": round(p - (5.0 * risk), 2)
+                }
+
     return None
 
 def sync_market_hub():
@@ -236,22 +258,24 @@ def sync_market_hub():
         p_res = requests.get(f"{BASE}/fapi/v1/ticker/price", params={"symbol": SYMBOL}, timeout=3).json()
         DATA_HUB["price"] = float(p_res.get("price", 0.0))
 
-        k15 = fetch_klines("15m", 50)
+        # Fetch PDH & PDL
+        pdh, pdl = fetch_daily_pdh_pdl()
+        DATA_HUB["pdh"] = pdh
+        DATA_HUB["pdl"] = pdl
+
+        k15 = fetch_klines("15m", 45)
         if k15:
-            DATA_HUB["klines"]["15m"] = k15
-            ref = k15[-16:]
+            DATA_HUB["klines_15m"] = k15
             with LOCK:
                 ACTIVE_POIS = [
-                    {"type": "BSL", "title": "BSL (Liquidity High)", "price": round(max(x["high"] for x in ref), 2), "color": "#ef5350"},
-                    {"type": "SSL", "title": "SSL (Liquidity Low)", "price": round(min(x["low"] for x in ref), 2), "color": "#26a69a"}
+                    {"type": "PDH", "title": "2.0 PDH (Previous Day High)", "price": round(pdh, 2), "color": "#ff1744"},
+                    {"type": "PDL", "title": "2.0 PDL (Previous Day Low)", "price": round(pdl, 2), "color": "#00e676"}
                 ]
 
-        fr_res = requests.get(f"{BASE}/fapi/v1/premiumIndex", params={"symbol": SYMBOL}, timeout=3).json()
-        DATA_HUB["funding_rate"] = float(fr_res.get("lastFundingRate", 0.0))
         DATA_HUB["session_tag"] = get_current_session()
         DATA_HUB["last_sync"] = time.time()
     except Exception as e:
-        logging.warning(f"Sync warning: {e}")
+        logging.warning(f"Sync issue: {e}")
 
 def manage_positions(p):
     global ACTIVE_TRADES
@@ -263,40 +287,40 @@ def manage_positions(p):
                 if p >= t["tp1"] and t["stage"] == "OPEN":
                     t["stage"] = "TP1_DONE"
                     t["sl"] = entry
-                    send_telegram(f"🎯 <b>[{t['type']}] TP1 HIT (+2.0R)</b>\nStop Loss moved to Breakeven (${entry:,.2f})")
+                    send_telegram(f"🎯 <b>[{t['type']}] 1:2 TP1 HIT</b>\nStop Loss moved to <b>Breakeven (${entry:,.2f})</b>")
                 elif p >= t["tp2"] and t["stage"] == "TP1_DONE":
                     t["stage"] = "TP2_DONE"
                     t["sl"] = t["tp1"]
-                    send_telegram(f"🎯 <b>[{t['type']}] TP2 HIT (+3.5R)</b>\nStop Loss trailed to TP1 (${t['tp1']:,.2f})")
+                    send_telegram(f"🎯 <b>[{t['type']}] 1:3.5 TP2 HIT</b>\nStop Loss trailed to <b>TP1 (${t['tp1']:,.2f})</b>")
                 if p <= t["sl"]:
                     pnl = -1.0 if t["stage"] == "OPEN" else 1.5
-                    res = "SL HIT" if t["stage"] == "OPEN" else "BE/PROFIT CLOSE"
+                    res = "SL HIT" if t["stage"] == "OPEN" else "PROFIT / BE CLOSE"
                     save_closed(t, p, res, pnl)
-                    send_telegram(f"🏁 <b>[{t['type']} CLOSED] {res}</b> @ ${p:,.2f} | Net: {pnl:+.1f}R")
+                    send_telegram(f"🏁 <b>[{t['type']} FINISHED] {res}</b> @ ${p:,.2f} | PnL: <b>{pnl:+.1f}R</b>")
                     continue
                 elif p >= t["tp3"]:
-                    save_closed(t, p, "TP3 COMPLETED 🔥", 5.0)
-                    send_telegram(f"🔥 <b>[{t['type']} RUNNER TARGET HIT]</b> @ ${p:,.2f} | Net: +5.0R")
+                    save_closed(t, p, "RUNNER TARGET 1:5 🔥", 5.0)
+                    send_telegram(f"🔥 <b>[{t['type']} 1:5 TARGET ACCOMPLISHED]</b> @ ${p:,.2f} | PnL: <b>+5.0R</b>")
                     continue
 
             elif t["dir"] == "SHORT":
                 if p <= t["tp1"] and t["stage"] == "OPEN":
                     t["stage"] = "TP1_DONE"
                     t["sl"] = entry
-                    send_telegram(f"🎯 <b>[{t['type']}] TP1 HIT (+2.0R)</b>\nStop Loss moved to Breakeven (${entry:,.2f})")
+                    send_telegram(f"🎯 <b>[{t['type']}] 1:2 TP1 HIT</b>\nStop Loss moved to <b>Breakeven (${entry:,.2f})</b>")
                 elif p <= t["tp2"] and t["stage"] == "TP1_DONE":
                     t["stage"] = "TP2_DONE"
                     t["sl"] = t["tp1"]
-                    send_telegram(f"🎯 <b>[{t['type']}] TP2 HIT (+3.5R)</b>\nStop Loss trailed to TP1 (${t['tp1']:,.2f})")
+                    send_telegram(f"🎯 <b>[{t['type']}] 1:3.5 TP2 HIT</b>\nStop Loss trailed to <b>TP1 (${t['tp1']:,.2f})</b>")
                 if p >= t["sl"]:
                     pnl = -1.0 if t["stage"] == "OPEN" else 1.5
-                    res = "SL HIT" if t["stage"] == "OPEN" else "BE/PROFIT CLOSE"
+                    res = "SL HIT" if t["stage"] == "OPEN" else "PROFIT / BE CLOSE"
                     save_closed(t, p, res, pnl)
-                    send_telegram(f"🏁 <b>[{t['type']} CLOSED] {res}</b> @ ${p:,.2f} | Net: {pnl:+.1f}R")
+                    send_telegram(f"🏁 <b>[{t['type']} FINISHED] {res}</b> @ ${p:,.2f} | PnL: <b>{pnl:+.1f}R</b>")
                     continue
                 elif p <= t["tp3"]:
-                    save_closed(t, p, "TP3 COMPLETED 🔥", 5.0)
-                    send_telegram(f"🔥 <b>[{t['type']} RUNNER TARGET HIT]</b> @ ${p:,.2f} | Net: +5.0R")
+                    save_closed(t, p, "RUNNER TARGET 1:5 🔥", 5.0)
+                    send_telegram(f"🔥 <b>[{t['type']} 1:5 TARGET ACCOMPLISHED]</b> @ ${p:,.2f} | PnL: <b>+5.0R</b>")
                     continue
 
             rem.append(t)
@@ -308,7 +332,7 @@ def save_closed(t, exit_p, res, pnl):
         c.execute("""INSERT OR REPLACE INTO trades 
                      (trade_id, created_at, signal_type, tf, direction, setup, score, entry, sl, tp1, tp2, tp3, exit, result, pnl_r, status)
                      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                  (t["id"], t["created"], t["type"], t["tf"], t["dir"], t["setup"], t["score"],
+                  (t["id"], t["created"], t["type"], t["tf"], t["dir"], t["setup"], 98,
                    t["entry"], t["sl"], t["tp1"], t["tp2"], t["tp3"], exit_p, res, pnl, "CLOSED"))
         c.commit()
         c.close()
@@ -327,13 +351,15 @@ def master_execution_scan():
         if now - LAST_SCAN_TIME < 20: 
             return
 
-        c15 = DATA_HUB["klines"].get("15m", [])
+        c15 = DATA_HUB["klines_15m"]
         p = DATA_HUB["price"]
+        pdh = DATA_HUB["pdh"]
+        pdl = DATA_HUB["pdl"]
 
         if len(c15) < 15 or p < 10000: 
             return
 
-        signal = evaluate_pro_trader_narrative(c15, p)
+        signal = scan_masterclass_2_setups(c15, pdh, pdl, p)
         if not signal:
             return
 
@@ -344,7 +370,6 @@ def master_execution_scan():
             "tf": "15M",
             "dir": signal["dir"],
             "setup": signal["setup"],
-            "score": signal["score"],
             "entry": round(signal["entry"], 2),
             "sl": round(signal["sl"], 2),
             "tp1": round(signal["tp1"], 2),
@@ -357,16 +382,17 @@ def master_execution_scan():
         LAST_SCAN_TIME = now
 
         send_telegram(
-            f"🧠 <b>[PRO TRADER NARRATIVE SIGNAL]</b>\n\n"
-            f"<b>Direction:</b> {signal['dir']} (Confluence Score: {signal['score']}/100)\n"
+            f"👑 <b>[GAUTAM JHA 2.0 STRATEGY ALERT]</b>\n\n"
+            f"<b>Direction:</b> {signal['dir']} ({signal['category']})\n"
             f"🔹 <b>Entry:</b> ${signal['entry']:,.2f}\n"
-            f"🛑 <b>SL:</b> ${signal['sl']:,.2f} (Risk: ${signal['risk']:.1f})\n"
-            f"🎯 <b>TP1 (2.0R):</b> ${signal['tp1']:,.2f}\n"
-            f"🎯 <b>TP2 (3.5R):</b> ${signal['tp2']:,.2f}\n"
-            f"🔥 <b>TP3 (5.0R):</b> ${signal['tp3']:,.2f}\n\n"
-            f"💡 <b>Market Narrative:</b> {signal['setup']}\n"
+            f"🛑 <b>Stop Loss:</b> ${signal['sl']:,.2f} (Risk: ${signal['risk']:.1f})\n"
+            f"🎯 <b>Target 1 (1:2):</b> ${signal['tp1']:,.2f}\n"
+            f"🎯 <b>Target 2 (1:3.5):</b> ${signal['tp2']:,.2f}\n"
+            f"🔥 <b>Target 3 (1:5):</b> ${signal['tp3']:,.2f}\n\n"
+            f"🧠 <b>Trading Logic:</b> {signal['setup']}\n"
+            f"📍 <b>Key Daily Benchmark:</b> PDH: ${pdh:,.1f} | PDL: ${pdl:,.1f}\n"
             f"⏱ <b>Session:</b> {DATA_HUB['session_tag']}\n"
-            f"🛡 <b>Trailing Protection:</b> Auto-Breakeven at TP1"
+            f"🛡 <b>Auto Management:</b> Cost-to-cost Breakeven at TP1"
         )
 
 def keep_alive_ping():
@@ -383,7 +409,7 @@ def master_loop():
     global STARTED_FLAG
     time.sleep(3)
     if not STARTED_FLAG:
-        send_telegram("🧠 <b>PRO TRADER REASONING ENGINE ONLINE</b>\nMulti-Factor SMC, Liquidity Traps & Candle Psychology Active.")
+        send_telegram("👑 <b>GAUTAM JHA 2.0 ENGINE LIVE</b>\nPDH / PDL Sweeps & Confirmation Entries Active 24/7.")
         STARTED_FLAG = True
 
     while True:
