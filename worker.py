@@ -9,7 +9,7 @@ from flask import Flask, jsonify
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [GAUTAM-JHA-2.0] %(message)s"
+    format="%(asctime)s [%(levelname)s] [BYBIT-ENGINE-LIVE] %(message)s"
 )
 
 app = Flask(__name__)
@@ -25,7 +25,7 @@ LOCK = threading.RLock()
 STARTED_FLAG = False
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 }
 
 DATA_HUB = {
@@ -72,7 +72,7 @@ def send_telegram(text):
 @app.route("/")
 @app.route("/healthz")
 def health():
-    return "Gautam Jha 2.0 Engine Live", 200
+    return "Gautam Jha 2.0 Live Engine Active", 200
 
 @app.route("/vault-data")
 def api_vault_data():
@@ -100,59 +100,52 @@ def api_vault_data():
     except Exception:
         return jsonify({"vault": [], "active": [], "pois": []}), 500
 
-# Dual Route Fetcher (Futures first, Spot backup)
-def get_live_price():
-    endpoints = [
-        "https://fapi.binance.com/fapi/v1/ticker/price?symbol=BTCUSDT",
-        "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
-        "https://api1.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
-    ]
-    for url in endpoints:
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=3).json()
-            if "price" in r:
-                return float(r["price"])
-        except Exception:
-            continue
+# Bybit Live Ticker Feed (Bypasses Render Geoblocks)
+def fetch_bybit_price():
+    url = "https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=4).json()
+        list_data = r.get("result", {}).get("list", [])
+        if list_data:
+            return float(list_data[0]["lastPrice"])
+    except Exception as e:
+        logging.warning(f"Bybit price error: {e}")
     return 0.0
 
-def fetch_daily_pdh_pdl():
-    endpoints = [
-        "https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1d&limit=3",
-        "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=3"
-    ]
-    for url in endpoints:
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=4).json()
-            if isinstance(r, list) and len(r) >= 2:
-                prev_day = r[-2]
-                return float(prev_day[2]), float(prev_day[3])
-        except Exception:
-            continue
+# Bybit Daily High/Low (PDH / PDL)
+def fetch_bybit_daily():
+    url = "https://api.bybit.com/v5/market/kline?category=linear&symbol=BTCUSDT&interval=D&limit=3"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=4).json()
+        raw = r.get("result", {}).get("list", [])
+        if len(raw) >= 2:
+            prev_d = raw[1] # [startTime, open, high, low, close, volume, turnover]
+            return float(prev_d[2]), float(prev_d[3])
+    except Exception as e:
+        logging.warning(f"Bybit daily error: {e}")
     return 0.0, 0.0
 
-def fetch_klines_15m():
-    endpoints = [
-        "https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=15m&limit=40",
-        "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=40"
-    ]
-    for url in endpoints:
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=4).json()
-            if isinstance(r, list) and len(r) > 10:
-                parsed = []
-                for b in r[:-1]:
-                    parsed.append({
-                        "time": int(b[0] // 1000), 
-                        "open": float(b[1]), 
-                        "high": float(b[2]), 
-                        "low": float(b[3]), 
-                        "close": float(b[4]), 
-                        "vol": float(b[5])
-                    })
-                return parsed
-        except Exception:
-            continue
+# Bybit 15M Candles
+def fetch_bybit_15m():
+    url = "https://api.bybit.com/v5/market/kline?category=linear&symbol=BTCUSDT&interval=15&limit=40"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=4).json()
+        raw = r.get("result", {}).get("list", [])
+        if len(raw) > 10:
+            parsed = []
+            # Bybit sends latest first, so reverse to chronological order
+            for b in reversed(raw[1:]): # Exclude current running candle
+                parsed.append({
+                    "time": int(b[0]) // 1000,
+                    "open": float(b[1]),
+                    "high": float(b[2]),
+                    "low": float(b[3]),
+                    "close": float(b[4]),
+                    "vol": float(b[5])
+                })
+            return parsed
+    except Exception as e:
+        logging.warning(f"Bybit 15m error: {e}")
     return []
 
 def get_current_session():
@@ -162,7 +155,7 @@ def get_current_session():
     elif 13 <= utc_hr < 21: return "NEW YORK (TREND ENGINE)"
     return "SESSION CLOSE"
 
-# ---------------- GAUTAM JHA 2.0 LOGIC ----------------
+# ---------------- GAUTAM JHA 2.0 STRATEGY SCANNER ----------------
 def scan_masterclass_2_setups(c15, pdh, pdl, p):
     if len(c15) < 15 or p <= 1000.0: 
         return None
@@ -181,14 +174,14 @@ def scan_masterclass_2_setups(c15, pdh, pdl, p):
 
     # 1. 2.0 PDL REVERSAL TRAP
     if pdl > 0 and cur["low"] < pdl and cur["close"] > pdl:
-        if cur["close"] > prev["high"] or (lower_wick / candle_range >= 0.30):
+        if cur["close"] > prev["high"] or (lower_wick / candle_range >= 0.28):
             sl = round(cur["low"] - 25.0, 2)
             risk = p - sl
-            if 35.0 <= risk <= 700.0:
+            if 30.0 <= risk <= 750.0:
                 return {
                     "dir": "LONG",
                     "category": "2.0_PDL_TRAP",
-                    "setup": "Masterclass 2.0: PDL Swept + Green Confirmation (Retail Trap)",
+                    "setup": "Masterclass 2.0: PDL Swept + Green Confirmation (Retail Sellers Trapped)",
                     "entry": p,
                     "sl": sl,
                     "risk": risk,
@@ -199,14 +192,14 @@ def scan_masterclass_2_setups(c15, pdh, pdl, p):
 
     # 2. 2.0 PDH REVERSAL TRAP
     if pdh > 0 and cur["high"] > pdh and cur["close"] < pdh:
-        if cur["close"] < prev["low"] or (upper_wick / candle_range >= 0.30):
+        if cur["close"] < prev["low"] or (upper_wick / candle_range >= 0.28):
             sl = round(cur["high"] + 25.0, 2)
             risk = sl - p
-            if 35.0 <= risk <= 700.0:
+            if 30.0 <= risk <= 750.0:
                 return {
                     "dir": "SHORT",
                     "category": "2.0_PDH_TRAP",
-                    "setup": "Masterclass 2.0: PDH Swept + Red Confirmation (Retail Trap)",
+                    "setup": "Masterclass 2.0: PDH Swept + Red Confirmation (Retail Buyers Trapped)",
                     "entry": p,
                     "sl": sl,
                     "risk": risk,
@@ -215,11 +208,11 @@ def scan_masterclass_2_setups(c15, pdh, pdl, p):
                     "tp3": round(p - (5.0 * risk), 2)
                 }
 
-    # 3. 1.0 SWING SWEEPS
+    # 3. 1.0 SWING HIGH / LOW HUNT
     if cur["low"] < swing_low and cur["close"] > swing_low and cur["close"] > cur["open"]:
         sl = round(cur["low"] - 25.0, 2)
         risk = p - sl
-        if 35.0 <= risk <= 700.0:
+        if 30.0 <= risk <= 750.0:
             return {
                 "dir": "LONG",
                 "category": "1.0_SWING_SWEEP",
@@ -235,7 +228,7 @@ def scan_masterclass_2_setups(c15, pdh, pdl, p):
     if cur["high"] > swing_high and cur["close"] < swing_high and cur["close"] < cur["open"]:
         sl = round(cur["high"] + 25.0, 2)
         risk = sl - p
-        if 35.0 <= risk <= 700.0:
+        if 30.0 <= risk <= 750.0:
             return {
                 "dir": "SHORT",
                 "category": "1.0_SWING_SWEEP",
@@ -248,12 +241,12 @@ def scan_masterclass_2_setups(c15, pdh, pdl, p):
                 "tp3": round(p - (5.0 * risk), 2)
             }
 
-    # 4. MOMENTUM EXPANSION (Waterfall Run)
-    if body / candle_range >= 0.60:
+    # 4. MOMENTUM EXPANSION (Trend Run)
+    if body / candle_range >= 0.58:
         if cur["close"] > swing_high and cur["close"] > cur["open"]:
             sl = round(cur["open"] - 25.0, 2)
             risk = p - sl
-            if 35.0 <= risk <= 700.0:
+            if 30.0 <= risk <= 750.0:
                 return {
                     "dir": "LONG",
                     "category": "2.0_MOMENTUM_RUN",
@@ -268,7 +261,7 @@ def scan_masterclass_2_setups(c15, pdh, pdl, p):
         elif cur["close"] < swing_low and cur["close"] < cur["open"]:
             sl = round(cur["open"] + 25.0, 2)
             risk = sl - p
-            if 35.0 <= risk <= 700.0:
+            if 30.0 <= risk <= 750.0:
                 return {
                     "dir": "SHORT",
                     "category": "2.0_MOMENTUM_RUN",
@@ -286,16 +279,16 @@ def scan_masterclass_2_setups(c15, pdh, pdl, p):
 def sync_market_hub():
     global DATA_HUB, ACTIVE_POIS
     try:
-        p = get_live_price()
+        p = fetch_bybit_price()
         if p > 0.0:
             DATA_HUB["price"] = p
 
-        pdh, pdl = fetch_daily_pdh_pdl()
+        pdh, pdl = fetch_bybit_daily()
         if pdh > 0.0 and pdl > 0.0:
             DATA_HUB["pdh"] = pdh
             DATA_HUB["pdl"] = pdl
 
-        k15 = fetch_klines_15m()
+        k15 = fetch_bybit_15m()
         if k15:
             DATA_HUB["klines_15m"] = k15
             ref = k15[-14:]
@@ -444,7 +437,7 @@ def master_loop():
     global STARTED_FLAG
     time.sleep(3)
     if not STARTED_FLAG:
-        send_telegram("👑 <b>GAUTAM JHA 2.0 DUAL-ROUTE ENGINE LIVE</b>\nBinance API Fixed. Live Price & Setups Connected.")
+        send_telegram("🚀 <b>GAUTAM JHA ENGINE UNBLOCKED (BYBIT FEED)</b>\nReal-time Data Active. Monitoring 15M Traps.")
         STARTED_FLAG = True
 
     while True:
