@@ -21,9 +21,10 @@ RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 
 LOCK = threading.RLock()
 STARTED_FLAG = False
-LAST_PROCESSED_CANDLE_TIME = 0
 
-# Discipline & Risk Controls
+# Hard Dedup Memory
+PROCESSED_CANDLES = set()
+
 MAX_DAILY_TRADES = 3
 MAX_CONSECUTIVE_LOSSES = 2
 DAILY_STATS = {
@@ -202,13 +203,12 @@ def reset_daily_stats_if_needed():
         DAILY_STATS["consecutive_losses"] = 0
         DAILY_STATS["locked"] = False
 
-# ---------------- GAUTAM JHA CORE STRATEGY SCANNER ----------------
 def scan_jha_masterclass_setups(c15, pdh, pdl, p):
     if len(c15) < 18 or p <= 1000.0: 
         return None
 
-    cur = c15[-1]   # Trigger Confirmation Candle
-    prev = c15[-2]  # Trap/Sweep Candle
+    cur = c15[-1]
+    prev = c15[-2]
 
     closes = [x["close"] for x in c15]
     ema9 = calculate_ema(closes, period=9)
@@ -216,7 +216,6 @@ def scan_jha_masterclass_setups(c15, pdh, pdl, p):
     cur_range = max(cur["high"] - cur["low"], 1.0)
     prev_range = max(prev["high"] - prev["low"], 1.0)
 
-    # Event/News filter: Avoid ultra-volatile uncontrolled candles
     if cur_range > 1200.0 or prev_range > 1200.0:
         return None
 
@@ -227,7 +226,7 @@ def scan_jha_masterclass_setups(c15, pdh, pdl, p):
     swing_high = max(x["high"] for x in ref)
     swing_low = min(x["low"] for x in ref)
 
-    # 1. SETUP: 2.0 PDL LIQUIDITY TRAP
+    # 1. 2.0 PDL LIQUIDITY TRAP
     if pdl > 0 and prev["low"] < pdl and prev["close"] > pdl:
         if (prev_lower_wick / prev_range >= 0.28) and (cur["close"] > prev["high"]) and (cur["close"] > ema9):
             sl = round(prev["low"] - 25.0, 2)
@@ -245,7 +244,7 @@ def scan_jha_masterclass_setups(c15, pdh, pdl, p):
                     "candle_time": cur["time"]
                 }
 
-    # 2. SETUP: 2.0 PDH LIQUIDITY TRAP
+    # 2. 2.0 PDH LIQUIDITY TRAP
     if pdh > 0 and prev["high"] > pdh and prev["close"] < pdh:
         if (prev_upper_wick / prev_range >= 0.28) and (cur["close"] < prev["low"]) and (cur["close"] < ema9):
             sl = round(prev["high"] + 25.0, 2)
@@ -263,7 +262,7 @@ def scan_jha_masterclass_setups(c15, pdh, pdl, p):
                     "candle_time": cur["time"]
                 }
 
-    # 3. SETUP: 1.0 SWING SUPPORT TRAP
+    # 3. 1.0 SWING SUPPORT TRAP
     if prev["low"] < swing_low and prev["close"] > swing_low:
         if (cur["close"] > prev["high"]) and (cur["close"] > cur["open"]) and (cur["close"] > ema9):
             sl = round(prev["low"] - 25.0, 2)
@@ -281,7 +280,7 @@ def scan_jha_masterclass_setups(c15, pdh, pdl, p):
                     "candle_time": cur["time"]
                 }
 
-    # 4. SETUP: 1.0 SWING RESISTANCE TRAP
+    # 4. 1.0 SWING RESISTANCE TRAP
     if prev["high"] > swing_high and prev["close"] < swing_high:
         if (cur["close"] < prev["low"]) and (cur["close"] < cur["open"]) and (cur["close"] < ema9):
             sl = round(prev["high"] + 25.0, 2)
@@ -353,14 +352,13 @@ def manage_positions(p):
             direction = t["dir"]
 
             if direction == "LONG":
-                # Auto-Breakeven at 1:2
                 if p >= t["tp1"] and t["stage"] == "OPEN":
                     t["stage"] = "TP1_DONE"
                     t["sl"] = entry
                     save_or_update_trade(t, status="RUNNING_RISK_FREE")
                     send_telegram(
                         f"🎯 <b>[{t['type']}] 1:2 TARGET HIT</b>\n"
-                        f"🛡 <b>Auto-Breakeven:</b> Stop Loss shifted to Entry (${entry:,.2f}). Trade is now Risk-Free!"
+                        f"🛡 <b>Auto-Breakeven:</b> Stop Loss shifted to Entry (${entry:,.2f}). Trade is Risk-Free!"
                     )
 
                 if p <= t["sl"]:
@@ -392,10 +390,10 @@ def manage_positions(p):
                     save_or_update_trade(t, status="RUNNING_RISK_FREE")
                     send_telegram(
                         f"🎯 <b>[{t['type']}] 1:2 TARGET HIT</b>\n"
-                        f"🛡 <b>Auto-Breakeven:</b> Stop Loss shifted to Entry (${entry:,.2f}). Trade is now Risk-Free!"
+                        f"🛡 <b>Auto-Breakeven:</b> Stop Loss shifted to Entry (${entry:,.2f}). Trade is Risk-Free!"
                     )
 
-                if p >= t["sl"]:
+                if p <= t["sl"]:
                     is_full_loss = (t["stage"] == "OPEN")
                     pnl_r = -1.0 if is_full_loss else 0.0
                     pnl_pct = round(((entry - p) / entry) * 100, 2)
@@ -421,10 +419,11 @@ def manage_positions(p):
         ACTIVE_TRADES = rem
 
 def master_execution_scan():
-    global ACTIVE_TRADES, LAST_PROCESSED_CANDLE_TIME, DAILY_STATS
+    global ACTIVE_TRADES, PROCESSED_CANDLES, DAILY_STATS
     with LOCK:
         reset_daily_stats_if_needed()
 
+        # Hard guardrail: already active trade
         if len(ACTIVE_TRADES) >= 1: 
             return
         if DAILY_STATS["trades_count"] >= MAX_DAILY_TRADES:
@@ -432,7 +431,7 @@ def master_execution_scan():
         if DAILY_STATS["consecutive_losses"] >= MAX_CONSECUTIVE_LOSSES:
             if not DAILY_STATS["locked"]:
                 DAILY_STATS["locked"] = True
-                send_telegram("🛑 <b>RISK DISCIPLINE TRIGGERED:</b> 2 consecutive SL hits. Trading locked for the day to preserve capital.")
+                send_telegram("🛑 <b>RISK DISCIPLINE:</b> 2 consecutive SL hits. Trading locked for the day.")
             return
 
         c15 = DATA_HUB["klines_15m"]
@@ -447,12 +446,23 @@ def master_execution_scan():
         if not signal:
             return
 
-        # Closed-candle timestamp lock: stops duplicate alerts
-        if signal["candle_time"] <= LAST_PROCESSED_CANDLE_TIME:
+        # STRICT DEDUP CHECK
+        candle_ts = signal["candle_time"]
+        if candle_ts in PROCESSED_CANDLES:
+            return
+
+        t_id = f"TRD_{candle_ts}"
+
+        # DB duplicate check
+        conn = db()
+        exists = conn.execute("SELECT 1 FROM trades WHERE trade_id = ?", (t_id,)).fetchone()
+        conn.close()
+        if exists:
+            PROCESSED_CANDLES.add(candle_ts)
             return
 
         t = {
-            "id": f"TRD_{int(time.time()*1000)}",
+            "id": t_id,
             "created": datetime.now(timezone.utc).strftime("%H:%M:%S"),
             "type": signal["category"],
             "tf": "15M",
@@ -466,21 +476,21 @@ def master_execution_scan():
         }
 
         ACTIVE_TRADES.append(t)
-        LAST_PROCESSED_CANDLE_TIME = signal["candle_time"]
+        PROCESSED_CANDLES.add(candle_ts)
         DAILY_STATS["trades_count"] += 1
 
-        # Save to DB instantly
+        # Instant DB save
         save_or_update_trade(t, status="OPEN")
 
         send_telegram(
-            f"👑 <b>[GAUTAM JHA MASTERCLASS CONFIRMED SETUP]</b>\n\n"
+            f"👑 <b>[GAUTAM JHA CONFIRMED SETUP]</b>\n\n"
             f"<b>Direction:</b> {signal['dir']} ({signal['category']})\n"
             f"🔹 <b>Entry:</b> ${signal['entry']:,.2f}\n"
             f"🛑 <b>Stop Loss:</b> ${signal['sl']:,.2f} (Risk: ${signal['risk']:.1f})\n"
             f"🎯 <b>Target 1 (1:2):</b> ${signal['tp1']:,.2f}\n"
             f"🔥 <b>Target 2 (1:3.5):</b> ${signal['tp2']:,.2f}\n\n"
             f"🧠 <b>Trading Logic:</b> {signal['setup']}\n"
-            f"📍 <b>Key Benchmark:</b> PDH: ${pdh:,.1f} | PDL: ${pdl:,.1f}\n"
+            f"📍 <b>Key Levels:</b> PDH: ${pdh:,.1f} | PDL: ${pdl:,.1f}\n"
             f"🛡 <b>Auto Management:</b> Cost-to-cost Breakeven at TP1\n"
             f"📊 <b>Discipline Status:</b> Trade {DAILY_STATS['trades_count']}/{MAX_DAILY_TRADES}"
         )
@@ -489,7 +499,7 @@ def master_loop():
     global STARTED_FLAG
     time.sleep(3)
     if not STARTED_FLAG:
-        send_telegram("👑 <b>DISCIPLINE ENGINE & VAULT LOGGER LIVE</b>\nTracking Traps, Confirmation Candles, and Percentage Returns.")
+        send_telegram("👑 <b>ENGINE DEDUP LOCK ACTIVE</b>\nZero Duplicate Alerts Guaranteed.")
         STARTED_FLAG = True
 
     while True:
