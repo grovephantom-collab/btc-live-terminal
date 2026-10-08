@@ -9,7 +9,7 @@ from flask import Flask, jsonify
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [COINBASE-US-ENGINE] %(message)s"
+    format="%(asctime)s [%(levelname)s] [JHA-MASTER-PRO] %(message)s"
 )
 
 app = Flask(__name__)
@@ -21,6 +21,17 @@ RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 
 LOCK = threading.RLock()
 STARTED_FLAG = False
+LAST_PROCESSED_CANDLE_TIME = 0
+
+# Discipline & Risk Controls
+MAX_DAILY_TRADES = 3
+MAX_CONSECUTIVE_LOSSES = 2
+DAILY_STATS = {
+    "day": "",
+    "trades_count": 0,
+    "consecutive_losses": 0,
+    "locked": False
+}
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -40,19 +51,32 @@ ACTIVE_TRADES = []
 ACTIVE_POIS = []
 
 def db():
-    c = sqlite3.connect(DB_FILE, timeout=30)
-    c.execute("PRAGMA journal_mode=WAL")
-    return c
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
 
 def init_db():
-    c = db()
-    c.execute("""CREATE TABLE IF NOT EXISTS trades (
+    conn = db()
+    conn.execute("""CREATE TABLE IF NOT EXISTS trades (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        trade_id TEXT UNIQUE, created_at TEXT, signal_type TEXT, tf TEXT, direction TEXT,
-        setup TEXT, score INTEGER, entry REAL, sl REAL, tp1 REAL, tp2 REAL, tp3 REAL,
-        exit REAL, result TEXT, pnl_r REAL, status TEXT)""")
-    c.commit()
-    c.close()
+        trade_id TEXT UNIQUE, 
+        created_at TEXT, 
+        closed_at TEXT,
+        signal_type TEXT, 
+        tf TEXT, 
+        direction TEXT,
+        setup TEXT, 
+        entry REAL, 
+        sl REAL, 
+        tp1 REAL, 
+        tp2 REAL, 
+        exit REAL, 
+        result TEXT, 
+        pnl_r REAL, 
+        pnl_percent REAL,
+        status TEXT)""")
+    conn.commit()
+    conn.close()
 
 init_db()
 
@@ -71,20 +95,31 @@ def send_telegram(text):
 @app.route("/")
 @app.route("/healthz")
 def health():
-    return "BTC Institutional Engine 100% Active", 200
+    return "Institutional Discipline Engine Live", 200
 
 @app.route("/vault-data")
 def api_vault_data():
     try:
-        c = db()
-        c.row_factory = sqlite3.Row
-        rows = c.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 50").fetchall()
-        c.close()
+        conn = db()
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 50").fetchall()
+        conn.close()
         vault = [{
-            "time": r["created_at"], "type": r["signal_type"], "tf": r["tf"],
-            "dir": r["direction"], "setup": r["setup"], "score": r["score"],
-            "entry": float(r["entry"] or 0), "exit": float(r["exit"] or 0),
-            "res": r["result"], "pnl": float(r["pnl_r"] or 0), "status": r["status"]
+            "trade_id": r["trade_id"],
+            "created_at": r["created_at"],
+            "closed_at": r["closed_at"] or "--",
+            "type": r["signal_type"],
+            "dir": r["direction"],
+            "setup": r["setup"],
+            "entry": float(r["entry"] or 0),
+            "sl": float(r["sl"] or 0),
+            "tp1": float(r["tp1"] or 0),
+            "tp2": float(r["tp2"] or 0),
+            "exit": float(r["exit"] or 0),
+            "res": r["result"],
+            "pnl_r": float(r["pnl_r"] or 0),
+            "pnl_percent": float(r["pnl_percent"] or 0),
+            "status": r["status"]
         } for r in rows]
         with LOCK:
             return jsonify({
@@ -94,41 +129,30 @@ def api_vault_data():
                 "price": DATA_HUB["price"],
                 "pdh": DATA_HUB["pdh"],
                 "pdl": DATA_HUB["pdl"],
-                "session": DATA_HUB["session_tag"]
+                "session": DATA_HUB["session_tag"],
+                "daily_stats": DAILY_STATS
             }), 200
-    except Exception:
+    except Exception as e:
+        logging.error(f"API vault error: {e}")
         return jsonify({"vault": [], "active": [], "pois": []}), 500
 
-# 1. COINBASE US LIVE PRICE (100% Bypass for Render Cloud)
 def fetch_coinbase_price():
     try:
         url = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
         r = requests.get(url, headers=HEADERS, timeout=4).json()
         if "data" in r and "amount" in r["data"]:
             return float(r["data"]["amount"])
-    except Exception as e:
-        logging.warning(f"Coinbase price err: {e}")
-    
-    # Backup: Kraken US
-    try:
-        r2 = requests.get("https://api.kraken.com/0/public/Ticker?pair=XBTUSD", headers=HEADERS, timeout=4).json()
-        res = r2.get("result", {})
-        pair = next(iter(res.values()))
-        return float(pair["c"][0])
     except Exception:
         pass
     return 0.0
 
-# 2. COINBASE CANDLES (15M Timeframe)
 def fetch_coinbase_15m():
     try:
-        # Granularity 900 = 15 minutes
         url = "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=900"
         r = requests.get(url, headers=HEADERS, timeout=4).json()
-        if isinstance(r, list) and len(r) > 10:
+        if isinstance(r, list) and len(r) > 15:
             parsed = []
-            # Coinbase format: [time, low, high, open, close, volume] (newest first)
-            for b in reversed(r[1:45]): # reverse to chronological
+            for b in reversed(r[1:50]):
                 parsed.append({
                     "time": int(b[0]),
                     "low": float(b[1]),
@@ -138,22 +162,29 @@ def fetch_coinbase_15m():
                     "vol": float(b[5])
                 })
             return parsed
-    except Exception as e:
-        logging.warning(f"Coinbase 15m err: {e}")
+    except Exception:
+        pass
     return []
 
-# 3. DAILY HIGH / LOW (PDH / PDL)
 def fetch_coinbase_daily():
     try:
-        # Granularity 86400 = 1 Day
         url = "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=86400"
         r = requests.get(url, headers=HEADERS, timeout=4).json()
         if isinstance(r, list) and len(r) >= 2:
-            prev_d = r[1] # completed previous day
-            return float(prev_d[2]), float(prev_d[1]) # High, Low
-    except Exception as e:
-        logging.warning(f"Coinbase daily err: {e}")
+            prev_d = r[1]
+            return float(prev_d[2]), float(prev_d[1])
+    except Exception:
+        pass
     return 0.0, 0.0
+
+def calculate_ema(closes, period=9):
+    if len(closes) < period:
+        return closes[-1] if closes else 0.0
+    multiplier = 2 / (period + 1)
+    ema = sum(closes[:period]) / period
+    for price in closes[period:]:
+        ema = (price - ema) * multiplier + ema
+    return ema
 
 def get_current_session():
     utc_hr = datetime.now(timezone.utc).hour
@@ -162,123 +193,110 @@ def get_current_session():
     elif 13 <= utc_hr < 21: return "NEW YORK TREND"
     return "SESSION CLOSE"
 
-# ---------------- GAUTAM JHA 2.0 LOGIC ENGINE ----------------
-def scan_masterclass_2_setups(c15, pdh, pdl, p):
-    if len(c15) < 15 or p <= 1000.0: 
+def reset_daily_stats_if_needed():
+    global DAILY_STATS
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if DAILY_STATS["day"] != today:
+        DAILY_STATS["day"] = today
+        DAILY_STATS["trades_count"] = 0
+        DAILY_STATS["consecutive_losses"] = 0
+        DAILY_STATS["locked"] = False
+
+# ---------------- GAUTAM JHA CORE STRATEGY SCANNER ----------------
+def scan_jha_masterclass_setups(c15, pdh, pdl, p):
+    if len(c15) < 18 or p <= 1000.0: 
         return None
 
-    cur = c15[-1]
-    prev = c15[-2]
+    cur = c15[-1]   # Trigger Confirmation Candle
+    prev = c15[-2]  # Trap/Sweep Candle
 
-    candle_range = max(cur["high"] - cur["low"], 1.0)
-    body = abs(cur["close"] - cur["open"])
-    lower_wick = min(cur["open"], cur["close"]) - cur["low"]
-    upper_wick = cur["high"] - max(cur["open"], cur["close"])
+    closes = [x["close"] for x in c15]
+    ema9 = calculate_ema(closes, period=9)
 
-    ref = c15[-14:-2]
+    cur_range = max(cur["high"] - cur["low"], 1.0)
+    prev_range = max(prev["high"] - prev["low"], 1.0)
+
+    # Event/News filter: Avoid ultra-volatile uncontrolled candles
+    if cur_range > 1200.0 or prev_range > 1200.0:
+        return None
+
+    prev_lower_wick = min(prev["open"], prev["close"]) - prev["low"]
+    prev_upper_wick = prev["high"] - max(prev["open"], prev["close"])
+
+    ref = c15[-16:-2]
     swing_high = max(x["high"] for x in ref)
     swing_low = min(x["low"] for x in ref)
 
-    # Setup 1: 2.0 PDL REVERSAL TRAP
-    if pdl > 0 and cur["low"] < pdl and cur["close"] > pdl:
-        if cur["close"] > prev["high"] or (lower_wick / candle_range >= 0.28):
-            sl = round(cur["low"] - 25.0, 2)
-            risk = p - sl
-            if 30.0 <= risk <= 750.0:
+    # 1. SETUP: 2.0 PDL LIQUIDITY TRAP
+    if pdl > 0 and prev["low"] < pdl and prev["close"] > pdl:
+        if (prev_lower_wick / prev_range >= 0.28) and (cur["close"] > prev["high"]) and (cur["close"] > ema9):
+            sl = round(prev["low"] - 25.0, 2)
+            risk = round(p - sl, 2)
+            if 30.0 <= risk <= 650.0:
                 return {
                     "dir": "LONG",
                     "category": "2.0_PDL_TRAP",
-                    "setup": "Masterclass 2.0: PDL Swept + Green Confirmation (Retail Sellers Trapped)",
+                    "setup": "PDL Sweep + Absorption Wick + 9 EMA Bullish Confirmation",
                     "entry": p,
                     "sl": sl,
                     "risk": risk,
                     "tp1": round(p + (2.0 * risk), 2),
                     "tp2": round(p + (3.5 * risk), 2),
-                    "tp3": round(p + (5.0 * risk), 2)
+                    "candle_time": cur["time"]
                 }
 
-    # Setup 2: 2.0 PDH REVERSAL TRAP
-    if pdh > 0 and cur["high"] > pdh and cur["close"] < pdh:
-        if cur["close"] < prev["low"] or (upper_wick / candle_range >= 0.28):
-            sl = round(cur["high"] + 25.0, 2)
-            risk = sl - p
-            if 30.0 <= risk <= 750.0:
+    # 2. SETUP: 2.0 PDH LIQUIDITY TRAP
+    if pdh > 0 and prev["high"] > pdh and prev["close"] < pdh:
+        if (prev_upper_wick / prev_range >= 0.28) and (cur["close"] < prev["low"]) and (cur["close"] < ema9):
+            sl = round(prev["high"] + 25.0, 2)
+            risk = round(sl - p, 2)
+            if 30.0 <= risk <= 650.0:
                 return {
                     "dir": "SHORT",
                     "category": "2.0_PDH_TRAP",
-                    "setup": "Masterclass 2.0: PDH Swept + Red Confirmation (Retail Buyers Trapped)",
+                    "setup": "PDH Sweep + Rejection Wick + 9 EMA Bearish Confirmation",
                     "entry": p,
                     "sl": sl,
                     "risk": risk,
                     "tp1": round(p - (2.0 * risk), 2),
                     "tp2": round(p - (3.5 * risk), 2),
-                    "tp3": round(p - (5.0 * risk), 2)
+                    "candle_time": cur["time"]
                 }
 
-    # Setup 3: 1.0 SWING SWEEPS
-    if cur["low"] < swing_low and cur["close"] > swing_low and cur["close"] > cur["open"]:
-        sl = round(cur["low"] - 25.0, 2)
-        risk = p - sl
-        if 30.0 <= risk <= 750.0:
-            return {
-                "dir": "LONG",
-                "category": "1.0_SWING_SWEEP",
-                "setup": "Masterclass 1.0: Liquidity Hunt at Support Swing + Reversal Close",
-                "entry": p,
-                "sl": sl,
-                "risk": risk,
-                "tp1": round(p + (2.0 * risk), 2),
-                "tp2": round(p + (3.5 * risk), 2),
-                "tp3": round(p + (5.0 * risk), 2)
-            }
-
-    if cur["high"] > swing_high and cur["close"] < swing_high and cur["close"] < cur["open"]:
-        sl = round(cur["high"] + 25.0, 2)
-        risk = sl - p
-        if 30.0 <= risk <= 750.0:
-            return {
-                "dir": "SHORT",
-                "category": "1.0_SWING_SWEEP",
-                "setup": "Masterclass 1.0: Liquidity Hunt at Resistance Swing + Rejection Close",
-                "entry": p,
-                "sl": sl,
-                "risk": risk,
-                "tp1": round(p - (2.0 * risk), 2),
-                "tp2": round(p - (3.5 * risk), 2),
-                "tp3": round(p - (5.0 * risk), 2)
-            }
-
-    # Setup 4: MOMENTUM EXPANSION (Waterfall Breakdown / Breakout)
-    if body / candle_range >= 0.58:
-        if cur["close"] > swing_high and cur["close"] > cur["open"]:
-            sl = round(cur["open"] - 25.0, 2)
-            risk = p - sl
-            if 30.0 <= risk <= 750.0:
+    # 3. SETUP: 1.0 SWING SUPPORT TRAP
+    if prev["low"] < swing_low and prev["close"] > swing_low:
+        if (cur["close"] > prev["high"]) and (cur["close"] > cur["open"]) and (cur["close"] > ema9):
+            sl = round(prev["low"] - 25.0, 2)
+            risk = round(p - sl, 2)
+            if 30.0 <= risk <= 650.0:
                 return {
                     "dir": "LONG",
-                    "category": "2.0_MOMENTUM_RUN",
-                    "setup": "Institutional Momentum Breakout (Solid Body Expansion)",
+                    "category": "1.0_SWING_SWEEP",
+                    "setup": "Support Swing Trap + Breakout Confirmation above 9 EMA",
                     "entry": p,
                     "sl": sl,
                     "risk": risk,
                     "tp1": round(p + (2.0 * risk), 2),
                     "tp2": round(p + (3.5 * risk), 2),
-                    "tp3": round(p + (5.0 * risk), 2)
+                    "candle_time": cur["time"]
                 }
-        elif cur["close"] < swing_low and cur["close"] < cur["open"]:
-            sl = round(cur["open"] + 25.0, 2)
-            risk = sl - p
-            if 30.0 <= risk <= 750.0:
+
+    # 4. SETUP: 1.0 SWING RESISTANCE TRAP
+    if prev["high"] > swing_high and prev["close"] < swing_high:
+        if (cur["close"] < prev["low"]) and (cur["close"] < cur["open"]) and (cur["close"] < ema9):
+            sl = round(prev["high"] + 25.0, 2)
+            risk = round(sl - p, 2)
+            if 30.0 <= risk <= 650.0:
                 return {
                     "dir": "SHORT",
-                    "category": "2.0_MOMENTUM_RUN",
-                    "setup": "Institutional Waterfall Breakdown (Solid Body Expansion)",
+                    "category": "1.0_SWING_SWEEP",
+                    "setup": "Resistance Swing Trap + Breakdown Confirmation below 9 EMA",
                     "entry": p,
                     "sl": sl,
                     "risk": risk,
                     "tp1": round(p - (2.0 * risk), 2),
                     "tp2": round(p - (3.5 * risk), 2),
-                    "tp3": round(p - (5.0 * risk), 2)
+                    "candle_time": cur["time"]
                 }
 
     return None
@@ -301,8 +319,8 @@ def sync_market_hub():
             ref = k15[-14:]
             with LOCK:
                 ACTIVE_POIS = [
-                    {"type": "PDH", "title": "2.0 PDH (Previous Day High)", "price": round(pdh, 2), "color": "#ff1744"},
-                    {"type": "PDL", "title": "2.0 PDL (Previous Day Low)", "price": round(pdl, 2), "color": "#00e676"},
+                    {"type": "PDH", "title": "PDH (High)", "price": round(pdh, 2), "color": "#ff1744"},
+                    {"type": "PDL", "title": "PDL (Low)", "price": round(pdl, 2), "color": "#00e676"},
                     {"type": "BSL", "title": "Resistance Swing", "price": round(max(x["high"] for x in ref), 2), "color": "#ef5350"},
                     {"type": "SSL", "title": "Support Swing", "price": round(min(x["low"] for x in ref), 2), "color": "#26a69a"}
                 ]
@@ -310,80 +328,111 @@ def sync_market_hub():
         DATA_HUB["session_tag"] = get_current_session()
         DATA_HUB["last_sync"] = time.time()
     except Exception as e:
-        logging.warning(f"Sync loop error: {e}")
+        logging.warning(f"Sync error: {e}")
+
+def save_or_update_trade(t, status="OPEN", exit_p=0.0, res="RUNNING", pnl_r=0.0, pnl_pct=0.0):
+    try:
+        closed_at = datetime.now(timezone.utc).strftime("%H:%M:%S") if status == "CLOSED" else None
+        conn = db()
+        conn.execute("""INSERT OR REPLACE INTO trades 
+                     (trade_id, created_at, closed_at, signal_type, tf, direction, setup, entry, sl, tp1, tp2, exit, result, pnl_r, pnl_percent, status)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  (t["id"], t["created"], closed_at, t["type"], t["tf"], t["dir"], t["setup"],
+                   t["entry"], t["sl"], t["tp1"], t["tp2"], exit_p, res, pnl_r, pnl_pct, status))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"DB error: {e}")
 
 def manage_positions(p):
-    global ACTIVE_TRADES
+    global ACTIVE_TRADES, DAILY_STATS
     with LOCK:
         rem = []
         for t in ACTIVE_TRADES:
             entry = t["entry"]
-            if t["dir"] == "LONG":
+            direction = t["dir"]
+
+            if direction == "LONG":
+                # Auto-Breakeven at 1:2
                 if p >= t["tp1"] and t["stage"] == "OPEN":
                     t["stage"] = "TP1_DONE"
                     t["sl"] = entry
-                    send_telegram(f"🎯 <b>[{t['type']}] 1:2 TP1 HIT</b>\nStop Loss moved to <b>Breakeven (${entry:,.2f})</b>")
-                elif p >= t["tp2"] and t["stage"] == "TP1_DONE":
-                    t["stage"] = "TP2_DONE"
-                    t["sl"] = t["tp1"]
-                    send_telegram(f"🎯 <b>[{t['type']}] 1:3.5 TP2 HIT</b>\nStop Loss trailed to <b>TP1 (${t['tp1']:,.2f})</b>")
+                    save_or_update_trade(t, status="RUNNING_RISK_FREE")
+                    send_telegram(
+                        f"🎯 <b>[{t['type']}] 1:2 TARGET HIT</b>\n"
+                        f"🛡 <b>Auto-Breakeven:</b> Stop Loss shifted to Entry (${entry:,.2f}). Trade is now Risk-Free!"
+                    )
+
                 if p <= t["sl"]:
-                    pnl = -1.0 if t["stage"] == "OPEN" else 1.5
-                    res = "SL HIT" if t["stage"] == "OPEN" else "PROFIT / BE CLOSE"
-                    save_closed(t, p, res, pnl)
-                    send_telegram(f"🏁 <b>[{t['type']} FINISHED] {res}</b> @ ${p:,.2f} | PnL: <b>{pnl:+.1f}R</b>")
-                    continue
-                elif p >= t["tp3"]:
-                    save_closed(t, p, "RUNNER TARGET 1:5 🔥", 5.0)
-                    send_telegram(f"🔥 <b>[{t['type']} 1:5 TARGET ACCOMPLISHED]</b> @ ${p:,.2f} | PnL: <b>+5.0R</b>")
+                    is_full_loss = (t["stage"] == "OPEN")
+                    pnl_r = -1.0 if is_full_loss else 0.0
+                    pnl_pct = round(((p - entry) / entry) * 100, 2)
+                    res = "SL HIT (-1R)" if is_full_loss else "BREAKEVEN EXIT (0R)"
+                    
+                    if is_full_loss:
+                        DAILY_STATS["consecutive_losses"] += 1
+                    else:
+                        DAILY_STATS["consecutive_losses"] = 0
+
+                    save_or_update_trade(t, status="CLOSED", exit_p=p, res=res, pnl_r=pnl_r, pnl_pct=pnl_pct)
+                    send_telegram(f"🏁 <b>[{t['type']} FINISHED] {res}</b> @ ${p:,.2f} | PnL: <b>{pnl_pct:+.2f}%</b> ({pnl_r:+.1f}R)")
                     continue
 
-            elif t["dir"] == "SHORT":
+                elif p >= t["tp2"]:
+                    DAILY_STATS["consecutive_losses"] = 0
+                    pnl_pct = round(((p - entry) / entry) * 100, 2)
+                    save_or_update_trade(t, status="CLOSED", exit_p=p, res="TP2 RUNNER HIT 🔥", pnl_r=3.5, pnl_pct=pnl_pct)
+                    send_telegram(f"🔥 <b>[{t['type']} RUNNER TARGET HIT]</b> @ ${p:,.2f} | PnL: <b>{pnl_pct:+.2f}%</b> (+3.5R)")
+                    continue
+
+            elif direction == "SHORT":
                 if p <= t["tp1"] and t["stage"] == "OPEN":
                     t["stage"] = "TP1_DONE"
                     t["sl"] = entry
-                    send_telegram(f"🎯 <b>[{t['type']}] 1:2 TP1 HIT</b>\nStop Loss moved to <b>Breakeven (${entry:,.2f})</b>")
-                elif p <= t["tp2"] and t["stage"] == "TP1_DONE":
-                    t["stage"] = "TP2_DONE"
-                    t["sl"] = t["tp1"]
-                    send_telegram(f"🎯 <b>[{t['type']}] 1:3.5 TP2 HIT</b>\nStop Loss trailed to <b>TP1 (${t['tp1']:,.2f})</b>")
+                    save_or_update_trade(t, status="RUNNING_RISK_FREE")
+                    send_telegram(
+                        f"🎯 <b>[{t['type']}] 1:2 TARGET HIT</b>\n"
+                        f"🛡 <b>Auto-Breakeven:</b> Stop Loss shifted to Entry (${entry:,.2f}). Trade is now Risk-Free!"
+                    )
+
                 if p >= t["sl"]:
-                    pnl = -1.0 if t["stage"] == "OPEN" else 1.5
-                    res = "SL HIT" if t["stage"] == "OPEN" else "PROFIT / BE CLOSE"
-                    save_closed(t, p, res, pnl)
-                    send_telegram(f"🏁 <b>[{t['type']} FINISHED] {res}</b> @ ${p:,.2f} | PnL: <b>{pnl:+.1f}R</b>")
+                    is_full_loss = (t["stage"] == "OPEN")
+                    pnl_r = -1.0 if is_full_loss else 0.0
+                    pnl_pct = round(((entry - p) / entry) * 100, 2)
+                    res = "SL HIT (-1R)" if is_full_loss else "BREAKEVEN EXIT (0R)"
+                    
+                    if is_full_loss:
+                        DAILY_STATS["consecutive_losses"] += 1
+                    else:
+                        DAILY_STATS["consecutive_losses"] = 0
+
+                    save_or_update_trade(t, status="CLOSED", exit_p=p, res=res, pnl_r=pnl_r, pnl_pct=pnl_pct)
+                    send_telegram(f"🏁 <b>[{t['type']} FINISHED] {res}</b> @ ${p:,.2f} | PnL: <b>{pnl_pct:+.2f}%</b> ({pnl_r:+.1f}R)")
                     continue
-                elif p <= t["tp3"]:
-                    save_closed(t, p, "RUNNER TARGET 1:5 🔥", 5.0)
-                    send_telegram(f"🔥 <b>[{t['type']} 1:5 TARGET ACCOMPLISHED]</b> @ ${p:,.2f} | PnL: <b>+5.0R</b>")
+
+                elif p <= t["tp2"]:
+                    DAILY_STATS["consecutive_losses"] = 0
+                    pnl_pct = round(((entry - p) / entry) * 100, 2)
+                    save_or_update_trade(t, status="CLOSED", exit_p=p, res="TP2 RUNNER HIT 🔥", pnl_r=3.5, pnl_pct=pnl_pct)
+                    send_telegram(f"🔥 <b>[{t['type']} RUNNER TARGET HIT]</b> @ ${p:,.2f} | PnL: <b>{pnl_pct:+.2f}%</b> (+3.5R)")
                     continue
 
             rem.append(t)
         ACTIVE_TRADES = rem
 
-def save_closed(t, exit_p, res, pnl):
-    try:
-        c = db()
-        c.execute("""INSERT OR REPLACE INTO trades 
-                     (trade_id, created_at, signal_type, tf, direction, setup, score, entry, sl, tp1, tp2, tp3, exit, result, pnl_r, status)
-                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                  (t["id"], t["created"], t["type"], t["tf"], t["dir"], t["setup"], 98,
-                   t["entry"], t["sl"], t["tp1"], t["tp2"], t["tp3"], exit_p, res, pnl, "CLOSED"))
-        c.commit()
-        c.close()
-    except Exception as e:
-        logging.error(f"DB save error: {e}")
-
-LAST_SCAN_TIME = 0
-
 def master_execution_scan():
-    global ACTIVE_TRADES, LAST_SCAN_TIME
+    global ACTIVE_TRADES, LAST_PROCESSED_CANDLE_TIME, DAILY_STATS
     with LOCK:
+        reset_daily_stats_if_needed()
+
         if len(ACTIVE_TRADES) >= 1: 
             return
-            
-        now = time.time()
-        if now - LAST_SCAN_TIME < 20: 
+        if DAILY_STATS["trades_count"] >= MAX_DAILY_TRADES:
+            return
+        if DAILY_STATS["consecutive_losses"] >= MAX_CONSECUTIVE_LOSSES:
+            if not DAILY_STATS["locked"]:
+                DAILY_STATS["locked"] = True
+                send_telegram("🛑 <b>RISK DISCIPLINE TRIGGERED:</b> 2 consecutive SL hits. Trading locked for the day to preserve capital.")
             return
 
         c15 = DATA_HUB["klines_15m"]
@@ -391,15 +440,19 @@ def master_execution_scan():
         pdh = DATA_HUB["pdh"]
         pdl = DATA_HUB["pdl"]
 
-        if len(c15) < 15 or p < 10000: 
+        if len(c15) < 18 or p < 10000: 
             return
 
-        signal = scan_masterclass_2_setups(c15, pdh, pdl, p)
+        signal = scan_jha_masterclass_setups(c15, pdh, pdl, p)
         if not signal:
             return
 
+        # Closed-candle timestamp lock: stops duplicate alerts
+        if signal["candle_time"] <= LAST_PROCESSED_CANDLE_TIME:
+            return
+
         t = {
-            "id": f"TRD_{int(now*1000)}",
+            "id": f"TRD_{int(time.time()*1000)}",
             "created": datetime.now(timezone.utc).strftime("%H:%M:%S"),
             "type": signal["category"],
             "tf": "15M",
@@ -409,42 +462,34 @@ def master_execution_scan():
             "sl": round(signal["sl"], 2),
             "tp1": round(signal["tp1"], 2),
             "tp2": round(signal["tp2"], 2),
-            "tp3": round(signal["tp3"], 2),
             "stage": "OPEN"
         }
 
         ACTIVE_TRADES.append(t)
-        LAST_SCAN_TIME = now
+        LAST_PROCESSED_CANDLE_TIME = signal["candle_time"]
+        DAILY_STATS["trades_count"] += 1
+
+        # Save to DB instantly
+        save_or_update_trade(t, status="OPEN")
 
         send_telegram(
-            f"👑 <b>[GAUTAM JHA 2.0 STRATEGY ALERT]</b>\n\n"
+            f"👑 <b>[GAUTAM JHA MASTERCLASS CONFIRMED SETUP]</b>\n\n"
             f"<b>Direction:</b> {signal['dir']} ({signal['category']})\n"
             f"🔹 <b>Entry:</b> ${signal['entry']:,.2f}\n"
             f"🛑 <b>Stop Loss:</b> ${signal['sl']:,.2f} (Risk: ${signal['risk']:.1f})\n"
             f"🎯 <b>Target 1 (1:2):</b> ${signal['tp1']:,.2f}\n"
-            f"🎯 <b>Target 2 (1:3.5):</b> ${signal['tp2']:,.2f}\n"
-            f"🔥 <b>Target 3 (1:5):</b> ${signal['tp3']:,.2f}\n\n"
+            f"🔥 <b>Target 2 (1:3.5):</b> ${signal['tp2']:,.2f}\n\n"
             f"🧠 <b>Trading Logic:</b> {signal['setup']}\n"
-            f"📍 <b>Key Daily Benchmark:</b> PDH: ${pdh:,.1f} | PDL: ${pdl:,.1f}\n"
-            f"⏱ <b>Session:</b> {DATA_HUB['session_tag']}\n"
-            f"🛡 <b>Auto Management:</b> Cost-to-cost Breakeven at TP1"
+            f"📍 <b>Key Benchmark:</b> PDH: ${pdh:,.1f} | PDL: ${pdl:,.1f}\n"
+            f"🛡 <b>Auto Management:</b> Cost-to-cost Breakeven at TP1\n"
+            f"📊 <b>Discipline Status:</b> Trade {DAILY_STATS['trades_count']}/{MAX_DAILY_TRADES}"
         )
-
-def keep_alive_ping():
-    time.sleep(60)
-    while True:
-        try:
-            url = RENDER_EXTERNAL_URL or "http://127.0.0.1:10000/healthz"
-            requests.get(url, timeout=5)
-        except Exception:
-            pass
-        time.sleep(300)
 
 def master_loop():
     global STARTED_FLAG
     time.sleep(3)
     if not STARTED_FLAG:
-        send_telegram("🚀 <b>GAUTAM JHA ENGINE UNBLOCKED (COINBASE ROUTE)</b>\nReal-time Data Connected. 24/7 Scanning Active.")
+        send_telegram("👑 <b>DISCIPLINE ENGINE & VAULT LOGGER LIVE</b>\nTracking Traps, Confirmation Candles, and Percentage Returns.")
         STARTED_FLAG = True
 
     while True:
@@ -456,8 +501,18 @@ def master_loop():
                 master_execution_scan()
             time.sleep(3)
         except Exception as e:
-            logging.error(f"Loop issue: {e}")
+            logging.error(f"Loop error: {e}")
             time.sleep(3)
+
+def keep_alive_ping():
+    time.sleep(60)
+    while True:
+        try:
+            url = RENDER_EXTERNAL_URL or "http://127.0.0.1:10000/healthz"
+            requests.get(url, timeout=5)
+        except Exception:
+            pass
+        time.sleep(300)
 
 threading.Thread(target=master_loop, daemon=True).start()
 threading.Thread(target=keep_alive_ping, daemon=True).start()
