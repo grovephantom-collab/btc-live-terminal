@@ -1,6 +1,8 @@
 """
-Institutional SMC Master Engine (worker.py)
-Complete Production Architecture with Leader Lock, FVG, and Async Queue.
+Institutional SMC Master Engine (worker.py) - NOISE-IMMUNE EDITION
+- Minimum Risk: $120 (Eliminates $30 noise stops)
+- Rejection confirmation on FVG retests
+- Bulletproof Single-Leader Lock to prevent duplicate Telegram alerts
 """
 import os
 import time
@@ -23,25 +25,26 @@ DB_FILE = os.getenv("DB_FILE", "trades_v5.db")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8941403990:AAGLH_dupqmGoipglhVvRuiPBzvgMqJR3Ms")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7886716805")
 PORT = int(os.environ.get("PORT", 10000))
-SELF_URL = os.getenv("RENDER_EXTERNAL_URL", f"http://127.0.0.1:{PORT}").rstrip("/")
 
 MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "4"))
 ALLOWED_SESSIONS = {s.strip() for s in os.getenv(
     "TRADE_SESSIONS", "ASIAN RANGE,LONDON EXPANSION,NEW YORK TREND,SESSION CLOSE").split(",")}
 
+# Noise Immunity Adjustments
 SWEEP_BUFFER = 75.0          # +/- $75 tolerance around PDH/PDL
-SL_BUFFER = 20.0
-WICK_MIN = 0.24              # 24% rejection wick
-BODY_MAX = 0.60              # momentum exhaustion on trap candle
-VOL_MULT = 1.10              # absorption: >=1.1x avg of previous 10 candles
+SL_BUFFER = 45.0             # Extended protection beyond wicks/zones
+WICK_MIN = 0.24              # 24% rejection wick minimum
+BODY_MAX = 0.60              # exhaustion on trap candle
+VOL_MULT = 1.10              # absorption: >= 1.1x avg volume
 VOL_LOOKBACK = 10
 SPIKE_CAP = 1200.0           # news circuit breaker
-RISK_MIN, RISK_MAX = 30.0, 650.0
-BOS_RISK_MIN, BOS_RISK_MAX = 40.0, 500.0
+RISK_MIN = 120.0             # NO MORE $30 TIGHT STOPS. Minimum $120 space
+RISK_MAX = 650.0
+BOS_RISK_MIN = 120.0
+BOS_RISK_MAX = 550.0
 TP1_R, TP2_R = 2.0, 3.5
-FVG_MIN_SIZE = 30.0
-MAX_ENTRY_DRIFT = 0.5
-LOCK_SECONDS = 24 * 3600     # freeze after 2 consecutive SL
+FVG_MIN_SIZE = 35.0
+LOCK_SECONDS = 24 * 3600     # 24hr freeze on 2 consecutive losses
 PRICE_MAX_AGE, KLINE_MAX_AGE = 25, 120
 
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
@@ -87,13 +90,13 @@ def init_db():
 init_db()
 
 
-def acquire_leader(ttl=20.0):
+def acquire_leader(ttl=15.0):
     conn = db()
     try:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute("SELECT owner, ts FROM leader WHERE id=1").fetchone()
         now = time.time()
-        if row is None or row["owner"] == WORKER_ID or now - row["ts"] > ttl:
+        if row is None or row["owner"] == WORKER_ID or (now - row["ts"]) > ttl:
             conn.execute("INSERT OR REPLACE INTO leader (id, owner, ts) VALUES (1, ?, ?)", (WORKER_ID, now))
             conn.execute("COMMIT")
             return True
@@ -129,13 +132,13 @@ def telegram_worker():
                 r = HTTP.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
                                          "parse_mode": "HTML"}, timeout=8)
                 if r.status_code == 429:
-                    time.sleep(r.json().get("parameters", {}).get("retry_after", 2))
+                    time.sleep(r.json().get("parameters", {}).get("retry_after", 3))
                     continue
                 if r.ok:
                     break
             except Exception as e:
                 logging.error(f"Telegram worker error: {type(e).__name__}")
-            time.sleep(1.5 * (attempt + 1))
+            time.sleep(2.0 * (attempt + 1))
 
 
 # ----------------------------------------------------------------- ROUTES
@@ -264,14 +267,15 @@ def vol_absorbed(c, idx):
     return avg > 0 and c[idx]["vol"] >= VOL_MULT * avg
 
 
-def make_signal(direction, cat, setup, p, sl, rmin, rmax, t, extra=""):
+def make_signal(direction, cat, setup, p, sl, rmin, rmax, t):
     risk = round(abs(p - sl), 2)
     if (direction == "LONG" and sl >= p) or (direction == "SHORT" and sl <= p):
         return None
+    # Reject tight and oversized stops strictly
     if not (rmin <= risk <= rmax):
         return None
     m = 1 if direction == "LONG" else -1
-    return {"dir": direction, "cat": cat, "setup": setup + extra, "entry": p, "sl": round(sl, 2),
+    return {"dir": direction, "cat": cat, "setup": setup, "entry": p, "sl": round(sl, 2),
             "risk": risk, "tp1": round(p + m * TP1_R * risk, 2), "tp2": round(p + m * TP2_R * risk, 2),
             "time": t}
 
@@ -283,6 +287,7 @@ def scan_setups(c15, pdh, pdl, p):
     prev_range = max(prev["high"] - prev["low"], 1.0)
     cur_range = max(cur["high"] - cur["low"], 1.0)
 
+    # Circuit Breaker: News volatility
     if prev_range > SPIKE_CAP or cur_range > SPIKE_CAP:
         return None
 
@@ -294,54 +299,68 @@ def scan_setups(c15, pdh, pdl, p):
     swing_high = max(x["high"] for x in ref)
     swing_low = min(x["low"] for x in ref)
     t = cur["time"]
-    vtag = " + Volume Absorption" if absorbed else ""
+    vtag = " + Absorption" if absorbed else ""
 
-    # 1) SSL / PDL sweep -> LONG
+    # 1) SSL / PDL Sweep Reversal -> LONG
     pdl_hit = pdl > 0 and prev["low"] <= pdl + SWEEP_BUFFER and prev["close"] > pdl
     ssl_hit = prev["low"] < swing_low and prev["close"] > swing_low
     if ((pdl_hit or ssl_hit) and lower_wick >= WICK_MIN and body <= BODY_MAX
             and cur["close"] > cur["open"] and cur["close"] > prev["close"]):
         cat = "PDL_TRAP" if pdl_hit else "SSL_SWEEP"
+        sl_calc = min(prev["low"], cur["low"]) - SL_BUFFER
         sig = make_signal("LONG", cat, f"{cat}: Liquidity Hunt + {lower_wick*100:.0f}% Wick{vtag}",
-                          p, prev["low"] - SL_BUFFER, RISK_MIN, RISK_MAX, t)
+                          p, sl_calc, RISK_MIN, RISK_MAX, t)
         if sig: return sig
 
-    # 2) BSL / PDH sweep -> SHORT
+    # 2) BSL / PDH Sweep Reversal -> SHORT
     pdh_hit = pdh > 0 and prev["high"] >= pdh - SWEEP_BUFFER and prev["close"] < pdh
     bsl_hit = prev["high"] > swing_high and prev["close"] < swing_high
     if ((pdh_hit or bsl_hit) and upper_wick >= WICK_MIN and body <= BODY_MAX
             and cur["close"] < cur["open"] and cur["close"] < prev["close"]):
         cat = "PDH_TRAP" if pdh_hit else "BSL_SWEEP"
-        sig = make_signal("SHORT", cat, f"{cat}: Retail Breakout Trapped + {upper_wick*100:.0f}% Rejection{vtag}",
-                          p, prev["high"] + SL_BUFFER, RISK_MIN, RISK_MAX, t)
+        sl_calc = max(prev["high"], cur["high"]) + SL_BUFFER
+        sig = make_signal("SHORT", cat, f"{cat}: Retail Trap + {upper_wick*100:.0f}% Wick{vtag}",
+                          p, sl_calc, RISK_MIN, RISK_MAX, t)
         if sig: return sig
 
-    # 3) BOS momentum expansion
-    cur_abs = vol_absorbed(c15, -1)
-    if cur["close"] > swing_high and prev["low"] > swing_low + 200 and cur["close"] > cur["open"]:
-        sig = make_signal("LONG", "BOS_EXPANSION", "Break of Structure (BOS) Bullish Expansion",
-                          p, min(cur["low"], prev["low"]) - SL_BUFFER, BOS_RISK_MIN, BOS_RISK_MAX, t)
+    # 3) BOS Momentum Expansion
+    if cur["close"] > swing_high and prev["low"] > swing_low + 150 and cur["close"] > cur["open"]:
+        sl_calc = min(cur["low"], prev["low"]) - SL_BUFFER
+        sig = make_signal("LONG", "BOS_EXPANSION", "Break of Structure Bullish Continuation",
+                          p, sl_calc, BOS_RISK_MIN, BOS_RISK_MAX, t)
         if sig: return sig
-    if cur["close"] < swing_low and prev["high"] < swing_high - 200 and cur["close"] < cur["open"]:
-        sig = make_signal("SHORT", "BOS_EXPANSION", "Break of Structure (BOS) Bearish Expansion",
-                          p, max(cur["high"], prev["high"]) + SL_BUFFER, BOS_RISK_MIN, BOS_RISK_MAX, t)
+    if cur["close"] < swing_low and prev["high"] < swing_high - 150 and cur["close"] < cur["open"]:
+        sl_calc = max(cur["high"], prev["high"]) + SL_BUFFER
+        sig = make_signal("SHORT", "BOS_EXPANSION", "Break of Structure Bearish Continuation",
+                          p, sl_calc, BOS_RISK_MIN, BOS_RISK_MAX, t)
         if sig: return sig
 
-    # 4) FVG retest in trend direction
+    # 4) FVG Retest WITH STRICT CONFIRMATION (No Blind Touching)
     closes = [x["close"] for x in c15[-50:]]
-    trend_up = cur["close"] > sum(closes) / len(closes)
+    trend_up = cur["close"] > (sum(closes) / len(closes))
+    cur_wick_low = (min(cur["open"], cur["close"]) - cur["low"]) / cur_range
+    cur_wick_high = (cur["high"] - max(cur["open"], cur["close"])) / cur_range
+
     for f in find_fvgs(c15):
         if f["idx"] >= len(c15) - 3: continue
+        # Long retest: Price must dip into zone, bounce, leave a wick >= 20% and close GREEN
         if f["dir"] == "LONG" and trend_up:
-            if (cur["low"] <= f["hi"] and cur["close"] >= f["lo"] and cur["close"] > cur["open"]):
-                sig = make_signal("LONG", "FVG_RETEST", "Bullish FVG Imbalance Retest",
-                                  p, min(cur["low"], f["lo"]) - SL_BUFFER, RISK_MIN, RISK_MAX, t)
+            if (cur["low"] <= f["hi"] and cur["close"] >= f["lo"] and cur["close"] > cur["open"]
+                    and cur_wick_low >= 0.20):
+                # SL sits below the FVG zone floor with buffer, preventing inside-zone stops
+                sl_calc = f["lo"] - SL_BUFFER
+                sig = make_signal("LONG", "FVG_RETEST", "Bullish FVG Retest with Rejection Confirmation",
+                                  p, sl_calc, RISK_MIN, RISK_MAX, t)
                 if sig: return sig
+        # Short retest: Price must test zone, reject with wick >= 20% and close RED
         elif f["dir"] == "SHORT" and not trend_up:
-            if (cur["high"] >= f["lo"] and cur["close"] <= f["hi"] and cur["close"] < cur["open"]):
-                sig = make_signal("SHORT", "FVG_RETEST", "Bearish FVG Imbalance Retest",
-                                  p, max(cur["high"], f["hi"]) + SL_BUFFER, RISK_MIN, RISK_MAX, t)
+            if (cur["high"] >= f["lo"] and cur["close"] <= f["hi"] and cur["close"] < cur["open"]
+                    and cur_wick_high >= 0.20):
+                sl_calc = f["hi"] + SL_BUFFER
+                sig = make_signal("SHORT", "FVG_RETEST", "Bearish FVG Retest with Rejection Confirmation",
+                                  p, sl_calc, RISK_MIN, RISK_MAX, t)
                 if sig: return sig
+
     return None
 
 
@@ -381,22 +400,22 @@ def manage_positions(p):
             reached = (lambda lvl: p >= lvl) if long_ else (lambda lvl: p <= lvl)
             stopped = (lambda lvl: p <= lvl) if long_ else (lambda lvl: p >= lvl)
 
-            # TP2 First
+            # TP2 Target
             if reached(tp2):
                 if close_trade(conn, t, tp2, f"TP2 HIT (+{TP2_R}R)", TP2_R):
-                    send_telegram(f"🔥 <b>[{tag} TP2 FINISHED]</b>\nExit: ${tp2:,.2f} | "
+                    send_telegram(f"🔥 <b>[{tag} TP2 TARGET HIT]</b>\nExit: ${tp2:,.2f} | "
                                   f"PnL: <b>{pct(t['direction'], entry, tp2):+.2f}%</b> (+{TP2_R}R)")
                 continue
 
-            # TP1 -> Breakeven
+            # TP1 -> Shift Stop Loss to Breakeven
             if status == "OPEN" and reached(tp1):
                 r = conn.execute("UPDATE trades SET status='RISK_FREE', sl=? WHERE trade_id=? AND status='OPEN'",
                                  (entry, t["trade_id"]))
                 if r.rowcount > 0:
                     send_telegram(f"🎯 <b>[{tag}] TP1 HIT (+{TP1_R}R)</b>\n"
-                                  f"Stop Loss shifted to Entry (${entry:,.2f}). Trade is Risk-Free!")
+                                  f"Stop Loss shifted to Entry (${entry:,.2f}). Trade is now 100% Risk-Free!")
 
-            # SL or Breakeven
+            # Stop Loss Trigger
             if stopped(sl):
                 full_loss = status == "OPEN"
                 res_text = "SL HIT (-1R)" if full_loss else "BREAKEVEN EXIT (0R)"
@@ -434,7 +453,7 @@ def try_signal(p):
 
         sig = scan_setups(klines, pdh, pdl, p)
         if sig:
-            tid = f"TRD_{sig['time']}"
+            tid = f"TRD_{sig['time']}_{sig['cat']}"
             t_time = datetime.now(timezone.utc).strftime("%H:%M:%S")
             try:
                 conn.execute("""INSERT INTO trades 
