@@ -1,685 +1,1310 @@
-#!/usr/bin/env python3
-"""
-INSTITUTIONAL BTC/USDT ENGINE (worker.py)
-Filtered by High-Rating Concepts (>5/10):
-- Liquidity Sweep & Judas Traps (10/10)
-- Pure Price Action & Wick Rejections (10/10)
-- Volume Profile (Point of Control - POC) (9/10)
-- SMC / ICT Framework (8/10)
-- Supply & Demand Order Blocks (8/10)
-- Fair Value Gap (FVG) Mitigation (7/10)
-- 20/50 Dynamic EMA Trend Filter (7/10)
-- Fibonacci Equilibrium / Discount Zone (6/10)
-"""
 
-import os
-import time
-import uuid
-import queue
-import sqlite3
-import logging
-import threading
+#!/usr/bin/env python3
+"""BTCUSDT SMC PAPER engine. Live/testnet order placement is intentionally disabled."""
+import os, sys, time, uuid, hmac, math, json, queue, sqlite3, logging, threading
 from datetime import datetime, timezone
-from html import escape
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from flask import Flask, jsonify
+from flask import Flask, request, jsonify
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [PRO-SMC] %(message)s")
-app = Flask(__name__)
-
-# ==========================================
-# CONFIGURATION & CONSTANTS
-# ==========================================
-DB_FILE = os.getenv("DB_FILE", "trades_v9.db")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8941403990:AAGLH_dupqmGoipglhVvRuiPBzvgMqJR3Ms")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7886716805")
-PORT = int(os.environ.get("PORT", 10000))
-
-MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "4"))
-ALLOWED_SESSIONS = {
-    s.strip() for s in os.getenv("TRADE_SESSIONS", "LONDON EXPANSION,NEW YORK TREND,SESSION CLOSE,ASIAN RANGE").split(",")
-}
-
-# Institutional Parameters
-SWEEP_TOLERANCE = 85.0
-SL_BUFFER = 85.0
-WICK_MIN_RATIO = 0.25
-BODY_MAX_RATIO = 0.55
-VOL_ABSORB_MULT = 1.15
-VOL_LOOKBACK = 10
-NEWS_SPIKE_CAP = 1200.0
-
-# Risk Management
-RISK_MIN = 150.0
-RISK_MAX = 700.0
-TP1_RR = 2.0
-TP2_RR = 3.5
-FVG_MIN_SIZE = 40.0
-LOCK_SECONDS = 24 * 3600
-DATA_MAX_AGE_SEC = 25
-
-HEADERS = {"User-Agent": "Pro-SMC-Engine/8.0", "Accept": "application/json"}
-HTTP = requests.Session()
-HTTP.headers.update(HEADERS)
-
-WORKER_ID = uuid.uuid4().hex[:8]
-STATE_LOCK = threading.Lock()
-DATA_HUB: Dict[str, Any] = {
-    "price": 0.0,
-    "price_ts": 0.0,
-    "pdh": 0.0,
-    "pdl": 0.0,
-    "poc": 0.0,
-    "session": "INITIALIZING",
-    "klines": [],
-    "kline_ts": 0.0
-}
-ACTIVE_POIS: List[Dict[str, Any]] = []
-
-# ==========================================
-# DATABASE & SINGLE-LEADER LOCK
-# ==========================================
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_FILE, timeout=30, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
-    return conn
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)sZ [%(levelname)s] %(message)s"
+)
+log = logging.getLogger("SMC")
 
 
-def init_db() -> None:
-    conn = db()
-    conn.execute("""CREATE TABLE IF NOT EXISTS trades (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        trade_id TEXT UNIQUE, created_date TEXT, created_at TEXT, closed_at TEXT,
-        signal_type TEXT, tf TEXT, direction TEXT, setup TEXT,
-        entry REAL, sl REAL, tp1 REAL, tp2 REAL, exit REAL,
-        result TEXT, pnl_r REAL, pnl_percent REAL, status TEXT,
-        risk REAL, closed_ts REAL, session TEXT)""")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_date ON trades(created_date)")
-    conn.execute("""CREATE TABLE IF NOT EXISTS leader (
-        id INTEGER PRIMARY KEY CHECK (id = 1), owner TEXT, ts REAL)""")
-    conn.close()
+def required(name: str, n: int = 24) -> str:
+    v = os.getenv(name, "").strip()
+    if len(v) < n:
+        raise RuntimeError(f"{name} is required and must be at least {n} characters")
+    return v
 
 
-init_db()
+def fenv(name, default, minimum=0.0):
+    v = float(os.getenv(name, str(default)))
+    if not math.isfinite(v) or v < minimum:
+        raise RuntimeError(f"{name} must be finite and >= {minimum}")
+    return v
 
 
-def acquire_leader(ttl: float = 12.0) -> bool:
-    conn = db()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute("SELECT owner, ts FROM leader WHERE id=1").fetchone()
-        now = time.time()
-        if row is None or row["owner"] == WORKER_ID or (now - row["ts"]) > ttl:
-            conn.execute("INSERT OR REPLACE INTO leader (id, owner, ts) VALUES (1, ?, ?)", (WORKER_ID, now))
-            conn.execute("COMMIT")
-            return True
-        conn.execute("ROLLBACK")
-        return False
-    except Exception as e:
-        try:
-            conn.execute("ROLLBACK")
-        except Exception:
-            pass
-        logging.warning(f"Leader lock check: {e}")
-        return False
-    finally:
-        conn.close()
+def ienv(name, default, minimum=0):
+    v = int(os.getenv(name, str(default)))
+    if v < minimum:
+        raise RuntimeError(f"{name} must be >= {minimum}")
+    return v
 
 
-# ==========================================
-# ASYNC TELEGRAM DISPATCHER
-# ==========================================
-TG_QUEUE: "queue.Queue[str]" = queue.Queue(maxsize=100)
+try:
+    API_SECRET_KEY = required("API_SECRET_KEY")
+    WORKER_AUTH_TOKEN = required("WORKER_AUTH_TOKEN")
 
+    MODE = os.getenv("TRADING_MODE", "PAPER").strip().upper()
+    if MODE != "PAPER":
+        raise RuntimeError(
+            "This worker.py is PAPER-only; TESTNET/LIVE order execution is disabled."
+        )
 
-def send_telegram(text: str) -> None:
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    try:
-        TG_QUEUE.put_nowait(text)
-    except queue.Full:
-        logging.warning("Telegram queue saturated")
+    SYMBOL = os.getenv("SYMBOL", "BTCUSDT").strip().upper()
+    if not SYMBOL.isalnum():
+        raise RuntimeError("Invalid SYMBOL")
 
+    PORT = ienv("PORT", 10000, 1)
+    if PORT > 65535:
+        raise RuntimeError("PORT must be <= 65535")
 
-def telegram_worker_loop() -> None:
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    while True:
-        text = TG_QUEUE.get()
-        for attempt in range(4):
-            try:
-                r = HTTP.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
-                                         "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=10)
-                if r.status_code == 429:
-                    sleep_dur = r.json().get("parameters", {}).get("retry_after", 4)
-                    time.sleep(sleep_dur)
-                    continue
-                if r.ok:
-                    break
-            except Exception as e:
-                logging.error(f"Telegram worker error: {type(e).__name__}")
-            time.sleep(2.0 * (attempt + 1))
+    DB_FILE = os.getenv("DB_FILE", "data/institutional_vault.db").strip()
+    BASE_URL = os.getenv(
+        "BINANCE_FUTURES_URL", "https://fapi.binance.com"
+    ).rstrip("/")
 
+    HTTP_TIMEOUT = fenv("REQUEST_TIMEOUT_SEC", 7, 1)
+    SCAN_SECONDS = fenv("SCAN_INTERVAL_SEC", 15, 3)
+    LEASE_TTL = fenv("LEADER_TTL_SEC", 15, 5)
+    MAX_DATA_AGE = fenv("MAX_DATA_AGE_SEC", 90, 10)
 
-# ==========================================
-# HTTP ENDPOINTS
-# ==========================================
-@app.route("/")
-@app.route("/healthz")
-def healthz():
-    return "Institutional Master Engine (>5 Rating Core) Live & Scanning", 200
+    START_EQUITY = fenv("PAPER_EQUITY_USD", 1000, 10)
+    RISK_PCT = fenv("RISK_PER_TRADE_PCT", 0.01, 0.0001)
+    MAX_DAILY_LOSS = fenv("MAX_DAILY_LOSS_USD", 50, 1)
+    MAX_DAILY_TRADES = ienv("MAX_DAILY_TRADES", 3, 1)
+    MAX_OPEN_TRADES = ienv("MAX_OPEN_TRADES", 1, 1)
+    MAX_NOTIONAL = fenv("MAX_NOTIONAL_USD", 1000, 10)
 
+    FEE_RATE = fenv("PAPER_FEE_RATE", 0.0005, 0)
+    SLIPPAGE = fenv("PAPER_SLIPPAGE_RATE", 0.0003, 0)
+    MIN_SCORE = fenv("MIN_SIGNAL_SCORE", 75, 0)
 
-def compute_stats(conn: sqlite3.Connection) -> Dict[str, Any]:
-    rows = conn.execute("SELECT result, pnl_r FROM trades WHERE status='CLOSED'").fetchall()
-    n = len(rows)
-    wins = sum(1 for r in rows if (r["pnl_r"] or 0) > 0)
-    losses = sum(1 for r in rows if (r["pnl_r"] or 0) < 0)
-    be = n - wins - losses
-    total_r = round(sum((r["pnl_r"] or 0) for r in rows), 2)
-    return {
-        "closed": n,
-        "wins": wins,
-        "losses": losses,
-        "breakeven": be,
-        "win_rate": round(100 * wins / n, 1) if n else 0.0,
-        "total_r": total_r,
+    MIN_GAP = fenv("MIN_FVG_GAP_USD", 35, 0)
+    SWEEP_BUFFER = fenv("SWEEP_BUFFER_USD", 5, 0)
+    SL_BUFFER = fenv("STRUCTURAL_SL_BUFFER_USD", 15, 0)
+    MIN_STOP = fenv("MIN_STOP_DISTANCE_USD", 40, 1)
+    MAX_STOP = fenv("MAX_STOP_DISTANCE_USD", 1500, 1)
+
+    TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+    ALLOWED_SESSIONS = {
+        x.strip().upper()
+        for x in os.getenv(
+            "ALLOWED_SESSIONS",
+            "LONDON EXPANSION,NEW YORK TREND"
+        ).split(",")
+        if x.strip()
     }
 
-
-@app.route("/vault-data")
-def vault_data():
-    try:
-        conn = db()
-        rows = conn.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 50").fetchall()
-        active = conn.execute("SELECT * FROM trades WHERE status IN ('OPEN','RISK_FREE')").fetchall()
-        stats = compute_stats(conn)
-        conn.close()
-
-        with STATE_LOCK:
-            snap = {k: DATA_HUB[k] for k in ("price", "pdh", "pdl", "poc", "session")}
-            pois = list(ACTIVE_POIS)
-
-        resp = jsonify({
-            "vault": [dict(r) for r in rows],
-            "active": [dict(r) for r in active],
-            "pois": pois,
-            "stats": stats,
-            **snap,
-        })
-        resp.headers["Cache-Control"] = "no-store"
-        resp.headers["Access-Control-Allow-Origin"] = "*"
-        return resp, 200
-    except Exception as e:
-        logging.error(f"Vault error: {e}")
-        return jsonify({"vault": [], "active": [], "pois": [], "stats": {}}), 500
+except Exception as e:
+    log.critical("Configuration error: %s", e)
+    sys.exit(1)
 
 
-# ==========================================
-# TECHNICAL CALCULATION HELPERS
-# ==========================================
-def calculate_ema(values: List[float], period: int) -> float:
-    if len(values) < period:
-        return values[-1] if values else 0.0
-    multiplier = 2.0 / (period + 1.0)
-    ema = sum(values[:period]) / period
-    for val in values[period:]:
-        ema = (val - ema) * multiplier + ema
-    return ema
+INSTANCE = str(uuid.uuid4())
+STARTED = time.time()
+HTTP = requests.Session()
+HTTP.headers.update({"User-Agent": "Institutional-SMC-Paper/1.0"})
+
+TG_QUEUE: queue.Queue = queue.Queue(maxsize=100)
+LOCK = threading.Lock()
+
+MARKET: Dict[str, Any] = {
+    "price": None,
+    "price_ts": 0,
+    "klines": {},
+    "klines_ts": 0,
+    "session": "INITIALIZING",
+    "error": None
+}
+
+STATE: Dict[str, Any] = {
+    "status": "STARTING",
+    "last_scan_epoch": 0,
+    "last_signal": None,
+    "last_error": None,
+    "fencing_token": None
+}
 
 
-def calculate_volume_profile_poc(candles: List[Dict[str, float]], bins_count: int = 25) -> float:
-    """9/10 Rating: Volume Profile Point of Control (Highest Volume Price Level)"""
-    if not candles:
-        return 0.0
-    min_p = min(c["low"] for c in candles)
-    max_p = max(c["high"] for c in candles)
-    if max_p <= min_p:
-        return min_p
+# ---------------------------------------------------------------------
+# General helpers
+# ---------------------------------------------------------------------
 
-    bin_width = (max_p - min_p) / bins_count
-    volume_by_bin = [0.0] * bins_count
-
-    for c in candles:
-        typical_p = (c["high"] + c["low"] + c["close"]) / 3.0
-        bin_idx = min(int((typical_p - min_p) / bin_width), bins_count - 1)
-        volume_by_bin[bin_idx] += c["vol"]
-
-    max_vol_bin = volume_by_bin.index(max(volume_by_bin))
-    poc_price = min_p + (max_vol_bin + 0.5) * bin_width
-    return round(poc_price, 2)
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
 
 
-# ==========================================
-# COINBASE INGESTION
-# ==========================================
-def get_session_name() -> str:
-    hr = datetime.now(timezone.utc).hour
-    if 0 <= hr < 7:
+def today():
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def jd(x):
+    return json.dumps(x, separators=(",", ":"), sort_keys=True, default=str)
+
+
+def session_now():
+    h = datetime.now(timezone.utc).hour
+    if h < 7:
         return "ASIAN RANGE"
-    if 7 <= hr < 13:
+    if h < 13:
         return "LONDON EXPANSION"
-    if 13 <= hr < 21:
+    if h < 21:
         return "NEW YORK TREND"
     return "SESSION CLOSE"
 
 
-def fetch_spot_price() -> None:
-    r = HTTP.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=5)
+# ---------------------------------------------------------------------
+# SQLite database
+# ---------------------------------------------------------------------
+
+def db():
+    os.makedirs(os.path.dirname(os.path.abspath(DB_FILE)), exist_ok=True)
+    c = sqlite3.connect(DB_FILE, timeout=20, isolation_level=None)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA busy_timeout=20000")
+    c.execute("PRAGMA synchronous=FULL")
+    c.execute("PRAGMA foreign_keys=ON")
+    return c
+
+
+def init_db():
+    c = db()
+    try:
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS leader_lease(
+            id INTEGER PRIMARY KEY CHECK(id=1),
+            leader_id TEXT NOT NULL,
+            fencing_token INTEGER NOT NULL,
+            acquired_at_utc TEXT NOT NULL,
+            expires_at_epoch REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS signals(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_key TEXT UNIQUE NOT NULL,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            setup_name TEXT NOT NULL,
+            score REAL NOT NULL,
+            entry_price REAL NOT NULL,
+            stop_price REAL NOT NULL,
+            tp1_price REAL NOT NULL,
+            tp2_price REAL NOT NULL,
+            tp3_price REAL NOT NULL,
+            timeframe TEXT NOT NULL,
+            candle_time INTEGER NOT NULL,
+            details_json TEXT NOT NULL,
+            created_at_utc TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS trades(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_id TEXT UNIQUE NOT NULL,
+            signal_key TEXT UNIQUE NOT NULL,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            setup_name TEXT NOT NULL,
+            score REAL NOT NULL,
+            entry_price REAL NOT NULL,
+            stop_price REAL NOT NULL,
+            tp1_price REAL NOT NULL,
+            tp2_price REAL NOT NULL,
+            tp3_price REAL NOT NULL,
+            initial_qty REAL NOT NULL,
+            remaining_qty REAL NOT NULL,
+            tp1_done INTEGER NOT NULL DEFAULT 0,
+            tp2_done INTEGER NOT NULL DEFAULT 0,
+            tp3_done INTEGER NOT NULL DEFAULT 0,
+            stage TEXT NOT NULL DEFAULT 'OPEN',
+            realized_pnl_usd REAL NOT NULL DEFAULT 0,
+            unrealized_pnl_usd REAL NOT NULL DEFAULT 0,
+            total_fee_usd REAL NOT NULL DEFAULT 0,
+            weighted_pnl_r REAL NOT NULL DEFAULT 0,
+            close_reason TEXT,
+            opened_at_utc TEXT NOT NULL,
+            closed_at_utc TEXT,
+            updated_at_utc TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS trade_audit_log(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            details_json TEXT NOT NULL,
+            timestamp_utc TEXT NOT NULL,
+            FOREIGN KEY(trade_id)
+                REFERENCES trades(trade_id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_trades_stage ON trades(stage);
+        CREATE INDEX IF NOT EXISTS idx_trades_opened ON trades(opened_at_utc);
+        CREATE INDEX IF NOT EXISTS idx_audit_trade ON trade_audit_log(trade_id);
+        """)
+    finally:
+        c.close()
+
+
+def audit(c, tid, event, details):
+    c.execute(
+        """INSERT INTO trade_audit_log
+        (trade_id,event_type,details_json,timestamp_utc)
+        VALUES(?,?,?,?)""",
+        (tid, event, jd(details), now_iso())
+    )
+
+
+# ---------------------------------------------------------------------
+# Atomic leader lease and fencing token
+# ---------------------------------------------------------------------
+
+def lease_tick() -> Tuple[bool, Optional[int]]:
+    t = time.time()
+    c = db()
+
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        r = c.execute(
+            "SELECT * FROM leader_lease WHERE id=1"
+        ).fetchone()
+
+        if r is None:
+            token = 1
+            c.execute(
+                """INSERT INTO leader_lease
+                VALUES(1,?,?,?,?)""",
+                (INSTANCE, token, now_iso(), t + LEASE_TTL)
+            )
+            c.commit()
+            return True, token
+
+        if r["leader_id"] == INSTANCE and r["expires_at_epoch"] > t:
+            token = int(r["fencing_token"])
+            n = c.execute(
+                """UPDATE leader_lease
+                SET acquired_at_utc=?,expires_at_epoch=?
+                WHERE id=1 AND leader_id=? AND fencing_token=?
+                AND expires_at_epoch>?""",
+                (now_iso(), t + LEASE_TTL, INSTANCE, token, t)
+            ).rowcount
+            c.commit()
+            return n == 1, token if n == 1 else None
+
+        if r["expires_at_epoch"] <= t:
+            token = int(r["fencing_token"]) + 1
+            n = c.execute(
+                """UPDATE leader_lease
+                SET leader_id=?,fencing_token=?,acquired_at_utc=?,
+                    expires_at_epoch=?
+                WHERE id=1 AND fencing_token=? AND expires_at_epoch<=?""",
+                (
+                    INSTANCE, token, now_iso(), t + LEASE_TTL,
+                    int(r["fencing_token"]), t
+                )
+            ).rowcount
+            c.commit()
+            return n == 1, token if n == 1 else None
+
+        c.commit()
+        return False, None
+
+    except Exception:
+        c.rollback()
+        log.exception("Leader lease failure")
+        return False, None
+
+    finally:
+        c.close()
+
+
+def leader_ok(token):
+    if token is None:
+        return False
+
+    c = db()
+    try:
+        r = c.execute(
+            "SELECT * FROM leader_lease WHERE id=1"
+        ).fetchone()
+
+        return bool(
+            r
+            and r["leader_id"] == INSTANCE
+            and int(r["fencing_token"]) == int(token)
+            and r["expires_at_epoch"] > time.time()
+        )
+    finally:
+        c.close()
+
+
+# ---------------------------------------------------------------------
+# Telegram notifications
+# ---------------------------------------------------------------------
+
+def tg(message):
+    if TG_TOKEN and TG_CHAT:
+        try:
+            TG_QUEUE.put_nowait(message[:3500])
+        except queue.Full:
+            log.warning("Telegram queue full; alert dropped")
+
+
+def tg_loop():
+    while True:
+        msg = TG_QUEUE.get()
+        try:
+            if TG_TOKEN and TG_CHAT:
+                for attempt in range(4):
+                    try:
+                        r = HTTP.post(
+                            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                            json={
+                                "chat_id": TG_CHAT,
+                                "text": msg,
+                                "disable_web_page_preview": True
+                            },
+                            timeout=8
+                        )
+
+                        if r.status_code == 200:
+                            break
+
+                        if r.status_code == 429:
+                            wait = float(
+                                r.json().get("parameters", {}).get(
+                                    "retry_after", 3
+                                )
+                            )
+                            time.sleep(min(30, max(1, wait)))
+
+                        elif r.status_code >= 500:
+                            time.sleep(1.5 * (attempt + 1))
+                        else:
+                            log.warning("Telegram HTTP %s", r.status_code)
+                            break
+
+                    except requests.RequestException:
+                        time.sleep(1.5 * (attempt + 1))
+        finally:
+            TG_QUEUE.task_done()
+
+
+# ---------------------------------------------------------------------
+# Binance public market data: confirmed closed candles only
+# ---------------------------------------------------------------------
+
+def fetch_price():
+    r = HTTP.get(
+        BASE_URL + "/fapi/v1/ticker/price",
+        params={"symbol": SYMBOL},
+        timeout=HTTP_TIMEOUT
+    )
     r.raise_for_status()
-    price = float(r.json()["data"]["amount"])
-    with STATE_LOCK:
-        DATA_HUB["price"] = price
-        DATA_HUB["price_ts"] = time.time()
-        DATA_HUB["session"] = get_session_name()
+    p = float(r.json()["price"])
+    return p if math.isfinite(p) and p > 0 else None
 
 
-def fetch_daily_pdh_pdl() -> None:
-    r = HTTP.get("https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=86400", timeout=8)
+def fetch_klines(interval, limit=200):
+    r = HTTP.get(
+        BASE_URL + "/fapi/v1/klines",
+        params={
+            "symbol": SYMBOL,
+            "interval": interval,
+            "limit": min(limit + 2, 1500)
+        },
+        timeout=HTTP_TIMEOUT
+    )
     r.raise_for_status()
-    rd = r.json()
-    if isinstance(rd, list) and len(rd) >= 2:
-        with STATE_LOCK:
-            DATA_HUB["pdl"] = float(rd[1][1])
-            DATA_HUB["pdh"] = float(rd[1][2])
 
-
-def find_fvgs(candles: List[Dict[str, float]], lookback: int = 30) -> List[Dict[str, Any]]:
-    out = []
-    n = len(candles)
-    for i in range(max(1, n - lookback), n - 1):
-        a, b = candles[i - 1], candles[i + 1]
-        later = candles[i + 2:]
-        if a["high"] < b["low"] and (b["low"] - a["high"]) >= FVG_MIN_SIZE:
-            lo, hi = a["high"], b["low"]
-            if all(x["close"] > lo for x in later):
-                out.append({"dir": "LONG", "lo": lo, "hi": hi, "idx": i})
-        elif a["low"] > b["high"] and (a["low"] - b["high"]) >= FVG_MIN_SIZE:
-            lo, hi = b["high"], a["low"]
-            if all(x["close"] < hi for x in later):
-                out.append({"dir": "SHORT", "lo": lo, "hi": hi, "idx": i})
-    return sorted(out, key=lambda f: -f["idx"])
-
-
-def fetch_15m_klines() -> None:
-    r = HTTP.get("https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=900", timeout=8)
-    r.raise_for_status()
     raw = r.json()
-    if not (isinstance(raw, list) and len(raw) > 50):
-        return
+    now_ms = int(time.time() * 1000)
+    out = []
 
-    parsed = [
-        {"time": int(b[0]), "low": float(b[1]), "high": float(b[2]),
-         "open": float(b[3]), "close": float(b[4]), "vol": float(b[5])}
-        for b in reversed(raw[1:101])
-    ]
-    ref = parsed[-16:-2]
-    poc = calculate_volume_profile_poc(parsed[-40:])
+    if not isinstance(raw, list):
+        raise ValueError("Invalid kline response")
 
-    with STATE_LOCK:
-        DATA_HUB["klines"] = parsed
-        DATA_HUB["kline_ts"] = time.time()
-        DATA_HUB["poc"] = poc
-        pdh, pdl = DATA_HUB["pdh"], DATA_HUB["pdl"]
-        swing_hi = max(x["high"] for x in ref)
-        swing_lo = min(x["low"] for x in ref)
-        ACTIVE_POIS[:] = [
-            {"type": "PDH", "title": "PDH Liquidity Target", "price": pdh, "color": "#ff1744"},
-            {"type": "PDL", "title": "PDL Liquidity Target", "price": pdl, "color": "#00e676"},
-            {"type": "POC", "title": "Volume Profile POC (9/10)", "price": poc, "color": "#ff9100"},
-            {"type": "BSL", "title": "Swing High (BSL)", "price": swing_hi, "color": "#ef5350"},
-            {"type": "SSL", "title": "Swing Low (SSL)", "price": swing_lo, "color": "#26a69a"},
-        ]
-        for f in find_fvgs(parsed)[:2]:
-            mid = round((f["lo"] + f["hi"]) / 2, 2)
-            ACTIVE_POIS.append({"type": "FVG", "title": f"{'Bull' if f['dir']=='LONG' else 'Bear'} FVG (7/10)",
-                                "price": mid, "color": "#ffd600"})
+    for k in raw:
+        if not isinstance(k, list) or len(k) < 7:
+            continue
+
+        # Ignore any candle whose close time has not passed.
+        if int(k[6]) >= now_ms:
+            continue
+
+        x = {
+            "time": int(k[0] // 1000),
+            "close_time": int(k[6] // 1000),
+            "open": float(k[1]),
+            "high": float(k[2]),
+            "low": float(k[3]),
+            "close": float(k[4]),
+            "vol": float(k[5])
+        }
+
+        if (
+            min(x["open"], x["low"], x["close"]) <= 0
+            or x["high"] < max(x["open"], x["close"], x["low"])
+            or x["vol"] < 0
+        ):
+            continue
+
+        out.append(x)
+
+    out.sort(key=lambda z: z["time"])
+    dedup = {x["time"]: x for x in out}
+    return list(dedup.values())[-limit:]
 
 
-# ==========================================
-# CORE SIGNAL ENGINE (>5 RATED INTEGRATION)
-# ==========================================
-def volume_absorbed(candles: List[Dict[str, float]], idx: int) -> bool:
-    start = idx - VOL_LOOKBACK
-    if start < -len(candles):
+def refresh():
+    try:
+        p = fetch_price()
+        ks = {
+            k: fetch_klines(k, 200)
+            for k in ("15m", "1h", "4h", "1d")
+        }
+
+        if (
+            p is None
+            or len(ks["15m"]) < 40
+            or len(ks["1h"]) < 50
+            or len(ks["4h"]) < 55
+            or len(ks["1d"]) < 3
+        ):
+            raise ValueError("Insufficient valid market data/history")
+
+        with LOCK:
+            MARKET.update(
+                price=p,
+                price_ts=time.time(),
+                klines=ks,
+                klines_ts=time.time(),
+                session=session_now(),
+                error=None
+            )
+
+        return True
+
+    except Exception as e:
+        with LOCK:
+            MARKET["error"] = str(e)[:250]
+        log.warning("Market refresh failed: %s", e)
         return False
-    window = candles[start:idx]
-    if len(window) < VOL_LOOKBACK:
-        return False
-    avg = sum(x["vol"] for x in window) / len(window)
-    return avg > 0 and candles[idx]["vol"] >= (VOL_ABSORB_MULT * avg)
 
 
-def build_signal(direction: str, cat: str, setup: str, p: float, sl: float, t: int) -> Optional[Dict[str, Any]]:
-    risk = round(abs(p - sl), 2)
-    if (direction == "LONG" and sl >= p) or (direction == "SHORT" and sl <= p):
+# ---------------------------------------------------------------------
+# Indicators
+# ---------------------------------------------------------------------
+
+def ema(values: List[float], period: int) -> Optional[float]:
+    if (
+        period <= 0
+        or len(values) < period
+        or any(not math.isfinite(v) or v <= 0 for v in values)
+    ):
         return None
-    if not (RISK_MIN <= risk <= RISK_MAX):
+
+    k = 2 / (period + 1)
+    v = sum(values[:period]) / period
+
+    for x in values[period:]:
+        v += k * (x - v)
+
+    return v
+
+
+def atr(cs, period=14):
+    if len(cs) < period + 1:
         return None
 
-    mult = 1 if direction == "LONG" else -1
+    tr = []
+    for i in range(1, len(cs)):
+        x, pr = cs[i], cs[i - 1]
+        tr.append(max(
+            x["high"] - x["low"],
+            abs(x["high"] - pr["close"]),
+            abs(x["low"] - pr["close"])
+        ))
+
+    return sum(tr[-period:]) / period
+
+
+def psyche(c):
+    rng = max(c["high"] - c["low"], 1e-9)
+    body = abs(c["close"] - c["open"])
+
     return {
-        "dir": direction,
-        "cat": cat,
-        "setup": setup,
-        "entry": p,
-        "sl": round(sl, 2),
-        "risk": risk,
-        "tp1": round(p + mult * TP1_RR * risk, 2),
-        "tp2": round(p + mult * TP2_RR * risk, 2),
-        "time": t,
+        "body": body / rng,
+        "upper": (c["high"] - max(c["open"], c["close"])) / rng,
+        "lower": (min(c["open"], c["close"]) - c["low"]) / rng
     }
 
 
-def scan_top_rated_engine(candles: List[Dict[str, float]], pdh: float, pdl: float, p: float, session: str) -> Optional[Dict[str, Any]]:
-    if len(candles) < 40 or p < 10000:
-        return None
+# ---------------------------------------------------------------------
+# SMC swings, FVG and approximate volume POC
+# ---------------------------------------------------------------------
 
-    cur = candles[-1]
-    prev = candles[-2]
-    prev_range = max(prev["high"] - prev["low"], 1.0)
-    cur_range = max(cur["high"] - cur["low"], 1.0)
+def swings(cs, n=3):
+    hs, ls = [], []
 
-    if prev_range > NEWS_SPIKE_CAP or cur_range > NEWS_SPIKE_CAP:
-        return None
+    for i in range(n, len(cs) - n):
+        c = cs[i]
 
-    prev_body = abs(prev["close"] - prev["open"]) / prev_range
-    upper_wick = (prev["high"] - max(prev["open"], prev["close"])) / prev_range
-    lower_wick = (min(prev["open"], prev["close"]) - prev["low"]) / prev_range
-    is_absorbed = volume_absorbed(candles, -2)
+        if (
+            all(c["high"] > cs[i-j]["high"] for j in range(1, n+1))
+            and all(c["high"] >= cs[i+j]["high"] for j in range(1, n+1))
+        ):
+            hs.append({"price": c["high"], "time": c["time"]})
 
-    # 1. 20 & 50 EMA Dynamic Filter (7/10)
-    close_series = [c["close"] for c in candles]
-    ema20 = calculate_ema(close_series, 20)
-    ema50 = calculate_ema(close_series, 50)
-    ema_bullish = p > ema20 >= ema50
-    ema_bearish = p < ema20 <= ema50
+        if (
+            all(c["low"] < cs[i-j]["low"] for j in range(1, n+1))
+            and all(c["low"] <= cs[i+j]["low"] for j in range(1, n+1))
+        ):
+            ls.append({"price": c["low"], "time": c["time"]})
 
-    # 2. Fibonacci 50-61.8% Equilibrium / Discount Zone (6/10)
-    ref = candles[-20:-2]
-    swing_high = max(x["high"] for x in ref)
-    swing_low = min(x["low"] for x in ref)
-    range_high = max(pdh, swing_high) if pdh > 0 else swing_high
-    range_low = min(pdl, swing_low) if pdl > 0 else swing_low
-    equilibrium = (range_high + range_low) / 2.0
-    in_discount = p < equilibrium
-    in_premium = p > equilibrium
+    return hs, ls
 
-    # 3. Volume Profile POC (9/10)
-    poc = calculate_volume_profile_poc(candles[-40:])
-    t = cur["time"]
-    vol_text = " + Vol Absorption" if is_absorbed else ""
 
-    # -------------------------------------------------------------
-    # SETUP A: LIQUIDITY SWEEP & JUDAS TRAP (10/10)
-    # -------------------------------------------------------------
-    pdl_sweep = (pdl > 0) and (prev["low"] <= pdl + SWEEP_TOLERANCE) and (prev["close"] > pdl)
-    ssl_sweep = (prev["low"] < swing_low) and (prev["close"] > swing_low)
+def fvgs(cs):
+    out = []
 
-    if in_discount and (pdl_sweep or ssl_sweep):
-        if (lower_wick >= WICK_MIN_RATIO and prev_body <= BODY_MAX_RATIO
-                and cur["close"] > cur["open"] and cur["close"] > prev["close"]):
-            cat = "JUDAS_TRAP_LONG" if "LONDON" in session or "NEW YORK" in session else "LIQUIDITY_SWEEP_LONG"
-            desc = f"{cat}: 10/10 Sweep in Discount ({lower_wick*100:.0f}% Wick{vol_text})"
-            sl = min(prev["low"], cur["low"]) - SL_BUFFER
-            sig = build_signal("LONG", cat, desc, p, sl, t)
-            if sig:
-                return sig
+    for i in range(1, len(cs) - 1):
+        a, m, b = cs[i-1], cs[i], cs[i+1]
+        rng = max(m["high"] - m["low"], 1e-9)
 
-    pdh_sweep = (pdh > 0) and (prev["high"] >= pdh - SWEEP_TOLERANCE) and (prev["close"] < pdh)
-    bsl_sweep = (prev["high"] > swing_high) and (prev["close"] < swing_high)
-
-    if in_premium and (pdh_sweep or bsl_sweep):
-        if (upper_wick >= WICK_MIN_RATIO and prev_body <= BODY_MAX_RATIO
-                and cur["close"] < cur["open"] and cur["close"] < prev["close"]):
-            cat = "JUDAS_TRAP_SHORT" if "LONDON" in session or "NEW YORK" in session else "LIQUIDITY_SWEEP_SHORT"
-            desc = f"{cat}: 10/10 Sweep in Premium ({upper_wick*100:.0f}% Wick{vol_text})"
-            sl = max(prev["high"], cur["high"]) + SL_BUFFER
-            sig = build_signal("SHORT", cat, desc, p, sl, t)
-            if sig:
-                return sig
-
-    # -------------------------------------------------------------
-    # SETUP B: SUPPLY & DEMAND ORDER BLOCK + POC CONFLUENCE (8/10 & 9/10)
-    # -------------------------------------------------------------
-    for i in range(len(candles) - 10, len(candles) - 3):
-        ob = candles[i]
-        nxt = candles[i + 1]
-        # Bullish Demand OB (Red candle before explosive green move)
-        if ob["close"] < ob["open"] and nxt["close"] > ob["high"]:
-            ob_top = ob["open"]
-            ob_bot = ob["low"]
-            # Price taps Demand in Discount, supported near POC or EMA20
-            if in_discount and cur["low"] <= ob_top and cur["close"] >= ob_bot and cur["close"] > cur["open"]:
-                if abs(p - poc) <= 250.0 or p >= ema20:
-                    sl = ob_bot - SL_BUFFER
-                    sig = build_signal("LONG", "DEMAND_OB_POC",
-                                       f"Demand Zone (8/10) + POC Retest (${poc:,.0f}) in Discount", p, sl, t)
-                    if sig:
-                        return sig
-
-        # Bearish Supply OB (Green candle before impulsive dump)
-        if ob["close"] > ob["open"] and nxt["close"] < ob["low"]:
-            ob_top = ob["high"]
-            ob_bot = ob["open"]
-            # Price taps Supply in Premium, resisted near POC or EMA20
-            if in_premium and cur["high"] >= ob_bot and cur["close"] <= ob_top and cur["close"] < cur["open"]:
-                if abs(p - poc) <= 250.0 or p <= ema20:
-                    sl = ob_top + SL_BUFFER
-                    sig = build_signal("SHORT", "SUPPLY_OB_POC",
-                                       f"Supply Zone (8/10) + POC Retest (${poc:,.0f}) in Premium", p, sl, t)
-                    if sig:
-                        return sig
-
-    # -------------------------------------------------------------
-    # SETUP C: FAIR VALUE GAP (FVG) + EMA ALIGNMENT (7/10)
-    # -------------------------------------------------------------
-    cur_lower_wick = (min(cur["open"], cur["close"]) - cur["low"]) / cur_range
-    cur_upper_wick = (cur["high"] - max(cur["open"], cur["close"])) / cur_range
-
-    for fvg in find_fvgs(candles):
-        if fvg["idx"] >= len(candles) - 3:
+        # Require a displacement candle in the middle.
+        if abs(m["close"] - m["open"]) / rng < 0.55:
             continue
-        # Bullish FVG: In Discount + Trend Bullish (Above EMA50) + Rejection Wick
-        if fvg["dir"] == "LONG" and ema_bullish and in_discount:
-            if cur["low"] <= fvg["hi"] and cur["close"] >= fvg["lo"] and cur["close"] > cur["open"] and cur_lower_wick >= 0.25:
-                sl = fvg["lo"] - SL_BUFFER
-                sig = build_signal("LONG", "FVG_EMA_CONFLUENCE",
-                                   "Bullish FVG (7/10) with 20/50 EMA Trend & 25%+ Wick", p, sl, t)
-                if sig:
-                    return sig
 
-        # Bearish FVG: In Premium + Trend Bearish (Below EMA50) + Rejection Wick
-        elif fvg["dir"] == "SHORT" and ema_bearish and in_premium:
-            if cur["high"] >= fvg["lo"] and cur["close"] <= fvg["hi"] and cur["close"] < cur["open"] and cur_upper_wick >= 0.25:
-                sl = fvg["hi"] + SL_BUFFER
-                sig = build_signal("SHORT", "FVG_EMA_CONFLUENCE",
-                                   "Bearish FVG (7/10) with 20/50 EMA Trend & 25%+ Wick", p, sl, t)
-                if sig:
-                    return sig
+        if b["low"] > a["high"] and b["low"] - a["high"] >= MIN_GAP:
+            out.append({
+                "direction": "LONG",
+                "top": b["low"],
+                "bottom": a["high"],
+                "ce": (b["low"] + a["high"]) / 2,
+                "time": m["time"]
+            })
 
-    return None
+        elif a["low"] > b["high"] and a["low"] - b["high"] >= MIN_GAP:
+            out.append({
+                "direction": "SHORT",
+                "top": a["low"],
+                "bottom": b["high"],
+                "ce": (a["low"] + b["high"]) / 2,
+                "time": m["time"]
+            })
 
-
-# ==========================================
-# POSITION & RISK EXECUTION
-# ==========================================
-def pnl_percentage(direction: str, entry: float, exit_price: float) -> float:
-    diff = (exit_price - entry) if direction == "LONG" else (entry - exit_price)
-    return round((diff / entry) * 100.0, 2)
+    return out
 
 
-def is_account_locked(conn: sqlite3.Connection) -> bool:
-    rows = conn.execute(
-        """SELECT result, closed_ts FROM trades WHERE status='CLOSED'
-           ORDER BY closed_ts DESC, id DESC LIMIT 2"""
-    ).fetchall()
-    if len(rows) < 2:
-        return False
-    if all((r["result"] or "").startswith("SL HIT") for r in rows):
-        last_ts = rows[0]["closed_ts"] or 0
-        return (time.time() - last_ts) < LOCK_SECONDS
-    return False
+def approx_poc(cs, bins=30):
+    """Approximate candle-volume POC, not true tick-level volume-at-price."""
+    if not cs:
+        return None
+
+    lo = min(c["low"] for c in cs)
+    hi = max(c["high"] for c in cs)
+
+    if hi <= lo:
+        return lo
+
+    width = (hi - lo) / bins
+    vol = [0.0] * bins
+
+    for c in cs:
+        typical = (c["high"] + c["low"] + c["close"]) / 3
+        i = min(bins - 1, max(0, int((typical - lo) / width)))
+        vol[i] += c["vol"]
+
+    i = max(range(bins), key=lambda n: vol[n])
+    return lo + (i + 0.5) * width
 
 
-def close_trade_record(conn: sqlite3.Connection, trade: sqlite3.Row, exit_p: float, result: str, pnl_r: float) -> bool:
-    pct = pnl_percentage(trade["direction"], trade["entry"], exit_p)
-    res = conn.execute(
-        """UPDATE trades SET status='CLOSED', exit=?, result=?, pnl_r=?, pnl_percent=?,
-           closed_at=?, closed_ts=? WHERE trade_id=? AND status!='CLOSED'""",
-        (exit_p, result, pnl_r, pct, datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), time.time(), trade["trade_id"]),
+def structure(ks):
+    c15, c1h, c4h, c1d = (
+        ks["15m"], ks["1h"], ks["4h"], ks["1d"]
     )
-    return res.rowcount > 0
+
+    e20 = ema([c["close"] for c in c4h], 20)
+    e50 = ema([c["close"] for c in c4h], 50)
+    h20 = ema([c["close"] for c in c1h], 20)
+    h50 = ema([c["close"] for c in c1h], 50)
+
+    bias = (
+        "UNKNOWN" if e20 is None or e50 is None
+        else "BULLISH" if e20 > e50
+        else "BEARISH" if e20 < e50
+        else "NEUTRAL"
+    )
+
+    b1 = (
+        "UNKNOWN" if h20 is None or h50 is None
+        else "BULLISH" if h20 > h50
+        else "BEARISH" if h20 < h50
+        else "NEUTRAL"
+    )
+
+    sh, sl = swings(c15)
+    recent = c15[-30:]
+
+    swing_hi = sh[-1]["price"] if sh else max(c["high"] for c in recent)
+    swing_lo = sl[-1]["price"] if sl else min(c["low"] for c in recent)
+
+    # Latest completed UTC daily candle is used here.
+    return {
+        "bias4h": bias,
+        "bias1h": b1,
+        "swing_high": swing_hi,
+        "swing_low": swing_lo,
+        "pdh": c1d[-1]["high"],
+        "pdl": c1d[-1]["low"],
+        "eq": (swing_hi + swing_lo) / 2,
+        "atr": atr(c15),
+        "poc": approx_poc(c15[-96:]),
+        "fvgs": fvgs(c15)
+    }
 
 
-def manage_active_positions(current_price: float) -> None:
-    conn = db()
-    try:
-        active_trades = conn.execute("SELECT * FROM trades WHERE status IN ('OPEN','RISK_FREE')").fetchall()
-        for t in active_trades:
-            is_long = t["direction"] == "LONG"
-            entry, sl, tp1, tp2, status = t["entry"], t["sl"], t["tp1"], t["tp2"], t["status"]
-            tag = escape(t["signal_type"] or "")
+# ---------------------------------------------------------------------
+# Sniper-style sweep and reclaim signal
+# ---------------------------------------------------------------------
 
-            target_reached = (lambda lvl: current_price >= lvl) if is_long else (lambda lvl: current_price <= lvl)
-            stopped_out = (lambda lvl: current_price <= lvl) if is_long else (lambda lvl: current_price >= lvl)
+def make_signal(st, cs, price, sess):
+    if (
+        len(cs) < 40
+        or st["bias4h"] == "UNKNOWN"
+        or st["bias1h"] == "UNKNOWN"
+        or not st["atr"]
+        or sess not in ALLOWED_SESSIONS
+    ):
+        return None
 
-            # Target 2 Hit (+3.5R Final)
-            if target_reached(tp2):
-                if close_trade_record(conn, t, tp2, f"TP2 TARGET HIT (+{TP2_RR}R)", TP2_RR):
-                    p_ret = pnl_percentage(t["direction"], entry, tp2)
-                    send_telegram(
-                        f"🔥 <b>[{tag} TP2 TARGET ACHIEVED]</b>\n"
-                        f"Exit: <code>${tp2:,.2f}</code> | Return: <b>{p_ret:+.2f}%</b> (+{TP2_RR}R)\n"
-                        f"Final target closed successfully!"
-                    )
-                continue
+    swept, trigger = cs[-2], cs[-1]
+    p = psyche(swept)
+    eq = st["eq"]
+    candidates = []
 
-            # Target 1 Hit (+2.0R) -> Move SL to Breakeven
-            if status == "OPEN" and target_reached(tp1):
-                r = conn.execute("UPDATE trades SET status='RISK_FREE', sl=? WHERE trade_id=? AND status='OPEN'",
-                                 (entry, t["trade_id"]))
-                if r.rowcount > 0:
-                    send_telegram(
-                        f"🎯 <b>[{tag} TP1 HIT (+{TP1_RR}R)]</b>\n"
-                        f"Stop Loss updated to Entry: <code>${entry:,.2f}</code>.\n"
-                        f"Trade is now <b>100% Risk-Free</b>!"
-                    )
-
-            # SL Trigger
-            if stopped_out(sl):
-                is_full_loss = (status == "OPEN")
-                res_label = "SL HIT (-1R)" if is_full_loss else "BREAKEVEN EXIT (0R)"
-                pnl_r = -1.0 if is_full_loss else 0.0
-                if close_trade_record(conn, t, sl, res_label, pnl_r):
-                    p_ret = pnl_percentage(t["direction"], entry, sl)
-                    badge = "❌" if is_full_loss else "⚖️"
-                    send_telegram(
-                        f"{badge} <b>[{tag} CLOSED]</b> {res_label}\n"
-                        f"Exit: <code>${sl:,.2f}</code> | PnL: <b>{p_ret:+.2f}%</b>"
-                    )
-                    if is_full_loss and is_account_locked(conn):
-                        send_telegram("⛔ <b>Institutional Drawdown Lock:</b> 2 consecutive losses. Scanner frozen for 24h.")
-    finally:
-        conn.close()
-
-
-def try_dispatch_new_signal(current_price: float) -> None:
-    with STATE_LOCK:
-        klines = list(DATA_HUB["klines"])
-        pdh, pdl, session = DATA_HUB["pdh"], DATA_HUB["pdl"], DATA_HUB["session"]
-        fresh_data = (
-            (time.time() - DATA_HUB["price_ts"] < DATA_MAX_AGE_SEC)
-            and (time.time() - DATA_HUB["kline_ts"] < 120)
+    # LONG: sweep and reclaim the same sell-side level.
+    for label, level in [
+        ("PDL", st["pdl"]),
+        ("SWING_LOW", st["swing_low"])
+    ]:
+        valid = (
+            swept["low"] < level - SWEEP_BUFFER
+            and trigger["close"] > level
+            and trigger["close"] > trigger["open"]
+            and price < eq
+            and p["lower"] >= 0.40
+            and p["body"] <= 0.65
+            and st["bias4h"] == "BULLISH"
+            and st["bias1h"] != "BEARISH"
         )
 
-    if not fresh_data or session not in ALLOWED_SESSIONS:
+        if valid:
+            sl = min(swept["low"], trigger["low"]) - max(
+                SL_BUFFER, 0.15 * st["atr"]
+            )
+            risk = price - sl
+
+            if MIN_STOP <= risk <= MAX_STOP:
+                score = min(
+                    100,
+                    68 + min(12, p["lower"] * 15)
+                    + (8 if label == "PDL" else 4)
+                    + (3 if st["poc"] and price < st["poc"] else 0)
+                )
+
+                candidates.append({
+                    "direction": "LONG",
+                    "setup_name": f"{label} SSL sweep/reclaim",
+                    "entry": price,
+                    "sl": sl,
+                    "risk": risk,
+                    "score": score,
+                    "swept_level": label,
+                    "trigger_time": trigger["time"],
+                    "wick_ratio": p["lower"]
+                })
+
+    # SHORT: sweep and reclaim the same buy-side level.
+    for label, level in [
+        ("PDH", st["pdh"]),
+        ("SWING_HIGH", st["swing_high"])
+    ]:
+        valid = (
+            swept["high"] > level + SWEEP_BUFFER
+            and trigger["close"] < level
+            and trigger["close"] < trigger["open"]
+            and price > eq
+            and p["upper"] >= 0.40
+            and p["body"] <= 0.65
+            and st["bias4h"] == "BEARISH"
+            and st["bias1h"] != "BULLISH"
+        )
+
+        if valid:
+            sl = max(swept["high"], trigger["high"]) + max(
+                SL_BUFFER, 0.15 * st["atr"]
+            )
+            risk = sl - price
+
+            if MIN_STOP <= risk <= MAX_STOP:
+                score = min(
+                    100,
+                    68 + min(12, p["upper"] * 15)
+                    + (8 if label == "PDH" else 4)
+                    + (3 if st["poc"] and price > st["poc"] else 0)
+                )
+
+                candidates.append({
+                    "direction": "SHORT",
+                    "setup_name": f"{label} BSL sweep/reclaim",
+                    "entry": price,
+                    "sl": sl,
+                    "risk": risk,
+                    "score": score,
+                    "swept_level": label,
+                    "trigger_time": trigger["time"],
+                    "wick_ratio": p["upper"]
+                })
+
+    if not candidates:
+        return None
+
+    s = max(candidates, key=lambda x: x["score"])
+    if s["score"] < MIN_SCORE:
+        return None
+
+    sign = 1 if s["direction"] == "LONG" else -1
+
+    s.update(
+        tp1=s["entry"] + sign * 1.5 * s["risk"],
+        tp2=s["entry"] + sign * 2.25 * s["risk"],
+        tp3=s["entry"] + sign * 3.0 * s["risk"],
+        timeframe="15m",
+        session=sess,
+        structure={
+            "bias4h": st["bias4h"],
+            "bias1h": st["bias1h"],
+            "eq": eq,
+            "pdh": st["pdh"],
+            "pdl": st["pdl"],
+            "swing_high": st["swing_high"],
+            "swing_low": st["swing_low"],
+            "poc_approx": st["poc"]
+        }
+    )
+
+    return s
+
+
+# ---------------------------------------------------------------------
+# Paper equity, daily limits, and trade creation
+# ---------------------------------------------------------------------
+
+def equity(c):
+    r = c.execute(
+        "SELECT COALESCE(SUM(realized_pnl_usd),0) p FROM trades"
+    ).fetchone()
+    return max(0, START_EQUITY + float(r["p"]))
+
+
+def daily_stats(c):
+    day = today()
+
+    rows = c.execute(
+        """SELECT realized_pnl_usd FROM trades
+        WHERE substr(opened_at_utc,1,10)=?""",
+        (day,)
+    ).fetchall()
+
+    count = c.execute(
+        """SELECT COUNT(*) n FROM trades
+        WHERE substr(opened_at_utc,1,10)=?""",
+        (day,)
+    ).fetchone()["n"]
+
+    return sum(float(r["realized_pnl_usd"]) for r in rows), int(count)
+
+
+def open_paper_trade(s, token):
+    if not leader_ok(token):
+        return False
+
+    key = (
+        f"{SYMBOL}:{s['direction']}:"
+        f"{s['trigger_time']}:{s['swept_level']}"
+    )
+
+    c = db()
+
+    try:
+        c.execute("BEGIN IMMEDIATE")
+
+        lease = c.execute(
+            "SELECT * FROM leader_lease WHERE id=1"
+        ).fetchone()
+
+        if (
+            not lease
+            or lease["leader_id"] != INSTANCE
+            or int(lease["fencing_token"]) != token
+            or lease["expires_at_epoch"] <= time.time()
+        ):
+            c.rollback()
+            return False
+
+        if c.execute(
+            "SELECT 1 FROM signals WHERE signal_key=?", (key,)
+        ).fetchone():
+            c.rollback()
+            return False
+
+        pnl, n = daily_stats(c)
+        op = c.execute(
+            "SELECT COUNT(*) n FROM trades WHERE stage!='CLOSED'"
+        ).fetchone()["n"]
+
+        if pnl <= -MAX_DAILY_LOSS or n >= MAX_DAILY_TRADES or op >= MAX_OPEN_TRADES:
+            c.rollback()
+            return False
+
+        qty = min(
+            (equity(c) * RISK_PCT) / s["risk"],
+            MAX_NOTIONAL / s["entry"]
+        )
+
+        if not math.isfinite(qty) or qty <= 0:
+            c.rollback()
+            return False
+
+        c.execute(
+            """INSERT INTO signals(
+                signal_key,symbol,direction,setup_name,score,
+                entry_price,stop_price,tp1_price,tp2_price,tp3_price,
+                timeframe,candle_time,details_json,created_at_utc
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                key, SYMBOL, s["direction"], s["setup_name"], s["score"],
+                s["entry"], s["sl"], s["tp1"], s["tp2"], s["tp3"],
+                s["timeframe"], s["trigger_time"], jd(s), now_iso()
+            )
+        )
+
+        tid = str(uuid.uuid4())
+        now = now_iso()
+
+        c.execute(
+            """INSERT INTO trades(
+                trade_id,signal_key,symbol,direction,setup_name,score,
+                entry_price,stop_price,tp1_price,tp2_price,tp3_price,
+                initial_qty,remaining_qty,stage,opened_at_utc,updated_at_utc
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'OPEN',?,?)""",
+            (
+                tid, key, SYMBOL, s["direction"], s["setup_name"],
+                s["score"], s["entry"], s["sl"], s["tp1"], s["tp2"],
+                s["tp3"], qty, qty, now, now
+            )
+        )
+
+        audit(c, tid, "PAPER_OPEN", {
+            "qty": qty,
+            "fencing_token": token,
+            "signal_key": key
+        })
+
+        c.commit()
+
+        log.info(
+            "PAPER OPEN %s %s qty=%.6f entry=%.2f score=%.1f",
+            s["direction"], tid[:8], qty, s["entry"], s["score"]
+        )
+
+        tg(
+            f"PAPER {SYMBOL} {s['direction']}\n"
+            f"{s['setup_name']}\nScore {s['score']:.1f}\n"
+            f"Entry {s['entry']:.2f} | SL {s['sl']:.2f}\n"
+            f"TPs {s['tp1']:.2f} / {s['tp2']:.2f} / {s['tp3']:.2f}\n"
+            f"Qty {qty:.6f}"
+        )
+        return True
+
+    except sqlite3.IntegrityError:
+        c.rollback()
+        return False
+
+    except Exception:
+        c.rollback()
+        log.exception("Paper trade insert failed")
+        return False
+
+    finally:
+        c.close()
+
+
+# ---------------------------------------------------------------------
+# Paper trade manager: TP1 50%, TP2 30%, TP3 remaining
+# ---------------------------------------------------------------------
+
+def manage_trades(price, token):
+    if not leader_ok(token) or price <= 0:
         return
 
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    conn = db()
+    c = db()
+
     try:
-        if is_account_locked(conn):
+        c.execute("BEGIN IMMEDIATE")
+        l = c.execute(
+            "SELECT * FROM leader_lease WHERE id=1"
+        ).fetchone()
+
+        if (
+            not l
+            or l["leader_id"] != INSTANCE
+            or int(l["fencing_token"]) != token
+            or l["expires_at_epoch"] <= time.time()
+        ):
+            c.rollback()
             return
 
-        active_count = conn.execute("SELECT COUNT(*) FROM trades WHERE status IN ('OPEN','RISK_FREE')").fetchone()[0]
-        today_trades = conn.execute("SELECT COUNT(*) FROM trades WHERE created_date=?", (today_str,)).fetchone()[0]
+        for r in c.execute(
+            "SELECT * FROM trades WHERE stage!='CLOSED'"
+        ).fetchall():
 
-        if active_count > 0 or today_trades >= MAX_DAILY_TRADES:
-            return
+            direction = r["direction"]
+            sign = 1 if direction == "LONG" else -1
+            entry = float(r["entry_price"])
+            qty = float(r["remaining_qty"])
+            stop = float(r["stop_price"])
+            realized = float(r["realized_pnl_usd"])
+            fees = float(r["total_fee_usd"])
+            stage = r["stage"]
+            reason = None
 
-        sig = scan_top_rated_engine(klines, pdh, pdl, current_price, session)
-        if sig:
-            t_id = f"PRO_{sig['time']}_{sig['cat']}"
-            t_now = datetime.now(timezone.utc).strftime("%H:%M:%S")
-            try:
-                conn.execute(
-                    """INSERT INTO trades 
-                    (trade_id, created_date, created_at, signal_type, tf, direction, setup, entry, sl, tp1, tp2, status, risk, session) 
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (t_id, today_str, t_now, sig["cat"], "15M", sig["dir"], sig["setup"],
-                     sig["entry"], sig["sl"], sig["tp1"], sig["tp2"], "OPEN", sig["risk"], session),
+            flags = {
+                "tp1_done": r["tp1_done"],
+                "tp2_done": r["tp2_done"],
+                "tp3_done": r["tp3_done"]
+            }
+
+            def target_hit(level):
+                return price >= level if direction == "LONG" else price <= level
+
+            def stop_hit(level):
+                return price <= level if direction == "LONG" else price >= level
+
+            if stop_hit(stop):
+                exitp = stop * (
+                    1 - SLIPPAGE if sign == 1 else 1 + SLIPPAGE
                 )
-                dir_badge = "🟢 LONG" if sig["dir"] == "LONG" else "🔴 SHORT"
-                send_telegram(
-                    f"👑 <b>[INSTITUTIONAL GRADE ENTRY CONFIRMED]</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"<b>Asset:</b> BTC/USD (Spot & Perp)\n"
-                    f"<b>Direction:</b> {dir_badge} ({sig['cat']})\n"
-                    f"<b>Session:</b> {session}\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🔹 <b>Entry:</b> <code>${sig['entry']:,.2f}</code>\n"
-                    f"🛑 <b>Stop Loss:</b> <code>${sig['sl']:,.2f}</code> (Risk: ${sig['risk']:.1f})\n"
-                    f"🎯 <b>Target 1 (1:{TP1_RR}):</b> <code>${sig['tp1']:,.2f}</code>\n"
-                    f"🔥 <b>Target 2 (1:{TP2_RR}):</b> <code>${sig['tp2']:,.2f}</code>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🧠 <b>Confluence:</b> {sig['setup']}\n"
-                    f"🛡️ <b>Risk Engine:</b> Auto-Breakeven at TP1"
+                gross = (exitp - entry) * qty * sign
+                fee = abs(exitp * qty) * FEE_RATE
+
+                realized += gross - fee
+                fees += fee
+
+                audit(c, r["trade_id"], "STOP_LOSS", {
+                    "price": exitp,
+                    "qty": qty,
+                    "gross": gross,
+                    "fee": fee
+                })
+
+                qty = 0
+                reason = "STOP_LOSS"
+
+            else:
+                for n, field, fraction in [
+                    (1, "tp1_price", 0.50),
+                    (2, "tp2_price", 0.30),
+                    (3, "tp3_price", 1.00)
+                ]:
+                    flag = f"tp{n}_done"
+
+                    if flags[flag] or not target_hit(float(r[field])):
+                        continue
+
+                    close_qty = (
+                        qty if n == 3
+                        else min(qty, float(r["initial_qty"]) * fraction)
+                    )
+
+                    if close_qty <= 0:
+                        continue
+
+                    exitp = float(r[field]) * (
+                        1 - SLIPPAGE if sign == 1 else 1 + SLIPPAGE
+                    )
+
+                    gross = (exitp - entry) * close_qty * sign
+                    fee = abs(exitp * close_qty) * FEE_RATE
+
+                    realized += gross - fee
+                    fees += fee
+                    qty = max(0, qty - close_qty)
+                    flags[flag] = 1
+
+                    audit(c, r["trade_id"], f"TP{n}_HIT", {
+                        "price": exitp,
+                        "qty": close_qty,
+                        "gross": gross,
+                        "fee": fee
+                    })
+
+                    if n == 1:
+                        stop = entry
+                        stage = "TP1_HIT"
+                    elif n == 2:
+                        stage = "TP2_HIT"
+                    else:
+                        reason = "TP3"
+                        qty = 0
+
+                    break
+
+            if qty <= 1e-10:
+                qty = 0
+                stage = "CLOSED"
+                reason = reason or "TARGETS_COMPLETE"
+
+            unreal = (price - entry) * qty * sign
+            risk = max(
+                float(r["initial_qty"]) * abs(entry - float(r["stop_price"])),
+                1e-9
+            )
+            wr = realized / risk
+
+            c.execute(
+                """UPDATE trades SET
+                    stop_price=?,remaining_qty=?,
+                    tp1_done=?,tp2_done=?,tp3_done=?,
+                    stage=?,realized_pnl_usd=?,unrealized_pnl_usd=?,
+                    total_fee_usd=?,weighted_pnl_r=?,close_reason=?,
+                    closed_at_utc=?,updated_at_utc=?
+                WHERE trade_id=?""",
+                (
+                    stop, qty,
+                    flags["tp1_done"], flags["tp2_done"], flags["tp3_done"],
+                    stage, realized, unreal, fees, wr, reason,
+                    now_iso() if stage == "CLOSED" else None,
+                    now_iso(), r["trade_id"]
                 )
-            except sqlite3.IntegrityError:
-                pass
+            )
+
+            if reason:
+                tg(
+                    f"PAPER {SYMBOL} {direction} {reason}\n"
+                    f"Realized PnL {realized:.2f} USD"
+                )
+
+        c.commit()
+
+    except Exception:
+        c.rollback()
+        log.exception("Trade manager error")
+
     finally:
-        conn.close()
+        c.close()
 
 
-# ==========================================
-# MASTER LOOP
-# ==========================================
-def master_scanner_cycle() -> None:
-    last_daily_sync = 0.0
-    last_kline_sync = 0.0
+# ---------------------------------------------------------------------
+# Main engine loop
+# ---------------------------------------------------------------------
 
+def engine_loop():
     while True:
         try:
-            now = time.time()
-            if now - last_daily_sync > 300.0:
-                fetch_daily_pdh_pdl()
-                last_daily_sync = now
+            is_leader, token = lease_tick()
 
-            if now - last_kline_sync > 15.0:
-                fetch_15m_klines()
-                last_kline_sync = now
+            if not is_leader or token is None:
+                STATE.update(status="STANDBY", fencing_token=None)
+                time.sleep(2)
+                continue
 
-            fetch_spot_price()
-            price = DATA_HUB["price"]
+            STATE.update(status="RUNNING_PAPER", fencing_token=token)
 
-            if price > 10000.0 and acquire_leader():
-                manage_active_positions(price)
-                try_dispatch_new_signal(price)
+            if not refresh():
+                STATE.update(last_error=MARKET.get("error"))
+                time.sleep(SCAN_SECONDS)
+                continue
 
-        except Exception as exc:
-            logging.error(f"Cycle execution error: {exc}")
+            with LOCK:
+                p = MARKET["price"]
+                pts = MARKET["price_ts"]
+                ks = {k: list(v) for k, v in MARKET["klines"].items()}
+                sess = MARKET["session"]
+                kts = MARKET["klines_ts"]
 
-        time.sleep(3.0)
+            if (
+                time.time() - pts > MAX_DATA_AGE
+                or time.time() - kts > MAX_DATA_AGE
+            ):
+                STATE["status"] = "DATA_STALE"
+                time.sleep(SCAN_SECONDS)
+                continue
+
+            manage_trades(p, token)
+
+            st = structure(ks)
+            s = make_signal(st, ks["15m"], p, sess)
+
+            if s:
+                STATE["last_signal"] = {
+                    "direction": s["direction"],
+                    "score": s["score"],
+                    "setup_name": s["setup_name"],
+                    "time": now_iso()
+                }
+                open_paper_trade(s, token)
+
+            STATE.update(
+                last_scan_epoch=time.time(),
+                last_error=None
+            )
+
+            time.sleep(SCAN_SECONDS)
+
+        except Exception as e:
+            STATE.update(status="ERROR", last_error=str(e)[:250])
+            log.exception("Engine loop exception")
+            time.sleep(max(3, SCAN_SECONDS))
 
 
-# Start Background Threads
-threading.Thread(target=telegram_worker_loop, name="TelegramDispatcher", daemon=True).start()
-threading.Thread(target=master_scanner_cycle, name="MasterScanner", daemon=True).start()
+# ---------------------------------------------------------------------
+# Authenticated Flask API
+# ---------------------------------------------------------------------
+
+app = Flask(__name__)
+
+
+def auth_ok():
+    h = request.headers.get("Authorization", "")
+    if not h.startswith("Bearer "):
+        return False
+
+    return hmac.compare_digest(
+        h[7:].strip().encode(),
+        WORKER_AUTH_TOKEN.encode()
+    )
+
+
+@app.before_request
+def protect():
+    if request.path == "/healthz":
+        return None
+
+    if not auth_ok():
+        return jsonify({"error": "unauthorized"}), 401
+
+
+@app.get("/healthz")
+def healthz():
+    with LOCK:
+        fresh = bool(
+            MARKET["price"]
+            and time.time() - MARKET["price_ts"] <= MAX_DATA_AGE
+            and time.time() - MARKET["klines_ts"] <= MAX_DATA_AGE
+        )
+
+    d = dict(STATE)
+    d.update(
+        mode="PAPER",
+        symbol=SYMBOL,
+        market_data_fresh=fresh,
+        uptime_seconds=int(time.time() - STARTED),
+        utc_time=now_iso()
+    )
+
+    code = 200 if d["status"] in ("RUNNING_PAPER", "STANDBY") else 503
+    return jsonify(d), code
+
+
+@app.get("/vault-data")
+def vault_data():
+    limit = min(max(int(request.args.get("limit", "50")), 1), 200)
+    c = db()
+
+    try:
+        ts = [
+            dict(r) for r in c.execute(
+                "SELECT * FROM trades ORDER BY id DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+        ]
+
+        ss = [
+            dict(r) for r in c.execute(
+                "SELECT * FROM signals ORDER BY id DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+        ]
+
+        pnl = c.execute(
+            "SELECT COALESCE(SUM(realized_pnl_usd),0) p FROM trades"
+        ).fetchone()["p"]
+
+        op = c.execute(
+            "SELECT COUNT(*) n FROM trades WHERE stage!='CLOSED'"
+        ).fetchone()["n"]
+
+        return jsonify({
+            "mode": "PAPER",
+            "symbol": SYMBOL,
+            "starting_equity_usd": START_EQUITY,
+            "equity_estimate_usd": equity(c),
+            "realized_pnl_usd": pnl,
+            "open_trades": op,
+            "trades": ts,
+            "signals": ss
+        })
+
+    finally:
+        c.close()
+
+
+@app.get("/signals")
+def signals_api():
+    limit = min(max(int(request.args.get("limit", "20")), 1), 100)
+    c = db()
+
+    try:
+        rows = c.execute(
+            "SELECT * FROM signals ORDER BY id DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+
+        return jsonify({"signals": [dict(r) for r in rows]})
+
+    finally:
+        c.close()
+
+
+@app.errorhandler(413)
+def too_big(_):
+    return jsonify({"error": "request too large"}), 413
+
+
+def main():
+    init_db()
+
+    threading.Thread(
+        target=tg_loop, daemon=True, name="telegram"
+    ).start()
+
+    threading.Thread(
+        target=engine_loop, daemon=True, name="engine"
+    ).start()
+
+    log.info(
+        "Starting %s in PAPER-only mode on port %d; exchange order placement disabled.",
+        SYMBOL, PORT
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=PORT,
+        debug=False,
+        threaded=True,
+        use_reloader=False
+    )
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)
+    main()
