@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """BTCUSDT SMC PAPER engine. Live/testnet order placement is intentionally disabled."""
 import os, sys, time, uuid, hmac, math, json, queue, sqlite3, logging, threading
@@ -76,8 +75,8 @@ try:
     MIN_SCORE = fenv("MIN_SIGNAL_SCORE", 75, 0)
 
     MIN_GAP = fenv("MIN_FVG_GAP_USD", 35, 0)
-    SWEEP_BUFFER = fenv("SWEEP_BUFFER_USD", 5, 0)
-    SL_BUFFER = fenv("STRUCTURAL_SL_BUFFER_USD", 15, 0)
+    SWEEP_BUFFER = fenv("SWEEP_BUFFER_USD", 10, 0)
+    SL_BUFFER = fenv("STRUCTURAL_SL_BUFFER_USD", 25, 0)
     MIN_STOP = fenv("MIN_STOP_DISTANCE_USD", 40, 1)
     MAX_STOP = fenv("MAX_STOP_DISTANCE_USD", 1500, 1)
 
@@ -112,6 +111,7 @@ MARKET: Dict[str, Any] = {
     "klines": {},
     "klines_ts": 0,
     "session": "INITIALIZING",
+    "poc": None,
     "error": None
 }
 
@@ -123,10 +123,6 @@ STATE: Dict[str, Any] = {
     "fencing_token": None
 }
 
-
-# ---------------------------------------------------------------------
-# General helpers
-# ---------------------------------------------------------------------
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
@@ -151,17 +147,13 @@ def session_now():
     return "SESSION CLOSE"
 
 
-# ---------------------------------------------------------------------
-# SQLite database
-# ---------------------------------------------------------------------
-
 def db():
     os.makedirs(os.path.dirname(os.path.abspath(DB_FILE)), exist_ok=True)
     c = sqlite3.connect(DB_FILE, timeout=20, isolation_level=None)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("PRAGMA busy_timeout=20000")
-    c.execute("PRAGMA synchronous=FULL")
+    c.execute("PRAGMA synchronous=NORMAL")
     c.execute("PRAGMA foreign_keys=ON")
     return c
 
@@ -252,10 +244,6 @@ def audit(c, tid, event, details):
     )
 
 
-# ---------------------------------------------------------------------
-# Atomic leader lease and fencing token
-# ---------------------------------------------------------------------
-
 def lease_tick() -> Tuple[bool, Optional[int]]:
     t = time.time()
     c = db()
@@ -284,7 +272,7 @@ def lease_tick() -> Tuple[bool, Optional[int]]:
                 WHERE id=1 AND leader_id=? AND fencing_token=?
                 AND expires_at_epoch>?""",
                 (now_iso(), t + LEASE_TTL, INSTANCE, token, t)
-            ).rowcount
+            )
             c.commit()
             return n == 1, token if n == 1 else None
 
@@ -299,7 +287,7 @@ def lease_tick() -> Tuple[bool, Optional[int]]:
                     INSTANCE, token, now_iso(), t + LEASE_TTL,
                     int(r["fencing_token"]), t
                 )
-            ).rowcount
+            )
             c.commit()
             return n == 1, token if n == 1 else None
 
@@ -334,10 +322,6 @@ def leader_ok(token):
     finally:
         c.close()
 
-
-# ---------------------------------------------------------------------
-# Telegram notifications
-# ---------------------------------------------------------------------
 
 def tg(message):
     if TG_TOKEN and TG_CHAT:
@@ -387,10 +371,6 @@ def tg_loop():
             TG_QUEUE.task_done()
 
 
-# ---------------------------------------------------------------------
-# Binance public market data: confirmed closed candles only
-# ---------------------------------------------------------------------
-
 def fetch_price():
     r = HTTP.get(
         BASE_URL + "/fapi/v1/ticker/price",
@@ -425,7 +405,6 @@ def fetch_klines(interval, limit=200):
         if not isinstance(k, list) or len(k) < 7:
             continue
 
-        # Ignore any candle whose close time has not passed.
         if int(k[6]) >= now_ms:
             continue
 
@@ -453,6 +432,28 @@ def fetch_klines(interval, limit=200):
     return list(dedup.values())[-limit:]
 
 
+def approx_poc(cs, bins=30):
+    if not cs:
+        return None
+
+    lo = min(c["low"] for c in cs)
+    hi = max(c["high"] for c in cs)
+
+    if hi <= lo:
+        return lo
+
+    width = (hi - lo) / bins
+    vol = [0.0] * bins
+
+    for c in cs:
+        typical = (c["high"] + c["low"] + c["close"]) / 3
+        i = min(bins - 1, max(0, int((typical - lo) / width)))
+        vol[i] += c["vol"]
+
+    i = max(range(bins), key=lambda n: vol[n])
+    return lo + (i + 0.5) * width
+
+
 def refresh():
     try:
         p = fetch_price()
@@ -470,6 +471,8 @@ def refresh():
         ):
             raise ValueError("Insufficient valid market data/history")
 
+        poc_val = approx_poc(ks["15m"][-96:])
+
         with LOCK:
             MARKET.update(
                 price=p,
@@ -477,6 +480,7 @@ def refresh():
                 klines=ks,
                 klines_ts=time.time(),
                 session=session_now(),
+                poc=poc_val,
                 error=None
             )
 
@@ -488,10 +492,6 @@ def refresh():
         log.warning("Market refresh failed: %s", e)
         return False
 
-
-# ---------------------------------------------------------------------
-# Indicators
-# ---------------------------------------------------------------------
 
 def ema(values: List[float], period: int) -> Optional[float]:
     if (
@@ -537,10 +537,6 @@ def psyche(c):
     }
 
 
-# ---------------------------------------------------------------------
-# SMC swings, FVG and approximate volume POC
-# ---------------------------------------------------------------------
-
 def swings(cs, n=3):
     hs, ls = [], []
 
@@ -569,8 +565,7 @@ def fvgs(cs):
         a, m, b = cs[i-1], cs[i], cs[i+1]
         rng = max(m["high"] - m["low"], 1e-9)
 
-        # Require a displacement candle in the middle.
-        if abs(m["close"] - m["open"]) / rng < 0.55:
+        if abs(m["close"] - m["open"]) / rng < 0.50:
             continue
 
         if b["low"] > a["high"] and b["low"] - a["high"] >= MIN_GAP:
@@ -592,29 +587,6 @@ def fvgs(cs):
             })
 
     return out
-
-
-def approx_poc(cs, bins=30):
-    """Approximate candle-volume POC, not true tick-level volume-at-price."""
-    if not cs:
-        return None
-
-    lo = min(c["low"] for c in cs)
-    hi = max(c["high"] for c in cs)
-
-    if hi <= lo:
-        return lo
-
-    width = (hi - lo) / bins
-    vol = [0.0] * bins
-
-    for c in cs:
-        typical = (c["high"] + c["low"] + c["close"]) / 3
-        i = min(bins - 1, max(0, int((typical - lo) / width)))
-        vol[i] += c["vol"]
-
-    i = max(range(bins), key=lambda n: vol[n])
-    return lo + (i + 0.5) * width
 
 
 def structure(ks):
@@ -647,7 +619,6 @@ def structure(ks):
     swing_hi = sh[-1]["price"] if sh else max(c["high"] for c in recent)
     swing_lo = sl[-1]["price"] if sl else min(c["low"] for c in recent)
 
-    # Latest completed UTC daily candle is used here.
     return {
         "bias4h": bias,
         "bias1h": b1,
@@ -661,10 +632,6 @@ def structure(ks):
         "fvgs": fvgs(c15)
     }
 
-
-# ---------------------------------------------------------------------
-# Sniper-style sweep and reclaim signal
-# ---------------------------------------------------------------------
 
 def make_signal(st, cs, price, sess):
     if (
@@ -681,7 +648,7 @@ def make_signal(st, cs, price, sess):
     eq = st["eq"]
     candidates = []
 
-    # LONG: sweep and reclaim the same sell-side level.
+    # 1. SETUP: LIQUIDITY SWEEP & RECLAIM (LONG)
     for label, level in [
         ("PDL", st["pdl"]),
         ("SWING_LOW", st["swing_low"])
@@ -691,10 +658,9 @@ def make_signal(st, cs, price, sess):
             and trigger["close"] > level
             and trigger["close"] > trigger["open"]
             and price < eq
-            and p["lower"] >= 0.40
+            and p["lower"] >= 0.35
             and p["body"] <= 0.65
-            and st["bias4h"] == "BULLISH"
-            and st["bias1h"] != "BEARISH"
+            and st["bias4h"] != "BEARISH"
         )
 
         if valid:
@@ -706,7 +672,7 @@ def make_signal(st, cs, price, sess):
             if MIN_STOP <= risk <= MAX_STOP:
                 score = min(
                     100,
-                    68 + min(12, p["lower"] * 15)
+                    70 + min(12, p["lower"] * 15)
                     + (8 if label == "PDL" else 4)
                     + (3 if st["poc"] and price < st["poc"] else 0)
                 )
@@ -723,7 +689,7 @@ def make_signal(st, cs, price, sess):
                     "wick_ratio": p["lower"]
                 })
 
-    # SHORT: sweep and reclaim the same buy-side level.
+    # 2. SETUP: LIQUIDITY SWEEP & RECLAIM (SHORT)
     for label, level in [
         ("PDH", st["pdh"]),
         ("SWING_HIGH", st["swing_high"])
@@ -733,10 +699,9 @@ def make_signal(st, cs, price, sess):
             and trigger["close"] < level
             and trigger["close"] < trigger["open"]
             and price > eq
-            and p["upper"] >= 0.40
+            and p["upper"] >= 0.35
             and p["body"] <= 0.65
-            and st["bias4h"] == "BEARISH"
-            and st["bias1h"] != "BULLISH"
+            and st["bias4h"] != "BULLISH"
         )
 
         if valid:
@@ -748,7 +713,7 @@ def make_signal(st, cs, price, sess):
             if MIN_STOP <= risk <= MAX_STOP:
                 score = min(
                     100,
-                    68 + min(12, p["upper"] * 15)
+                    70 + min(12, p["upper"] * 15)
                     + (8 if label == "PDH" else 4)
                     + (3 if st["poc"] and price > st["poc"] else 0)
                 )
@@ -764,6 +729,41 @@ def make_signal(st, cs, price, sess):
                     "trigger_time": trigger["time"],
                     "wick_ratio": p["upper"]
                 })
+
+    # 3. SETUP: FVG CONSEQUENT ENCROACHMENT (CE) RETEST
+    for f in st.get("fvgs", []):
+        if f["direction"] == "LONG" and price < eq and st["bias4h"] == "BULLISH":
+            if trigger["low"] <= f["ce"] and trigger["close"] > f["ce"] and trigger["close"] > trigger["open"]:
+                sl = f["bottom"] - max(SL_BUFFER, 0.15 * st["atr"])
+                risk = price - sl
+                if MIN_STOP <= risk <= MAX_STOP:
+                    candidates.append({
+                        "direction": "LONG",
+                        "setup_name": "FVG CE Retest in Discount",
+                        "entry": price,
+                        "sl": sl,
+                        "risk": risk,
+                        "score": 80.0,
+                        "swept_level": "FVG_CE",
+                        "trigger_time": trigger["time"],
+                        "wick_ratio": p["lower"]
+                    })
+        elif f["direction"] == "SHORT" and price > eq and st["bias4h"] == "BEARISH":
+            if trigger["high"] >= f["ce"] and trigger["close"] < f["ce"] and trigger["close"] < trigger["open"]:
+                sl = f["top"] + max(SL_BUFFER, 0.15 * st["atr"])
+                risk = sl - price
+                if MIN_STOP <= risk <= MAX_STOP:
+                    candidates.append({
+                        "direction": "SHORT",
+                        "setup_name": "FVG CE Retest in Premium",
+                        "entry": price,
+                        "sl": sl,
+                        "risk": risk,
+                        "score": 80.0,
+                        "swept_level": "FVG_CE",
+                        "trigger_time": trigger["time"],
+                        "wick_ratio": p["upper"]
+                    })
 
     if not candidates:
         return None
@@ -795,15 +795,11 @@ def make_signal(st, cs, price, sess):
     return s
 
 
-# ---------------------------------------------------------------------
-# Paper equity, daily limits, and trade creation
-# ---------------------------------------------------------------------
-
 def equity(c):
     r = c.execute(
         "SELECT COALESCE(SUM(realized_pnl_usd),0) p FROM trades"
     ).fetchone()
-    return max(0, START_EQUITY + float(r["p"]))
+    return max(0, START_EQUITY + float(r["p"] or 0.0))
 
 
 def daily_stats(c):
@@ -821,7 +817,7 @@ def daily_stats(c):
         (day,)
     ).fetchone()["n"]
 
-    return sum(float(r["realized_pnl_usd"]) for r in rows), int(count)
+    return sum(float(r["realized_pnl_usd"] or 0.0) for r in rows), int(count or 0)
 
 
 def open_paper_trade(s, token):
@@ -939,10 +935,6 @@ def open_paper_trade(s, token):
         c.close()
 
 
-# ---------------------------------------------------------------------
-# Paper trade manager: TP1 50%, TP2 30%, TP3 remaining
-# ---------------------------------------------------------------------
-
 def manage_trades(price, token):
     if not leader_ok(token) or price <= 0:
         return
@@ -973,8 +965,8 @@ def manage_trades(price, token):
             entry = float(r["entry_price"])
             qty = float(r["remaining_qty"])
             stop = float(r["stop_price"])
-            realized = float(r["realized_pnl_usd"])
-            fees = float(r["total_fee_usd"])
+            realized = float(r["realized_pnl_usd"] or 0.0)
+            fees = float(r["total_fee_usd"] or 0.0)
             stage = r["stage"]
             reason = None
 
@@ -1104,10 +1096,6 @@ def manage_trades(price, token):
         c.close()
 
 
-# ---------------------------------------------------------------------
-# Main engine loop
-# ---------------------------------------------------------------------
-
 def engine_loop():
     while True:
         try:
@@ -1167,10 +1155,6 @@ def engine_loop():
             time.sleep(max(3, SCAN_SECONDS))
 
 
-# ---------------------------------------------------------------------
-# Authenticated Flask API
-# ---------------------------------------------------------------------
-
 app = Flask(__name__)
 
 
@@ -1229,6 +1213,12 @@ def vault_data():
             ).fetchall()
         ]
 
+        active_list = [
+            dict(r) for r in c.execute(
+                "SELECT * FROM trades WHERE stage!='CLOSED' ORDER BY id DESC LIMIT 1"
+            ).fetchall()
+        ]
+
         ss = [
             dict(r) for r in c.execute(
                 "SELECT * FROM signals ORDER BY id DESC LIMIT ?",
@@ -1244,13 +1234,47 @@ def vault_data():
             "SELECT COUNT(*) n FROM trades WHERE stage!='CLOSED'"
         ).fetchone()["n"]
 
+        wins = c.execute(
+            "SELECT COUNT(*) n FROM trades WHERE stage='CLOSED' AND realized_pnl_usd > 0"
+        ).fetchone()["n"]
+
+        losses = c.execute(
+            "SELECT COUNT(*) n FROM trades WHERE stage='CLOSED' AND realized_pnl_usd <= 0"
+        ).fetchone()["n"]
+
+        total_closed = wins + losses
+        win_rate = round(100.0 * wins / total_closed, 1) if total_closed > 0 else 0.0
+
+        with LOCK:
+            curr_p = MARKET.get("price") or 0.0
+            curr_sess = MARKET.get("session") or "UNKNOWN"
+            curr_poc = MARKET.get("poc") or 0.0
+
         return jsonify({
             "mode": "PAPER",
             "symbol": SYMBOL,
             "starting_equity_usd": START_EQUITY,
             "equity_estimate_usd": equity(c),
-            "realized_pnl_usd": pnl,
+            "realized_pnl_usd": float(pnl or 0.0),
             "open_trades": op,
+            "price": curr_p,
+            "session": curr_sess,
+            "poc": curr_poc,
+            "market": {
+                "price": curr_p,
+                "session": curr_sess,
+                "poc": curr_poc
+            },
+            "stats": {
+                "total_r": round(float(pnl or 0.0) / 10.0, 2),
+                "wins": wins,
+                "losses": losses,
+                "win_rate": win_rate
+            },
+            "active_trade": active_list[0] if active_list else None,
+            "active": active_list,
+            "vault": ts,
+            "history": ts,
             "trades": ts,
             "signals": ss
         })
@@ -1268,10 +1292,8 @@ def signals_api():
         rows = c.execute(
             "SELECT * FROM signals ORDER BY id DESC LIMIT ?",
             (limit,)
-        ).fetchall()
-
+        )
         return jsonify({"signals": [dict(r) for r in rows]})
-
     finally:
         c.close()
 
