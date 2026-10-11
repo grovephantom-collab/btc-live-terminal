@@ -57,8 +57,11 @@ def auth_check() -> bool:
 
 @app.before_request
 def auth_gate():
-    if request.path == "/healthz": return None
-    if not auth_check(): return jsonify({"error": "unauthorized"}), 401
+    # healthz, root aur dashboard bina token ke public view honge
+    if request.path in ("/healthz", "/", "/dashboard"): 
+        return None
+    if not auth_check(): 
+        return jsonify({"error": "unauthorized"}), 401
 
 # 4. Public Health Probe
 @app.get("/healthz")
@@ -69,6 +72,43 @@ def healthz():
     d.update(mode="PAPER", symbol=config.SYMBOL, market_data_fresh=fresh, uptime_seconds=int(time.time() - STARTED), utc_time=database.now_iso())
     return jsonify(d), (200 if d["status"] in ("RUNNING_PAPER", "STANDBY") else 503)
 
+# Public Direct Dashboard (Phone Browser Friendly)
+@app.get("/")
+@app.get("/dashboard")
+def dashboard_view():
+    c = database.db()
+    try:
+        ts = [dict(r) for r in c.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 50").fetchall()]
+        act = [dict(r) for r in c.execute("SELECT * FROM trades WHERE stage!='CLOSED' ORDER BY id DESC LIMIT 1").fetchall()]
+        pnl = float(c.execute("SELECT COALESCE(SUM(realized_pnl_usd),0) p FROM trades").fetchone()["p"] or 0.0)
+        
+        with LOCK:
+            cp = market_data.MARKET.get("price") or 0.0
+            cs = market_data.MARKET.get("session") or "UNKNOWN"
+            poc = market_data.MARKET.get("poc") or 0.0
+            
+        closed_trades = [t for t in ts if t.get("stage") == "CLOSED"]
+        wins = sum(1 for t in closed_trades if float(t.get("realized_pnl_usd") or 0) > 0)
+        total = len(closed_trades)
+        win_rate = round((wins / total * 100), 1) if total > 0 else 0.0
+
+        return jsonify({
+            "status": "ONLINE",
+            "market": {"price": cp, "session": cs, "poc": poc},
+            "stats": {
+                "realized_pnl_usd": pnl,
+                "total_trades": total,
+                "win_count": wins,
+                "loss_count": total - wins,
+                "win_rate_pct": win_rate
+            },
+            "active_trade": act[0] if act else None,
+            "recent_trades": ts
+        })
+    finally:
+        c.close()
+
+# Token Protected Vault Endpoint
 @app.get("/vault-data")
 def vault_data():
     limit = min(max(int(request.args.get("limit", "50")), 1), 200)
