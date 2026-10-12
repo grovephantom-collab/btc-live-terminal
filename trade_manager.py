@@ -1,111 +1,200 @@
-import math, uuid, sqlite3
-import config, database
-from notifications import enqueue_telegram
+import logging, database, config, notifications
 
-def get_equity(c: sqlite3.Connection) -> float:
-    r = c.execute("SELECT COALESCE(SUM(realized_pnl_usd),0) p FROM trades").fetchone()
-    return max(0, config.START_EQUITY + float(r["p"] or 0.0))
+log = logging.getLogger("TradeManager")
 
-def get_daily_stats(c: sqlite3.Connection):
-    day = database.today()
-    rows = c.execute("SELECT realized_pnl_usd FROM trades WHERE substr(opened_at_utc,1,10)=?", (day,)).fetchall()
-    cnt = c.execute("SELECT COUNT(*) n FROM trades WHERE substr(opened_at_utc,1,10)=?", (day,)).fetchone()["n"]
-    return sum(float(r["realized_pnl_usd"] or 0.0) for r in rows), int(cnt or 0)
+def get_equity(conn) -> float:
+    # Initial paper balance 500 USD + realized PnL
+    r = conn.execute("SELECT COALESCE(SUM(realized_pnl_usd), 0.0) as pnl FROM trades").fetchone()
+    base = 500.0
+    return max(50.0, base + float(r["pnl"] if r else 0.0))
 
-# 19, 20, 21, 22, 23 & 28. Risk Calculations & Idempotent Keys
-def open_paper_trade(s: dict, token: int) -> bool:
-    if not database.leader_ok(token): return False
-    key = f"{config.SYMBOL}:{s['direction']}:{s['trigger_time']}:{s['swept_level']}"
-    c = database.db()
+def check_daily_loss(conn) -> bool:
+    today = database.now_iso()[:10]
+    r = conn.execute("SELECT COALESCE(SUM(realized_pnl_usd), 0.0) as pnl FROM trades WHERE opened_at_utc LIKE ?", (today + "%",)).fetchone()
+    daily_pnl = float(r["pnl"] if r else 0.0)
+    return daily_pnl <= -abs(config.DAILY_LOSS_LIMIT_USD)
+
+def open_paper_trade(signal: dict, fencing_token: int):
+    conn = database.db()
     try:
-        c.execute("BEGIN IMMEDIATE")
-        if c.execute("SELECT 1 FROM signals WHERE signal_key=?", (key,)).fetchone():
-            c.rollback(); return False
-        
-        # 21 & 23. Daily Drawdown Limit & Max Trades
-        pnl, n = get_daily_stats(c)
-        op = c.execute("SELECT COUNT(*) n FROM trades WHERE stage!='CLOSED'").fetchone()["n"]
-        if pnl <= -config.MAX_DAILY_LOSS or n >= config.MAX_DAILY_TRADES or op >= config.MAX_OPEN_TRADES:
-            c.rollback(); return False
+        if check_daily_loss(conn):
+            log.warning("Daily risk limit hit. Trade skipped.")
+            return
 
-        # 22. 2 Consecutive SL -> 24h Lockout
-        recent = c.execute("SELECT close_reason, closed_at_utc FROM trades WHERE stage='CLOSED' ORDER BY id DESC LIMIT 2").fetchall()
-        if len(recent) >= 2 and all(r["close_reason"] == "STOP_LOSS" for r in recent):
-            from datetime import datetime, timezone
-            last_close = recent[0]["closed_at_utc"]
-            if last_close and (datetime.now(timezone.utc) - datetime.fromisoformat(last_close)).total_seconds() < 86400:
-                c.rollback(); return False
+        act = conn.execute("SELECT id FROM trades WHERE stage != 'CLOSED'").fetchone()
+        if act:
+            return  # Max 1 open position rule intact
 
-        # 20. 1% Account Equity Dynamic Sizing
-        qty = min((get_equity(c) * config.RISK_PCT) / s["risk"], config.MAX_NOTIONAL / s["entry"])
-        if not math.isfinite(qty) or qty <= 0: c.rollback(); return False
+        equity = get_equity(conn)
+        risk_usd = equity * config.RISK_PER_TRADE_PCT
+        entry = float(signal["entry"])
+        sl = float(signal["sl"])
+        direction = signal["direction"]
 
-        c.execute("""INSERT INTO signals(signal_key,symbol,direction,setup_name,score,entry_price,stop_price,tp1_price,tp2_price,tp3_price,timeframe,candle_time,details_json,created_at_utc)
-                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                  (key, config.SYMBOL, s["direction"], s["setup_name"], s["score"], s["entry"], s["sl"], s["tp1"], s["tp2"], s["tp3"], s["timeframe"], s["trigger_time"], database.jd(s), database.now_iso()))
+        risk_per_coin = abs(entry - sl)
+        if risk_per_coin <= 0:
+            return
 
-        tid, now = str(uuid.uuid4()), database.now_iso()
-        c.execute("""INSERT INTO trades(trade_id,signal_key,symbol,direction,setup_name,score,entry_price,stop_price,tp1_price,tp2_price,tp3_price,initial_qty,remaining_qty,stage,opened_at_utc,updated_at_utc)
-                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'OPEN',?,?)""",
-                  (tid, key, config.SYMBOL, s["direction"], s["setup_name"], s["score"], s["entry"], s["sl"], s["tp1"], s["tp2"], s["tp3"], qty, qty, now, now))
-        database.audit(c, tid, "PAPER_OPEN", {"qty": qty, "fencing_token": token, "signal_key": key})
-        c.commit()
+        qty = round(risk_usd / risk_per_coin, 6)
+        if qty <= 0:
+            return
 
-        enqueue_telegram(f"PAPER {config.SYMBOL} {s['direction']}\n{s['setup_name']}\nScore: {s['score']:.1f}\nEntry: {s['entry']:.2f} | SL: {s['sl']:.2f}\nTPs: {s['tp1']:.2f} / {s['tp2']:.2f} / {s['tp3']:.2f}\nQty: {qty:.6f}")
-        return True
-    except Exception:
-        c.rollback(); return False
-    finally: c.close()
+        tp1 = float(signal["tp1"])
+        tp2 = float(signal["tp2"])
+        tp3 = float(signal["tp3"])
 
-# 24, 25, 26 & 27. Partials, Breakeven & Fee Accounting
-def manage_positions(price: float, token: int):
-    if not database.leader_ok(token) or price <= 0: return
-    c = database.db()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO trades (
+                symbol, direction, entry_price, initial_sl, stop_price,
+                tp1_price, tp2_price, tp3_price, qty, original_qty,
+                stage, setup_name, opened_at_utc, fencing_token
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?)
+        """, (
+            config.SYMBOL, direction, entry, sl, sl,
+            tp1, tp2, tp3, qty, qty,
+            signal.get("setup_name", "SMC Setup"), database.now_iso(), fencing_token
+        ))
+        conn.commit()
+
+        # Instant alert via notifications engine
+        notifications.notify_signal_opened({
+            "direction": direction,
+            "setup_name": signal.get("setup_name", "SMC Setup"),
+            "score": signal.get("score", 80),
+            "entry": entry,
+            "sl": sl,
+            "tp1": tp1,
+            "tp2": tp2,
+            "tp3": tp3,
+            "qty": qty
+        })
+    finally:
+        conn.close()
+
+def manage_positions(current_price: float, fencing_token: int):
+    conn = database.db()
     try:
-        c.execute("BEGIN IMMEDIATE")
-        for r in c.execute("SELECT * FROM trades WHERE stage!='CLOSED'").fetchall():
-            d = r["direction"]
-            sign = 1 if d == "LONG" else -1
-            entry, stop, qty = float(r["entry_price"]), float(r["stop_price"]), float(r["remaining_qty"])
-            realized, fees, stage = float(r["realized_pnl_usd"] or 0.0), float(r["total_fee_usd"] or 0.0), r["stage"]
-            flags = {"tp1": r["tp1_done"], "tp2": r["tp2_done"], "tp3": r["tp3_done"]}
-            reason = None
+        t = conn.execute("SELECT * FROM trades WHERE stage != 'CLOSED' ORDER BY id DESC LIMIT 1").fetchone()
+        if not t:
+            return
 
-            stop_hit = price <= stop if d == "LONG" else price >= stop
-            if stop_hit:
-                # 27. Fee & Slippage Deduction
-                exitp = stop * (1 - config.SLIPPAGE if sign == 1 else 1 + config.SLIPPAGE)
-                gross = (exitp - entry) * qty * sign
-                fee = abs(exitp * qty) * config.FEE_RATE
-                realized += gross - fee; fees += fee; qty = 0; reason = "STOP_LOSS"
-            else:
-                # 24. Multi-Stage Partials (50% / 30% / 20%)
-                for idx, field, frac in [(1, "tp1_price", 0.50), (2, "tp2_price", 0.30), (3, "tp3_price", 1.00)]:
-                    fl = f"tp{idx}"
-                    hit = price >= float(r[field]) if d == "LONG" else price <= float(r[field])
-                    if flags[fl] or not hit: continue
-                    close_qty = qty if idx == 3 else min(qty, float(r["initial_qty"]) * frac)
-                    if close_qty <= 0: continue
-                    exitp = float(r[field]) * (1 - config.SLIPPAGE if sign == 1 else 1 + config.SLIPPAGE)
-                    gross = (exitp - entry) * close_qty * sign
-                    fee = abs(exitp * close_qty) * config.FEE_RATE
-                    realized += gross - fee; fees += fee; qty = max(0, qty - close_qty); flags[fl] = 1
-                    
-                    # 25. Auto-Breakeven Stop Shift at TP1
-                    if idx == 1: stop = entry; stage = "TP1_HIT"
-                    elif idx == 2: stage = "TP2_HIT"
-                    else: reason = "TP3"; qty = 0
-                    break
+        trade = dict(t)
+        tid = trade["id"]
+        direction = trade["direction"]
+        entry = trade["entry_price"]
+        sl = trade["stop_price"]
+        initial_sl = trade["initial_sl"]
+        stage = trade["stage"]
+        qty = trade["qty"]
+        orig_qty = trade["original_qty"]
 
-            if qty <= 1e-10: qty = 0; stage = "CLOSED"; reason = reason or "TARGETS_COMPLETE"
-            unreal = (price - entry) * qty * sign
-            risk = max(float(r["initial_qty"]) * abs(entry - float(r["stop_price"])), 1e-9)
-            # 26. Weighted Realized R
-            weighted_r = realized / risk
+        # Safe R-Multiple Calculation (Prevents huge numbers)
+        initial_risk_dist = abs(entry - initial_sl)
+        def calc_safe_r(exit_px):
+            if initial_risk_dist <= 0:
+                return 0.0
+            raw_r = (exit_px - entry) / initial_risk_dist if direction == "LONG" else (entry - exit_px) / initial_risk_dist
+            return max(-5.0, min(round(raw_r, 2), 20.0))
 
-            c.execute("""UPDATE trades SET stop_price=?,remaining_qty=?,tp1_done=?,tp2_done=?,tp3_done=?,stage=?,realized_pnl_usd=?,unrealized_pnl_usd=?,total_fee_usd=?,weighted_pnl_r=?,close_reason=?,closed_at_utc=?,updated_at_utc=? WHERE trade_id=?""",
-                      (stop, qty, flags["tp1"], flags["tp2"], flags["tp3"], stage, realized, unreal, fees, weighted_r, reason, database.now_iso() if stage == "CLOSED" else None, database.now_iso(), r["trade_id"]))
-            if reason: enqueue_telegram(f"PAPER {config.SYMBOL} {d} {reason}\nRealized PnL: {realized:.2f} USD (Net: {weighted_r:+.2f}R)")
-        c.commit()
-    except Exception: c.rollback()
-    finally: c.close()
+        # 1. Stop Loss Hit
+        sl_hit = (current_price <= sl) if direction == "LONG" else (current_price >= sl)
+        if sl_hit:
+            pnl_usd = (sl - entry) * qty if direction == "LONG" else (entry - sl) * qty
+            # Subtract fees & slippage
+            pnl_usd -= (sl * qty * 0.001)
+            weighted_r = calc_safe_r(sl)
+
+            conn.execute("""
+                UPDATE trades SET 
+                    stage = 'CLOSED', closed_at_utc = ?, close_reason = 'STOP_LOSS',
+                    realized_pnl_usd = COALESCE(realized_pnl_usd, 0) + ?,
+                    weighted_pnl_r = ?, fencing_token = ?
+                WHERE id = ?
+            """, (database.now_iso(), round(pnl_usd, 2), weighted_r, fencing_token, tid))
+            conn.commit()
+
+            notifications.notify_trade_closed({
+                "direction": direction,
+                "reason": "STOP_LOSS",
+                "pnl_usd": round(pnl_usd, 2),
+                "r_mult": weighted_r
+            })
+            return
+
+        # 2. Stage-based TP Management
+        tp1 = trade["tp1_price"]
+        tp2 = trade["tp2_price"]
+        tp3 = trade["tp3_price"]
+
+        # Buffer for zero brokerage on Break-Even
+        be_buffer = entry * 0.0008
+        be_price = (entry + be_buffer) if direction == "LONG" else (entry - be_buffer)
+
+        # Stage: ACTIVE -> Check TP1 (50% Close + Shift SL to BE)
+        if stage == "ACTIVE":
+            tp1_hit = (current_price >= tp1) if direction == "LONG" else (current_price <= tp1)
+            if tp1_hit:
+                part_qty = round(orig_qty * 0.50, 6)
+                pnl = (tp1 - entry) * part_qty if direction == "LONG" else (entry - tp1) * part_qty
+                pnl -= (tp1 * part_qty * 0.001)
+                new_qty = max(0.0, qty - part_qty)
+
+                conn.execute("""
+                    UPDATE trades SET 
+                        stage = 'TP1_HIT', stop_price = ?, qty = ?,
+                        realized_pnl_usd = COALESCE(realized_pnl_usd, 0) + ?,
+                        fencing_token = ?
+                    WHERE id = ?
+                """, (be_price, new_qty, round(pnl, 2), fencing_token, tid))
+                conn.commit()
+                return
+
+        # Stage: TP1_HIT -> Check TP2 (30% Close + Lock in TP1 price as SL)
+        elif stage == "TP1_HIT":
+            tp2_hit = (current_price >= tp2) if direction == "LONG" else (current_price <= tp2)
+            if tp2_hit:
+                part_qty = round(orig_qty * 0.30, 6)
+                pnl = (tp2 - entry) * part_qty if direction == "LONG" else (entry - tp2) * part_qty
+                pnl -= (tp2 * part_qty * 0.001)
+                new_qty = max(0.0, qty - part_qty)
+
+                conn.execute("""
+                    UPDATE trades SET 
+                        stage = 'TP2_HIT', stop_price = ?, qty = ?,
+                        realized_pnl_usd = COALESCE(realized_pnl_usd, 0) + ?,
+                        fencing_token = ?
+                    WHERE id = ?
+                """, (tp1, new_qty, round(pnl, 2), fencing_token, tid))
+                conn.commit()
+                return
+
+        # Stage: TP2_HIT -> Check TP3 / Trailing Runner
+        elif stage == "TP2_HIT":
+            tp3_hit = (current_price >= tp3) if direction == "LONG" else (current_price <= tp3)
+            if tp3_hit:
+                # 20% Runner Transition: Shift SL tightly to lock in TP2 profits & trail remainder
+                trail_sl = tp2
+                conn.execute("""
+                    UPDATE trades SET 
+                        stage = 'RUNNER_TRAILING', stop_price = ?, fencing_token = ?
+                    WHERE id = ?
+                """, (trail_sl, fencing_token, tid))
+                conn.commit()
+                return
+
+        # Stage: RUNNER_TRAILING -> Trail behind price dynamically
+        elif stage == "RUNNER_TRAILING":
+            # Long trails below higher lows; Short trails above lower highs
+            if direction == "LONG" and current_price > (sl + initial_risk_dist):
+                new_sl = current_price - (initial_risk_dist * 0.8)
+                if new_sl > sl:
+                    conn.execute("UPDATE trades SET stop_price = ?, fencing_token = ? WHERE id = ?", (new_sl, fencing_token, tid))
+                    conn.commit()
+            elif direction == "SHORT" and current_price < (sl - initial_risk_dist):
+                new_sl = current_price + (initial_risk_dist * 0.8)
+                if new_sl < sl:
+                    conn.execute("UPDATE trades SET stop_price = ?, fencing_token = ? WHERE id = ?", (new_sl, fencing_token, tid))
+                    conn.commit()
+    finally:
+        conn.close()
