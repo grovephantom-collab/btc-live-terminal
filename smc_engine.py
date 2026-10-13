@@ -2,14 +2,32 @@ import logging
 
 log = logging.getLogger("SMCEngine")
 
+def _parse_candle(c):
+    if isinstance(c, dict):
+        return (
+            float(c.get("open", 0.0)),
+            float(c.get("high", 0.0)),
+            float(c.get("low", 0.0)),
+            float(c.get("close", 0.0)),
+            float(c.get("vol", 1.0))
+        )
+    return (
+        float(c[1]),
+        float(c[2]),
+        float(c[3]),
+        float(c[4]),
+        float(c[5]) if len(c) > 5 else 1.0
+    )
+
 def get_structure(klines: dict) -> dict:
     k15 = klines.get("15m", [])
     if len(k15) < 30:
         return {}
     
-    highs = [float(c[2]) for c in k15]
-    lows = [float(c[3]) for c in k15]
-    closes = [float(c[4]) for c in k15]
+    parsed = [_parse_candle(c) for c in k15]
+    highs = [p[1] for p in parsed]
+    lows = [p[2] for p in parsed]
+    closes = [p[3] for p in parsed]
 
     swing_high = max(highs[-25:-1])
     swing_low = min(lows[-25:-1])
@@ -28,11 +46,11 @@ def detect_displacement_breakout(candles: list, structure: dict) -> dict:
     if len(candles) < 15 or not structure:
         return None
 
-    c = candles[-1]
-    prev_candles = candles[-7:-1]
+    parsed_all = [_parse_candle(c) for c in candles]
+    c = parsed_all[-1]
+    prev_candles = parsed_all[-7:-1]
 
-    o, h, l, cl = float(c[1]), float(c[2]), float(c[3]), float(c[4])
-    v = float(c[5]) if len(c) > 5 else 1.0
+    o, h, l, cl, v = c[0], c[1], c[2], c[3], c[4]
 
     candle_range = h - l
     if candle_range <= 0:
@@ -41,8 +59,7 @@ def detect_displacement_breakout(candles: list, structure: dict) -> dict:
     body = abs(cl - o)
     body_ratio = body / candle_range
 
-    # Volume filter relaxed from 1.35x to 1.15x
-    vols = [float(x[5]) for x in prev_candles if len(x) > 5]
+    vols = [x[4] for x in prev_candles]
     avg_vol = (sum(vols) / len(vols)) if vols else 1.0
     vol_surge = (v >= avg_vol * 1.15) or (avg_vol == 1.0)
 
@@ -90,8 +107,9 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
     if disp_signal:
         return disp_signal
 
-    c = candles_15m[-1]
-    o, h, l, cl = float(c[1]), float(c[2]), float(c[3]), float(c[4])
+    parsed = [_parse_candle(c) for c in candles_15m]
+    c = parsed[-1]
+    o, h, l, cl, _ = c[0], c[1], c[2], c[3], c[4]
     candle_range = h - l
     if candle_range <= 0:
         return None
@@ -131,34 +149,34 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
                     "tp3": round(cl - (risk * 4.0), 2)
                 }
 
-    c0, c1, c2 = candles_15m[-3], candles_15m[-2], candles_15m[-1]
-    if float(c2[3]) > float(c0[2]):
-        fvg_ce = (float(c2[3]) + float(c0[2])) / 2.0
+    c0, c1, c2 = parsed[-3], parsed[-2], parsed[-1]
+    if c2[2] > c0[1]:
+        fvg_ce = (c2[2] + c0[1]) / 2.0
         if l <= fvg_ce <= h and cl > fvg_ce:
-            risk = cl - float(c0[2])
+            risk = cl - c0[1]
             if risk > 0:
                 return {
                     "direction": "LONG",
                     "setup_name": "FVG CE Retest in Discount",
                     "score": 82.0,
                     "entry": cl,
-                    "sl": round(float(c0[2]), 2),
+                    "sl": round(c0[1], 2),
                     "tp1": round(cl + (risk * 1.5), 2),
                     "tp2": round(cl + (risk * 2.5), 2),
                     "tp3": round(cl + (risk * 4.0), 2)
                 }
 
-    if float(c0[3]) > float(c2[2]):
-        fvg_ce = (float(c0[3]) + float(c2[2])) / 2.0
+    if c0[2] > c2[1]:
+        fvg_ce = (c0[2] + c2[1]) / 2.0
         if l <= fvg_ce <= h and cl < fvg_ce:
-            risk = float(c0[3]) - cl
+            risk = c0[2] - cl
             if risk > 0:
                 return {
                     "direction": "SHORT",
                     "setup_name": "FVG CE Retest in Premium",
                     "score": 82.0,
                     "entry": cl,
-                    "sl": round(float(c0[3]), 2),
+                    "sl": round(c0[2], 2),
                     "tp1": round(cl - (risk * 1.5), 2),
                     "tp2": round(cl - (risk * 2.5), 2),
                     "tp3": round(cl - (risk * 4.0), 2)
