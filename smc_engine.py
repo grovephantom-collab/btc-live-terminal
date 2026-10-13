@@ -1,113 +1,179 @@
-import math
-from typing import List, Dict, Optional, Any
-import config
+import numpy as np
+import logging
 
-def ema(values: List[float], period: int) -> Optional[float]:
-    if period <= 0 or len(values) < period: return None
-    k = 2 / (period + 1)
-    v = sum(values[:period]) / period
-    for x in values[period:]: v += k * (x - v)
-    return v
+log = logging.getLogger("SMCEngine")
 
-def atr(cs: List[Dict[str, float]], period: int = 14) -> Optional[float]:
-    if len(cs) < period + 1: return None
-    tr = [max(cs[i]["high"] - cs[i]["low"], abs(cs[i]["high"] - cs[i-1]["close"]), abs(cs[i]["low"] - cs[i-1]["close"]))
-          for i in range(1, len(cs))]
-    return sum(tr[-period:]) / period
+def get_structure(klines: dict) -> dict:
+    k15 = klines.get("15m", [])
+    if len(k15) < 30:
+        return {}
+    
+    highs = [float(c[2]) for c in k15]
+    lows = [float(c[3]) for c in k15]
+    closes = [float(c[4]) for c in k15]
 
-# 15. Candle Anatomy & Psychology
-def psyche(c: Dict[str, float]) -> Dict[str, float]:
-    rng = max(c["high"] - c["low"], 1e-9)
+    # Dynamic swing points
+    swing_high = max(highs[-25:-1])
+    swing_low = min(lows[-25:-1])
+    recent_high = max(highs[-10:-1])
+    recent_low = min(lows[-10:-1])
+
     return {
-        "body": abs(c["close"] - c["open"]) / rng,
-        "upper": (c["high"] - max(c["open"], c["close"])) / rng,
-        "lower": (min(c["open"], c["close"]) - c["low"]) / rng
+        "swing_high": swing_high,
+        "swing_low": swing_low,
+        "recent_high": recent_high,
+        "recent_low": recent_low,
+        "current_close": closes[-1]
     }
 
-def swings(cs: List[Dict[str, float]], n: int = 3):
-    hs, ls = [], []
-    for i in range(n, len(cs) - n):
-        c = cs[i]
-        if all(c["high"] > cs[i-j]["high"] for j in range(1, n+1)) and all(c["high"] >= cs[i+j]["high"] for j in range(1, n+1)):
-            hs.append({"price": c["high"], "time": c["time"]})
-        if all(c["low"] < cs[i-j]["low"] for j in range(1, n+1)) and all(c["low"] <= cs[i+j]["low"] for j in range(1, n+1)):
-            ls.append({"price": c["low"], "time": c["time"]})
-    return hs, ls
+def detect_displacement_breakout(candles: list, structure: dict) -> dict:
+    """
+    Detects powerful institutional displacement candles that break structure (CHoCH/BOS)
+    Captures vertical moves without waiting for deep pullbacks, while filtering fakeouts.
+    """
+    if len(candles) < 15 or not structure:
+        return None
 
-# 17. Fair Value Gap (FVG) CE Retest Detection
-def fvgs(cs: List[Dict[str, float]]) -> List[Dict[str, Any]]:
-    out = []
-    for i in range(1, len(cs) - 1):
-        a, m, b = cs[i-1], cs[i], cs[i+1]
-        rng = max(m["high"] - m["low"], 1e-9)
-        if abs(m["close"] - m["open"]) / rng < 0.50: continue
-        if b["low"] > a["high"] and b["low"] - a["high"] >= config.MIN_GAP:
-            out.append({"direction": "LONG", "top": b["low"], "bottom": a["high"], "ce": (b["low"] + a["high"]) / 2, "time": m["time"]})
-        elif a["low"] > b["high"] and a["low"] - b["high"] >= config.MIN_GAP:
-            out.append({"direction": "SHORT", "top": a["low"], "bottom": b["high"], "ce": (a["low"] + b["high"]) / 2, "time": m["time"]})
-    return out
+    c = candles[-1] # Latest closed 15M candle
+    prev_candles = candles[-7:-1]
 
-# 12 & 13. Multi-Timeframe Structure & Dealing Range Equilibrium
-def get_structure(ks: Dict[str, List[Dict[str, float]]]) -> Dict[str, Any]:
-    c15, c1h, c4h, c1d = ks["15m"], ks["1h"], ks["4h"], ks["1d"]
-    e20 = ema([c["close"] for c in c4h], 20)
-    e50 = ema([c["close"] for c in c4h], 50)
-    bias = "BULLISH" if (e20 and e50 and e20 > e50) else "BEARISH" if (e20 and e50 and e20 < e50) else "NEUTRAL"
-    sh, sl = swings(c15)
-    sw_hi = sh[-1]["price"] if sh else max(c["high"] for c in c15[-30:])
-    sw_lo = sl[-1]["price"] if sl else min(c["low"] for c in c15[-30:])
-    return {
-        "bias4h": bias, "swing_high": sw_hi, "swing_low": sw_lo,
-        "pdh": c1d[-1]["high"] if c1d else sw_hi, "pdl": c1d[-1]["low"] if c1d else sw_lo,
-        "eq": (sw_hi + sw_lo) / 2, "atr": atr(c15), "fvgs": fvgs(c15)
-    }
+    o, h, l, cl = float(c[1]), float(c[2]), float(c[3]), float(c[4])
+    v = float(c[5]) if len(c) > 5 else 1.0
 
-# 14 & 18. Liquidity Reclaim & Session Window Enforcement
-def evaluate_signal(st: Dict[str, Any], cs: List[Dict[str, float]], price: float, sess: str, poc: Optional[float]) -> Optional[Dict[str, Any]]:
-    if len(cs) < 30 or not st["atr"] or sess not in config.ALLOWED_SESSIONS: return None
-    swept, trigger = cs[-2], cs[-1]
-    p = psyche(swept)
-    eq = st["eq"]
-    cands = []
+    candle_range = h - l
+    if candle_range <= 0:
+        return None
 
-    # SSL Sweep & Reclaim -> LONG in Discount
-    for label, level in [("PDL", st["pdl"]), ("SWING_LOW", st["swing_low"])]:
-        if (swept["low"] < level - config.SWEEP_BUFFER and trigger["close"] > level and trigger["close"] > trigger["open"]
-            and price < eq and p["lower"] >= 0.35 and p["body"] <= 0.65 and st["bias4h"] != "BEARISH"):
-            sl = min(swept["low"], trigger["low"]) - max(config.SL_BUFFER, 0.15 * st["atr"])
-            risk = price - sl
-            if config.MIN_STOP <= risk <= config.MAX_STOP:
-                score = min(100, 70 + min(12, p["lower"] * 15) + (8 if label == "PDL" else 4) + (3 if poc and price < poc else 0))
-                cands.append({"direction": "LONG", "setup_name": f"{label} SSL sweep/reclaim", "entry": price, "sl": sl, "risk": risk, "score": score, "swept_level": label, "trigger_time": trigger["time"]})
+    body = abs(cl - o)
+    body_ratio = body / candle_range
 
-    # BSL Trap & Reclaim -> SHORT in Premium
-    for label, level in [("PDH", st["pdh"]), ("SWING_HIGH", st["swing_high"])]:
-        if (swept["high"] > level + config.SWEEP_BUFFER and trigger["close"] < level and trigger["close"] < trigger["open"]
-            and price > eq and p["upper"] >= 0.35 and p["body"] <= 0.65 and st["bias4h"] != "BULLISH"):
-            sl = max(swept["high"], trigger["high"]) + max(config.SL_BUFFER, 0.15 * st["atr"])
-            risk = sl - price
-            if config.MIN_STOP <= risk <= config.MAX_STOP:
-                score = min(100, 70 + min(12, p["upper"] * 15) + (8 if label == "PDH" else 4) + (3 if poc and price > poc else 0))
-                cands.append({"direction": "SHORT", "setup_name": f"{label} BSL sweep/reclaim", "entry": price, "sl": sl, "risk": risk, "score": score, "swept_level": label, "trigger_time": trigger["time"]})
+    # Volume filter: must be > 1.35x average of previous 6 candles
+    avg_vol = np.mean([float(x[5]) for x in prev_candles]) if len(prev_candles[0]) > 5 else 1.0
+    vol_surge = (v >= avg_vol * 1.35) or (avg_vol == 1.0)
 
-    # FVG CE Mitigation
-    for f in st.get("fvgs", []):
-        if f["direction"] == "LONG" and price < eq and st["bias4h"] == "BULLISH":
-            if trigger["low"] <= f["ce"] and trigger["close"] > f["ce"] and trigger["close"] > trigger["open"]:
-                sl = f["bottom"] - max(config.SL_BUFFER, 0.15 * st["atr"])
-                risk = price - sl
-                if config.MIN_STOP <= risk <= config.MAX_STOP:
-                    cands.append({"direction": "LONG", "setup_name": "FVG CE Retest in Discount", "entry": price, "sl": sl, "risk": risk, "score": 80.0, "swept_level": "FVG_CE", "trigger_time": trigger["time"]})
-        elif f["direction"] == "SHORT" and price > eq and st["bias4h"] == "BEARISH":
-            if trigger["high"] >= f["ce"] and trigger["close"] < f["ce"] and trigger["close"] < trigger["open"]:
-                sl = f["top"] + max(config.SL_BUFFER, 0.15 * st["atr"])
-                risk = sl - price
-                if config.MIN_STOP <= risk <= config.MAX_STOP:
-                    cands.append({"direction": "SHORT", "setup_name": "FVG CE Retest in Premium", "entry": price, "sl": sl, "risk": risk, "score": 80.0, "swept_level": "FVG_CE", "trigger_time": trigger["time"]})
+    # Bullish Displacement Breakout (Long)
+    sh = structure["recent_high"]
+    if cl > sh and o < sh and cl > o and body_ratio >= 0.65 and vol_surge:
+        sl = max(l, cl - (candle_range * 0.70))
+        risk = cl - sl
+        if risk > 0:
+            return {
+                "direction": "LONG",
+                "setup_name": "Displacement CHoCH/BOS Breakout",
+                "score": 85.0,
+                "entry": cl,
+                "sl": round(sl, 2),
+                "tp1": round(cl + (risk * 1.5), 2),
+                "tp2": round(cl + (risk * 2.5), 2),
+                "tp3": round(cl + (risk * 4.0), 2)
+            }
 
-    if not cands: return None
-    s = max(cands, key=lambda x: x["score"])
-    if s["score"] < config.MIN_SCORE: return None
-    sign = 1 if s["direction"] == "LONG" else -1
-    s.update(tp1=s["entry"] + sign * 1.5 * s["risk"], tp2=s["entry"] + sign * 2.25 * s["risk"], tp3=s["entry"] + sign * 3.0 * s["risk"], timeframe="15m", session=sess)
-    return s
+    # Bearish Displacement Breakout (Short)
+    sl_level = structure["recent_low"]
+    if cl < sl_level and o > sl_level and cl < o and body_ratio >= 0.65 and vol_surge:
+        sl = min(h, cl + (candle_range * 0.70))
+        risk = sl - cl
+        if risk > 0:
+            return {
+                "direction": "SHORT",
+                "setup_name": "Displacement CHoCH/BOS Breakout",
+                "score": 85.0,
+                "entry": cl,
+                "sl": round(sl, 2),
+                "tp1": round(cl - (risk * 1.5), 2),
+                "tp2": round(cl - (risk * 2.5), 2),
+                "tp3": round(cl - (risk * 4.0), 2)
+            }
+
+    return None
+
+def evaluate_signal(structure: dict, candles_15m: list, current_price: float, session: str, poc: float) -> dict:
+    if len(candles_15m) < 20 or not structure:
+        return None
+
+    # Priority 1: Check High-Volume Displacement Breakout (To never miss vertical runs)
+    disp_signal = detect_displacement_breakout(candles_15m, structure)
+    if disp_signal:
+        return disp_signal
+
+    c = candles_15m[-1]
+    o, h, l, cl = float(c[1]), float(c[2]), float(c[3]), float(c[4])
+    candle_range = h - l
+    if candle_range <= 0:
+        return None
+
+    sh = structure["swing_high"]
+    sl = structure["swing_low"]
+
+    # Priority 2: Classic Liquidity Sweep & Reclaim
+    # SSL Sweep (Long Reversal)
+    if l < sl and cl > sl:
+        lower_wick = min(o, cl) - l
+        if (lower_wick / candle_range) >= 0.35:
+            risk = cl - l
+            if risk > 0:
+                return {
+                    "direction": "LONG",
+                    "setup_name": "SSL Sweep & Reclaim",
+                    "score": 88.0,
+                    "entry": cl,
+                    "sl": round(l - (candle_range * 0.1), 2),
+                    "tp1": round(cl + (risk * 1.5), 2),
+                    "tp2": round(cl + (risk * 2.5), 2),
+                    "tp3": round(cl + (risk * 4.0), 2)
+                }
+
+    # BSL Sweep (Short Reversal)
+    if h > sh and cl < sh:
+        upper_wick = h - max(o, cl)
+        if (upper_wick / candle_range) >= 0.35:
+            risk = h - cl
+            if risk > 0:
+                return {
+                    "direction": "SHORT",
+                    "setup_name": "BSL Sweep & Reclaim",
+                    "score": 88.0,
+                    "entry": cl,
+                    "sl": round(h + (candle_range * 0.1), 2),
+                    "tp1": round(cl - (risk * 1.5), 2),
+                    "tp2": round(cl - (risk * 2.5), 2),
+                    "tp3": round(cl - (risk * 4.0), 2)
+                }
+
+    # Priority 3: 15M FVG 50% CE Mitigation / Retest
+    c0, c1, c2 = candles_15m[-3], candles_15m[-2], candles_15m[-1]
+    # Bullish FVG (c0 high < c2 low)
+    if float(c2[3]) > float(c0[2]):
+        fvg_ce = (float(c2[3]) + float(c0[2])) / 2.0
+        if l <= fvg_ce <= h and cl > fvg_ce:
+            risk = cl - float(c0[2])
+            if risk > 0:
+                return {
+                    "direction": "LONG",
+                    "setup_name": "FVG CE Retest in Discount",
+                    "score": 82.0,
+                    "entry": cl,
+                    "sl": round(float(c0[2]), 2),
+                    "tp1": round(cl + (risk * 1.5), 2),
+                    "tp2": round(cl + (risk * 2.5), 2),
+                    "tp3": round(cl + (risk * 4.0), 2)
+                }
+
+    # Bearish FVG (c0 low > c2 high)
+    if float(c0[3]) > float(c2[2]):
+        fvg_ce = (float(c0[3]) + float(c2[2])) / 2.0
+        if l <= fvg_ce <= h and cl < fvg_ce:
+            risk = float(c0[3]) - cl
+            if risk > 0:
+                return {
+                    "direction": "SHORT",
+                    "setup_name": "FVG CE Retest in Premium",
+                    "score": 82.0,
+                    "entry": cl,
+                    "sl": round(float(c0[3]), 2),
+                    "tp1": round(cl - (risk * 1.5), 2),
+                    "tp2": round(cl - (risk * 2.5), 2),
+                    "tp3": round(cl - (risk * 4.0), 2)
+                }
+
+    return None
