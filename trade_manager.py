@@ -12,7 +12,9 @@ def check_daily_loss(conn) -> bool:
     today = database.now_iso()[:10]
     r = conn.execute("SELECT COALESCE(SUM(realized_pnl_usd), 0.0) as pnl FROM trades WHERE opened_at_utc LIKE ?", (today + "%",)).fetchone()
     daily_pnl = float(r["pnl"] if r else 0.0)
-    return daily_pnl <= -abs(config.DAILY_LOSS_LIMIT_USD)
+    # Safe check: config me chahe variable ho ya na ho, crash nahi hoga
+    limit = getattr(config, "DAILY_LOSS_LIMIT_USD", getattr(config, "MAX_DAILY_LOSS", 50.0))
+    return daily_pnl <= -abs(float(limit))
 
 def open_paper_trade(signal: dict, fencing_token: int):
     conn = database.db()
@@ -26,7 +28,8 @@ def open_paper_trade(signal: dict, fencing_token: int):
             return  # Max 1 open position rule intact
 
         equity = get_equity(conn)
-        risk_usd = equity * config.RISK_PER_TRADE_PCT
+        risk_pct = getattr(config, "RISK_PER_TRADE_PCT", 0.01)
+        risk_usd = equity * float(risk_pct)
         entry = float(signal["entry"])
         sl = float(signal["sl"])
         direction = signal["direction"]
@@ -43,6 +46,8 @@ def open_paper_trade(signal: dict, fencing_token: int):
         tp2 = float(signal["tp2"])
         tp3 = float(signal["tp3"])
 
+        sym = getattr(config, "SYMBOL", "BTCUSDT")
+
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO trades (
@@ -51,7 +56,7 @@ def open_paper_trade(signal: dict, fencing_token: int):
                 stage, setup_name, opened_at_utc, fencing_token
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?)
         """, (
-            config.SYMBOL, direction, entry, sl, sl,
+            sym, direction, entry, sl, sl,
             tp1, tp2, tp3, qty, qty,
             signal.get("setup_name", "SMC Setup"), database.now_iso(), fencing_token
         ))
@@ -173,7 +178,6 @@ def manage_positions(current_price: float, fencing_token: int):
         elif stage == "TP2_HIT":
             tp3_hit = (current_price >= tp3) if direction == "LONG" else (current_price <= tp3)
             if tp3_hit:
-                # 20% Runner Transition: Shift SL tightly to lock in TP2 profits & trail remainder
                 trail_sl = tp2
                 conn.execute("""
                     UPDATE trades SET 
@@ -185,7 +189,6 @@ def manage_positions(current_price: float, fencing_token: int):
 
         # Stage: RUNNER_TRAILING -> Trail behind price dynamically
         elif stage == "RUNNER_TRAILING":
-            # Long trails below higher lows; Short trails above lower highs
             if direction == "LONG" and current_price > (sl + initial_risk_dist):
                 new_sl = current_price - (initial_risk_dist * 0.8)
                 if new_sl > sl:
