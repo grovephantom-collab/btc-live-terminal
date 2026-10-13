@@ -41,14 +41,14 @@ def detect_displacement_breakout(candles: list, structure: dict) -> dict:
     body = abs(cl - o)
     body_ratio = body / candle_range
 
-    # Pure Python average calculation (no numpy needed)
+    # Volume filter relaxed from 1.35x to 1.15x
     vols = [float(x[5]) for x in prev_candles if len(x) > 5]
     avg_vol = (sum(vols) / len(vols)) if vols else 1.0
-    vol_surge = (v >= avg_vol * 1.35) or (avg_vol == 1.0)
+    vol_surge = (v >= avg_vol * 1.15) or (avg_vol == 1.0)
 
     # Bullish Displacement Breakout (Long)
     sh = structure["recent_high"]
-    if cl > sh and o < sh and cl > o and body_ratio >= 0.65 and vol_surge:
+    if cl > sh and cl > o and body_ratio >= 0.55 and vol_surge:
         sl = max(l, cl - (candle_range * 0.70))
         risk = cl - sl
         if risk > 0:
@@ -65,7 +65,7 @@ def detect_displacement_breakout(candles: list, structure: dict) -> dict:
 
     # Bearish Displacement Breakout (Short)
     sl_level = structure["recent_low"]
-    if cl < sl_level and o > sl_level and cl < o and body_ratio >= 0.65 and vol_surge:
+    if cl < sl_level and cl < o and body_ratio >= 0.55 and vol_surge:
         sl = min(h, cl + (candle_range * 0.70))
         risk = sl - cl
         if risk > 0:
