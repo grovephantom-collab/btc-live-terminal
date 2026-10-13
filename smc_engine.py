@@ -1,4 +1,3 @@
-import numpy as np
 import logging
 
 log = logging.getLogger("SMCEngine")
@@ -12,7 +11,6 @@ def get_structure(klines: dict) -> dict:
     lows = [float(c[3]) for c in k15]
     closes = [float(c[4]) for c in k15]
 
-    # Dynamic swing points
     swing_high = max(highs[-25:-1])
     swing_low = min(lows[-25:-1])
     recent_high = max(highs[-10:-1])
@@ -27,14 +25,10 @@ def get_structure(klines: dict) -> dict:
     }
 
 def detect_displacement_breakout(candles: list, structure: dict) -> dict:
-    """
-    Detects powerful institutional displacement candles that break structure (CHoCH/BOS)
-    Captures vertical moves without waiting for deep pullbacks, while filtering fakeouts.
-    """
     if len(candles) < 15 or not structure:
         return None
 
-    c = candles[-1] # Latest closed 15M candle
+    c = candles[-1]
     prev_candles = candles[-7:-1]
 
     o, h, l, cl = float(c[1]), float(c[2]), float(c[3]), float(c[4])
@@ -47,8 +41,9 @@ def detect_displacement_breakout(candles: list, structure: dict) -> dict:
     body = abs(cl - o)
     body_ratio = body / candle_range
 
-    # Volume filter: must be > 1.35x average of previous 6 candles
-    avg_vol = np.mean([float(x[5]) for x in prev_candles]) if len(prev_candles[0]) > 5 else 1.0
+    # Pure Python average calculation (no numpy needed)
+    vols = [float(x[5]) for x in prev_candles if len(x) > 5]
+    avg_vol = (sum(vols) / len(vols)) if vols else 1.0
     vol_surge = (v >= avg_vol * 1.35) or (avg_vol == 1.0)
 
     # Bullish Displacement Breakout (Long)
@@ -91,7 +86,6 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
     if len(candles_15m) < 20 or not structure:
         return None
 
-    # Priority 1: Check High-Volume Displacement Breakout (To never miss vertical runs)
     disp_signal = detect_displacement_breakout(candles_15m, structure)
     if disp_signal:
         return disp_signal
@@ -105,8 +99,6 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
     sh = structure["swing_high"]
     sl = structure["swing_low"]
 
-    # Priority 2: Classic Liquidity Sweep & Reclaim
-    # SSL Sweep (Long Reversal)
     if l < sl and cl > sl:
         lower_wick = min(o, cl) - l
         if (lower_wick / candle_range) >= 0.35:
@@ -123,7 +115,6 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
                     "tp3": round(cl + (risk * 4.0), 2)
                 }
 
-    # BSL Sweep (Short Reversal)
     if h > sh and cl < sh:
         upper_wick = h - max(o, cl)
         if (upper_wick / candle_range) >= 0.35:
@@ -140,9 +131,7 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
                     "tp3": round(cl - (risk * 4.0), 2)
                 }
 
-    # Priority 3: 15M FVG 50% CE Mitigation / Retest
     c0, c1, c2 = candles_15m[-3], candles_15m[-2], candles_15m[-1]
-    # Bullish FVG (c0 high < c2 low)
     if float(c2[3]) > float(c0[2]):
         fvg_ce = (float(c2[3]) + float(c0[2])) / 2.0
         if l <= fvg_ce <= h and cl > fvg_ce:
@@ -159,7 +148,6 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
                     "tp3": round(cl + (risk * 4.0), 2)
                 }
 
-    # Bearish FVG (c0 low > c2 high)
     if float(c0[3]) > float(c2[2]):
         fvg_ce = (float(c0[3]) + float(c2[2])) / 2.0
         if l <= fvg_ce <= h and cl < fvg_ce:
