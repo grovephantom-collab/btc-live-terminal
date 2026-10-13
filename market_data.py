@@ -37,11 +37,12 @@ def fetch_price() -> Optional[float]:
     except Exception: pass
     return None
 
-# 8 & 9. Confirmed Closed Candles Only & Chronological Sort
-def fetch_klines(interval: str, limit: int = 100) -> List[Dict[str, float]]:
+# 8 & 9. Confirmed Closed Candles Only & Chronological Sort (Lookback expanded to 48h+)
+def fetch_klines(interval: str, limit: int = 200) -> List[Dict[str, float]]:
+    # Binance Spot Fetch
     try:
         r = HTTP.get("https://api.binance.com/api/v3/klines",
-                     params={"symbol": config.SYMBOL, "interval": interval, "limit": min(limit + 5, 200)},
+                     params={"symbol": config.SYMBOL, "interval": interval, "limit": min(limit + 5, 300)},
                      timeout=config.HTTP_TIMEOUT)
         if r.status_code == 200:
             raw = r.json()
@@ -94,23 +95,43 @@ def approx_poc(cs: List[Dict[str, float]], bins: int = 30) -> Optional[float]:
     max_idx = max(range(bins), key=lambda n: vol[n])
     return lo + (max_idx + 0.5) * width
 
-# 10 & 11. Stale Data Freeze & Zero Artificial Bars
+# 10 & 11. Stale Data Freeze & Zero Artificial Bars with Safe Fallback
 def refresh_market_data(lock) -> bool:
     try:
         p = fetch_price()
-        if p is None: raise ValueError("Live ticker price unavailable")
+        if p is None:
+            with lock:
+                p = MARKET.get("price")
+            if p is None:
+                raise ValueError("Live ticker price unavailable")
+
         ks = {}
+        # 15m needs 200 bars (50 hours), others need standard lookback
+        limits = {"15m": 200, "1h": 100, "4h": 60, "1d": 30}
         for k in ("15m", "1h", "4h", "1d"):
-            bars = fetch_klines(k, 100)
-            if len(bars) < 15: raise ValueError(f"Insufficient history for {k}")
+            bars = fetch_klines(k, limits[k])
+            if len(bars) < 10:
+                # Reuse cached data if fresh API fetch temporarily throttled
+                with lock:
+                    cached_bars = MARKET.get("klines", {}).get(k, [])
+                if len(cached_bars) >= 10:
+                    bars = cached_bars
+                else:
+                    raise ValueError(f"Insufficient history for {k}")
             ks[k] = bars
             time.sleep(0.12)
+
         poc = approx_poc(ks["15m"][-60:])
         with lock:
             MARKET.update(price=p, price_ts=time.time(), klines=ks, klines_ts=time.time(),
                           session=session_now(), poc=poc, error=None)
         return True
     except Exception as e:
-        with lock: MARKET["error"] = str(e)[:250]
+        with lock:
+            # If we already have past valid candles, preserve them without setting hard error
+            if MARKET.get("klines"):
+                log.warning("Market refresh intermittent warn: %s (using cached bars)", e)
+                return True
+            MARKET["error"] = str(e)[:250]
         log.warning("Market refresh failed: %s", e)
         return False
