@@ -1,4 +1,4 @@
-import logging, database, config, notifications
+import time, uuid, logging, database, config, notifications
 
 log = logging.getLogger("TradeManager")
 
@@ -12,9 +12,15 @@ def check_daily_loss(conn) -> bool:
     today = database.now_iso()[:10]
     r = conn.execute("SELECT COALESCE(SUM(realized_pnl_usd), 0.0) as pnl FROM trades WHERE opened_at_utc LIKE ?", (today + "%",)).fetchone()
     daily_pnl = float(r["pnl"] if r else 0.0)
-    # Safe check: config me chahe variable ho ya na ho, crash nahi hoga
     limit = getattr(config, "DAILY_LOSS_LIMIT_USD", getattr(config, "MAX_DAILY_LOSS", 50.0))
     return daily_pnl <= -abs(float(limit))
+
+def _send_tg(msg: str):
+    try:
+        if hasattr(notifications, "enqueue_telegram"):
+            notifications.enqueue_telegram(msg)
+    except Exception as e:
+        log.warning("Telegram alert error: %s", e)
 
 def open_paper_trade(signal: dict, fencing_token: int):
     conn = database.db()
@@ -27,12 +33,23 @@ def open_paper_trade(signal: dict, fencing_token: int):
         if act:
             return  # Max 1 open position rule intact
 
+        sym = getattr(config, "SYMBOL", "BTCUSDT")
+        direction = str(signal["direction"])
+        setup_name = str(signal.get("setup_name", "SMC Setup"))
+        score = float(signal.get("score", 85.0))
+
+        # 15m candle bucket key so same candle doesn't open duplicate trades
+        candle_bucket = int(time.time() // 900)
+        sig_key = f"{sym}_{direction}_{candle_bucket}"
+        dup = conn.execute("SELECT id FROM trades WHERE signal_key = ?", (sig_key,)).fetchone()
+        if dup:
+            return
+
         equity = get_equity(conn)
         risk_pct = getattr(config, "RISK_PER_TRADE_PCT", 0.01)
         risk_usd = equity * float(risk_pct)
         entry = float(signal["entry"])
         sl = float(signal["sl"])
-        direction = signal["direction"]
 
         risk_per_coin = abs(entry - sl)
         if risk_per_coin <= 0:
@@ -46,34 +63,30 @@ def open_paper_trade(signal: dict, fencing_token: int):
         tp2 = float(signal["tp2"])
         tp3 = float(signal["tp3"])
 
-        sym = getattr(config, "SYMBOL", "BTCUSDT")
+        trade_id = f"TRD-{int(time.time() * 1000)}-{uuid.uuid4().hex[:4].upper()}"
+        now_str = database.now_iso()
 
-        cur = conn.cursor()
-        cur.execute("""
+        conn.execute("""
             INSERT INTO trades (
-                symbol, direction, entry_price, initial_sl, stop_price,
-                tp1_price, tp2_price, tp3_price, qty, original_qty,
-                stage, setup_name, opened_at_utc, fencing_token
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?)
+                trade_id, signal_key, symbol, direction, setup_name, score,
+                entry_price, stop_price, tp1_price, tp2_price, tp3_price,
+                initial_qty, remaining_qty, stage, opened_at_utc, updated_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)
         """, (
-            sym, direction, entry, sl, sl,
-            tp1, tp2, tp3, qty, qty,
-            signal.get("setup_name", "SMC Setup"), database.now_iso(), fencing_token
+            trade_id, sig_key, sym, direction, setup_name, score,
+            entry, sl, tp1, tp2, tp3,
+            qty, qty, now_str, now_str
         ))
         conn.commit()
 
-        # Instant alert via notifications engine
-        notifications.notify_signal_opened({
-            "direction": direction,
-            "setup_name": signal.get("setup_name", "SMC Setup"),
-            "score": signal.get("score", 80),
-            "entry": entry,
-            "sl": sl,
-            "tp1": tp1,
-            "tp2": tp2,
-            "tp3": tp3,
-            "qty": qty
-        })
+        _send_tg(
+            f"🚀 NEW {direction} TRADE OPENED ({sym})\n"
+            f"Setup: {setup_name} (Score: {score:.0f})\n"
+            f"Entry: ${entry:.2f}\n"
+            f"Stop Loss: ${sl:.2f}\n"
+            f"TP1: ${tp1:.2f} | TP2: ${tp2:.2f} | TP3: ${tp3:.2f}\n"
+            f"Size: {qty} BTC"
+        )
     finally:
         conn.close()
 
@@ -87,72 +100,93 @@ def manage_positions(current_price: float, fencing_token: int):
         trade = dict(t)
         tid = trade["id"]
         direction = trade["direction"]
-        entry = trade["entry_price"]
-        sl = trade["stop_price"]
-        initial_sl = trade["initial_sl"]
+        entry = float(trade["entry_price"])
+        sl = float(trade["stop_price"])
+        tp1 = float(trade["tp1_price"])
+        tp2 = float(trade["tp2_price"])
+        tp3 = float(trade["tp3_price"])
         stage = trade["stage"]
-        qty = trade["qty"]
-        orig_qty = trade["original_qty"]
+        qty = float(trade["remaining_qty"])
+        orig_qty = float(trade["initial_qty"])
+        realized_so_far = float(trade.get("realized_pnl_usd") or 0.0)
+        now_str = database.now_iso()
 
-        # Safe R-Multiple Calculation (Prevents huge numbers)
-        initial_risk_dist = abs(entry - initial_sl)
-        def calc_safe_r(exit_px):
-            if initial_risk_dist <= 0:
-                return 0.0
-            raw_r = (exit_px - entry) / initial_risk_dist if direction == "LONG" else (entry - exit_px) / initial_risk_dist
-            return max(-5.0, min(round(raw_r, 2), 20.0))
+        # Derive initial 1R distance from TP1 (set at 1.5R in smc_engine)
+        initial_risk_dist = abs(tp1 - entry) / 1.5
+        if initial_risk_dist <= 0:
+            initial_risk_dist = max(abs(entry - sl), 1.0)
+        initial_risk_usd = initial_risk_dist * orig_qty
 
-        # 1. Stop Loss Hit
+        # 1. Stop Loss / Trailing Stop Hit
         sl_hit = (current_price <= sl) if direction == "LONG" else (current_price >= sl)
         if sl_hit:
             pnl_usd = (sl - entry) * qty if direction == "LONG" else (entry - sl) * qty
-            # Subtract fees & slippage
-            pnl_usd -= (sl * qty * 0.001)
-            weighted_r = calc_safe_r(sl)
+            fee = sl * qty * 0.001
+            pnl_usd -= fee
+            total_pnl = realized_so_far + pnl_usd
+
+            if initial_risk_usd > 0:
+                weighted_r = max(-5.0, min(round(total_pnl / initial_risk_usd, 2), 20.0))
+            else:
+                weighted_r = 0.0
+
+            if stage == "RUNNER_TRAILING":
+                reason = "TRAIL_STOP_WIN"
+            elif stage == "TP2_HIT":
+                reason = "TP1_LOCK_WIN"
+            elif stage == "TP1_HIT":
+                reason = "BREAKEVEN_EXIT"
+            else:
+                reason = "STOP_LOSS"
 
             conn.execute("""
                 UPDATE trades SET 
-                    stage = 'CLOSED', closed_at_utc = ?, close_reason = 'STOP_LOSS',
+                    stage = 'CLOSED', remaining_qty = 0, closed_at_utc = ?, updated_at_utc = ?,
+                    close_reason = ?,
                     realized_pnl_usd = COALESCE(realized_pnl_usd, 0) + ?,
-                    weighted_pnl_r = ?, fencing_token = ?
+                    total_fee_usd = COALESCE(total_fee_usd, 0) + ?,
+                    weighted_pnl_r = ?
                 WHERE id = ?
-            """, (database.now_iso(), round(pnl_usd, 2), weighted_r, fencing_token, tid))
+            """, (now_str, now_str, reason, round(pnl_usd, 2), round(fee, 2), weighted_r, tid))
             conn.commit()
 
-            notifications.notify_trade_closed({
-                "direction": direction,
-                "reason": "STOP_LOSS",
-                "pnl_usd": round(pnl_usd, 2),
-                "r_mult": weighted_r
-            })
+            _send_tg(
+                f"🏁 TRADE CLOSED ({direction})\n"
+                f"Reason: {reason}\n"
+                f"Exit Price: ${sl:.2f}\n"
+                f"Total Net PnL: ${total_pnl:+.2f} ({weighted_r:+.2f}R)"
+            )
             return
-
-        # 2. Stage-based TP Management
-        tp1 = trade["tp1_price"]
-        tp2 = trade["tp2_price"]
-        tp3 = trade["tp3_price"]
 
         # Buffer for zero brokerage on Break-Even
         be_buffer = entry * 0.0008
         be_price = (entry + be_buffer) if direction == "LONG" else (entry - be_buffer)
 
-        # Stage: ACTIVE -> Check TP1 (50% Close + Shift SL to BE)
-        if stage == "ACTIVE":
+        # Stage: ACTIVE / OPEN -> Check TP1 (50% Close + Shift SL to BE)
+        if stage in ("ACTIVE", "OPEN"):
             tp1_hit = (current_price >= tp1) if direction == "LONG" else (current_price <= tp1)
             if tp1_hit:
                 part_qty = round(orig_qty * 0.50, 6)
                 pnl = (tp1 - entry) * part_qty if direction == "LONG" else (entry - tp1) * part_qty
-                pnl -= (tp1 * part_qty * 0.001)
-                new_qty = max(0.0, qty - part_qty)
+                fee = tp1 * part_qty * 0.001
+                pnl -= fee
+                new_qty = max(0.0, round(qty - part_qty, 6))
 
                 conn.execute("""
                     UPDATE trades SET 
-                        stage = 'TP1_HIT', stop_price = ?, qty = ?,
+                        stage = 'TP1_HIT', tp1_done = 1, stop_price = ?, remaining_qty = ?,
                         realized_pnl_usd = COALESCE(realized_pnl_usd, 0) + ?,
-                        fencing_token = ?
+                        total_fee_usd = COALESCE(total_fee_usd, 0) + ?,
+                        updated_at_utc = ?
                     WHERE id = ?
-                """, (be_price, new_qty, round(pnl, 2), fencing_token, tid))
+                """, (round(be_price, 2), new_qty, round(pnl, 2), round(fee, 2), now_str, tid))
                 conn.commit()
+
+                _send_tg(
+                    f"✅ TP1 HIT ({direction})\n"
+                    f"50% Position Booked: ${pnl:+.2f}\n"
+                    f"SL Shifted to Break-Even: ${be_price:.2f}"
+                )
                 return
 
         # Stage: TP1_HIT -> Check TP2 (30% Close + Lock in TP1 price as SL)
@@ -161,43 +195,55 @@ def manage_positions(current_price: float, fencing_token: int):
             if tp2_hit:
                 part_qty = round(orig_qty * 0.30, 6)
                 pnl = (tp2 - entry) * part_qty if direction == "LONG" else (entry - tp2) * part_qty
-                pnl -= (tp2 * part_qty * 0.001)
-                new_qty = max(0.0, qty - part_qty)
+                fee = tp2 * part_qty * 0.001
+                pnl -= fee
+                new_qty = max(0.0, round(qty - part_qty, 6))
 
                 conn.execute("""
                     UPDATE trades SET 
-                        stage = 'TP2_HIT', stop_price = ?, qty = ?,
+                        stage = 'TP2_HIT', tp2_done = 1, stop_price = ?, remaining_qty = ?,
                         realized_pnl_usd = COALESCE(realized_pnl_usd, 0) + ?,
-                        fencing_token = ?
+                        total_fee_usd = COALESCE(total_fee_usd, 0) + ?,
+                        updated_at_utc = ?
                     WHERE id = ?
-                """, (tp1, new_qty, round(pnl, 2), fencing_token, tid))
+                """, (tp1, new_qty, round(pnl, 2), round(fee, 2), now_str, tid))
                 conn.commit()
+
+                _send_tg(
+                    f"🔥 TP2 HIT ({direction})\n"
+                    f"30% Position Booked: ${pnl:+.2f}\n"
+                    f"SL Locked at TP1: ${tp1:.2f}"
+                )
                 return
 
         # Stage: TP2_HIT -> Check TP3 / Trailing Runner
         elif stage == "TP2_HIT":
             tp3_hit = (current_price >= tp3) if direction == "LONG" else (current_price <= tp3)
             if tp3_hit:
-                trail_sl = tp2
                 conn.execute("""
                     UPDATE trades SET 
-                        stage = 'RUNNER_TRAILING', stop_price = ?, fencing_token = ?
+                        stage = 'RUNNER_TRAILING', tp3_done = 1, stop_price = ?, updated_at_utc = ?
                     WHERE id = ?
-                """, (trail_sl, fencing_token, tid))
+                """, (tp2, now_str, tid))
                 conn.commit()
+
+                _send_tg(
+                    f"🏆 TP3 HIT ({direction})\n"
+                    f"Runner (20%) Now Trailing! SL Locked at TP2: ${tp2:.2f}"
+                )
                 return
 
         # Stage: RUNNER_TRAILING -> Trail behind price dynamically
         elif stage == "RUNNER_TRAILING":
             if direction == "LONG" and current_price > (sl + initial_risk_dist):
-                new_sl = current_price - (initial_risk_dist * 0.8)
+                new_sl = round(current_price - (initial_risk_dist * 0.8), 2)
                 if new_sl > sl:
-                    conn.execute("UPDATE trades SET stop_price = ?, fencing_token = ? WHERE id = ?", (new_sl, fencing_token, tid))
+                    conn.execute("UPDATE trades SET stop_price = ?, updated_at_utc = ? WHERE id = ?", (new_sl, now_str, tid))
                     conn.commit()
             elif direction == "SHORT" and current_price < (sl - initial_risk_dist):
-                new_sl = current_price + (initial_risk_dist * 0.8)
+                new_sl = round(current_price + (initial_risk_dist * 0.8), 2)
                 if new_sl < sl:
-                    conn.execute("UPDATE trades SET stop_price = ?, fencing_token = ? WHERE id = ?", (new_sl, fencing_token, tid))
+                    conn.execute("UPDATE trades SET stop_price = ?, updated_at_utc = ? WHERE id = ?", (new_sl, now_str, tid))
                     conn.commit()
     finally:
         conn.close()
