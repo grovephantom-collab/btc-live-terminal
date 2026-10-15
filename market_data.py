@@ -4,7 +4,7 @@ import config
 
 log = logging.getLogger("DataEngine")
 HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "Mozilla/5.0 ProSMC/1.0"})
+HTTP.headers.update({"User-Agent": "Mozilla/5.0 ProSMC/2.0"})
 
 MARKET: Dict[str, Any] = {
     "price": None, "price_ts": 0, "klines": {}, "klines_ts": 0,
@@ -19,45 +19,67 @@ def session_now() -> str:
     if h < 21: return "NEW YORK TREND"
     return "SESSION CLOSE"
 
-# 6 & 7. Geo-Block Immunity & Single Exchange Alignment
+# US-Unblocked Live Spot Price (Binance Vision -> Coinbase -> Kraken)
 def fetch_price() -> Optional[float]:
-    # Binance Spot
-    try:
-        r = HTTP.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": config.SYMBOL}, timeout=config.HTTP_TIMEOUT)
-        if r.status_code == 200:
-            p = float(r.json()["price"])
-            if math.isfinite(p) and p > 0: return p
-    except Exception: pass
-    # Coinbase Spot
+    for url in (
+        "https://data-api.binance.vision/api/v3/ticker/price",
+        "https://api.binance.com/api/v3/ticker/price"
+    ):
+        try:
+            r = HTTP.get(url, params={"symbol": config.SYMBOL}, timeout=config.HTTP_TIMEOUT)
+            if r.status_code == 200:
+                p = float(r.json()["price"])
+                if math.isfinite(p) and p > 0:
+                    return p
+        except Exception:
+            pass
+
     try:
         r = HTTP.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=config.HTTP_TIMEOUT)
         if r.status_code == 200:
             p = float(r.json()["data"]["amount"])
-            if math.isfinite(p) and p > 0: return p
-    except Exception: pass
+            if math.isfinite(p) and p > 0:
+                return p
+    except Exception:
+        pass
+
+    try:
+        r = HTTP.get("https://api.kraken.com/0/public/Ticker?pair=XBTUSD", timeout=config.HTTP_TIMEOUT)
+        if r.status_code == 200:
+            p = float(r.json()["result"]["XXBTZUSD"]["c"][0])
+            if math.isfinite(p) and p > 0:
+                return p
+    except Exception:
+        pass
     return None
 
-# 8 & 9. Confirmed Closed Candles Only & Chronological Sort (Lookback expanded to 48h+)
+# Confirmed Closed Candles Only (Uses US-Unblocked Binance Vision API first)
 def fetch_klines(interval: str, limit: int = 200) -> List[Dict[str, float]]:
-    # Binance Spot Fetch
-    try:
-        r = HTTP.get("https://api.binance.com/api/v3/klines",
-                     params={"symbol": config.SYMBOL, "interval": interval, "limit": min(limit + 5, 300)},
-                     timeout=config.HTTP_TIMEOUT)
-        if r.status_code == 200:
-            raw = r.json()
-            now_ms = int(time.time() * 1000)
-            out = []
-            for k in raw:
-                if int(k[6]) >= now_ms: continue  # discard incomplete bar
-                out.append({
-                    "time": int(k[0] // 1000), "close_time": int(k[6] // 1000),
-                    "open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4]), "vol": float(k[5])
-                })
-            if len(out) >= 10:
-                out.sort(key=lambda z: z["time"])
-                return out[-limit:]
-    except Exception: pass
+    for base_url in (
+        "https://data-api.binance.vision/api/v3/klines",
+        "https://api.binance.com/api/v3/klines"
+    ):
+        try:
+            r = HTTP.get(base_url,
+                         params={"symbol": config.SYMBOL, "interval": interval, "limit": min(limit + 5, 300)},
+                         timeout=config.HTTP_TIMEOUT)
+            if r.status_code == 200:
+                raw = r.json()
+                now_ms = int(time.time() * 1000)
+                out = []
+                for k in raw:
+                    if int(k[6]) >= now_ms:
+                        continue  # discard incomplete bar
+                    out.append({
+                        "time": int(k[0] // 1000), "close_time": int(k[6] // 1000),
+                        "open": float(k[1]), "high": float(k[2]), "low": float(k[3]),
+                        "close": float(k[4]), "vol": float(k[5])
+                    })
+                if len(out) >= 15:
+                    out.sort(key=lambda z: z["time"])
+                    return out[-limit:]
+        except Exception:
+            pass
 
     # Kraken Fallback
     gran = {"15m": 15, "1h": 60, "4h": 240, "1d": 1440}.get(interval, 15)
@@ -69,23 +91,27 @@ def fetch_klines(interval: str, limit: int = 200) -> List[Dict[str, float]]:
             out = []
             for k in raw:
                 t = int(k[0])
-                if t + (gran * 60) > now_s: continue
+                if t + (gran * 60) > now_s:
+                    continue
                 out.append({
                     "time": t, "close_time": t + (gran * 60),
-                    "open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4]), "vol": float(k[6])
+                    "open": float(k[1]), "high": float(k[2]), "low": float(k[3]),
+                    "close": float(k[4]), "vol": float(k[6])
                 })
-            if len(out) >= 10:
+            if len(out) >= 15:
                 out.sort(key=lambda z: z["time"])
                 return out[-limit:]
-    except Exception: pass
+    except Exception:
+        pass
     return []
 
-# 16. Volume Absorption & POC
 def approx_poc(cs: List[Dict[str, float]], bins: int = 30) -> Optional[float]:
-    if not cs: return None
+    if not cs:
+        return None
     lo = min(c["low"] for c in cs)
     hi = max(c["high"] for c in cs)
-    if hi <= lo: return lo
+    if hi <= lo:
+        return lo
     width = (hi - lo) / bins
     vol = [0.0] * bins
     for c in cs:
@@ -95,43 +121,38 @@ def approx_poc(cs: List[Dict[str, float]], bins: int = 30) -> Optional[float]:
     max_idx = max(range(bins), key=lambda n: vol[n])
     return lo + (max_idx + 0.5) * width
 
-# 10 & 11. Stale Data Freeze & Zero Artificial Bars with Safe Fallback
 def refresh_market_data(lock) -> bool:
     try:
         p = fetch_price()
         if p is None:
-            with lock:
-                p = MARKET.get("price")
-            if p is None:
-                raise ValueError("Live ticker price unavailable")
+            raise ValueError("Live ticker price unavailable")
+
+        # Always update live price immediately so dashboard/SL never uses frozen price
+        with lock:
+            MARKET["price"] = p
+            MARKET["price_ts"] = time.time()
+            MARKET["session"] = session_now()
 
         ks = {}
-        # 15m needs 200 bars (50 hours), others need standard lookback
         limits = {"15m": 200, "1h": 100, "4h": 60, "1d": 30}
         for k in ("15m", "1h", "4h", "1d"):
             bars = fetch_klines(k, limits[k])
-            if len(bars) < 10:
-                # Reuse cached data if fresh API fetch temporarily throttled
+            if len(bars) < 15:
                 with lock:
-                    cached_bars = MARKET.get("klines", {}).get(k, [])
-                if len(cached_bars) >= 10:
-                    bars = cached_bars
+                    cached = MARKET.get("klines", {}).get(k, [])
+                if len(cached) >= 15:
+                    bars = cached
                 else:
                     raise ValueError(f"Insufficient history for {k}")
             ks[k] = bars
-            time.sleep(0.12)
+            time.sleep(0.08)
 
         poc = approx_poc(ks["15m"][-60:])
         with lock:
-            MARKET.update(price=p, price_ts=time.time(), klines=ks, klines_ts=time.time(),
-                          session=session_now(), poc=poc, error=None)
+            MARKET.update(klines=ks, klines_ts=time.time(), poc=poc, error=None)
         return True
     except Exception as e:
         with lock:
-            # If we already have past valid candles, preserve them without setting hard error
-            if MARKET.get("klines"):
-                log.warning("Market refresh intermittent warn: %s (using cached bars)", e)
-                return True
             MARKET["error"] = str(e)[:250]
         log.warning("Market refresh failed: %s", e)
         return False
