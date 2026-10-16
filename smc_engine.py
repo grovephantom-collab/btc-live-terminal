@@ -60,7 +60,7 @@ def get_structure(klines: dict) -> dict:
     ema50_15m = _calc_ema(closes, 50)
     atr_15m = _calc_atr(p15, 14)
 
-    # Dealing Range (48 candles / 12 hours) for Premium & Discount Zones
+    # 12-Hour Dealing Range (48 candles) for Premium & Discount Zones
     range_high = max(highs[-48:-1])
     range_low = min(lows[-48:-1])
     dealing_range = max(range_high - range_low, atr_15m * 2.5)
@@ -106,11 +106,12 @@ def get_structure(klines: dict) -> dict:
     }
 
 def _build_trade(direction: str, setup_name: str, score: float, entry: float, structural_sl: float, atr: float) -> dict:
-    min_dist = max(atr * 1.5, entry * 0.0055)
-    max_dist = entry * 0.020
+    # Increased safety buffer (0.45x ATR) to protect against institutional stop-hunts & wick spikes
+    min_dist = max(atr * 1.8, entry * 0.0065)
+    max_dist = entry * 0.022
 
     if direction == "LONG":
-        sl = min(structural_sl - (atr * 0.25), entry - min_dist)
+        sl = min(structural_sl - (atr * 0.45), entry - min_dist)
         risk = entry - sl
         if risk <= 0 or risk > max_dist:
             return None
@@ -125,7 +126,7 @@ def _build_trade(direction: str, setup_name: str, score: float, entry: float, st
             "tp3": round(entry + (risk * 4.0), 2)
         }
     else:
-        sl = max(structural_sl + (atr * 0.25), entry + min_dist)
+        sl = max(structural_sl + (atr * 0.45), entry + min_dist)
         risk = sl - entry
         if risk <= 0 or risk > max_dist:
             return None
@@ -152,9 +153,9 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
     discount_level = structure["discount_level"]
 
     parsed = [_parse_candle(c) for c in candles_15m]
-    c = parsed[-1]      # Current closed candle
-    prev1 = parsed[-2]  # 1 candle ago
-    prev2 = parsed[-3]  # 2 candles ago
+    c = parsed[-1]
+    prev1 = parsed[-2]
+    prev2 = parsed[-3]
     o, h, l, cl, v = c[0], c[1], c[2], c[3], c[4]
 
     if current_price and abs(current_price - cl) > (atr * 0.75):
@@ -192,7 +193,6 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
     # SETUP 2: MARKET STRUCTURE SHIFT (MSS) + UNMITIGATED FVG MITIGATION
     # =========================================================================
     if bias == "BULLISH" and cl >= discount_level:
-        # Scan for Bullish FVG formed after a sweep
         for idx in range(3, 25):
             c_first = parsed[-(idx + 2)]
             c_third = parsed[-idx]
@@ -209,7 +209,6 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
                         )
 
     elif bias == "BEARISH" and cl <= premium_level:
-        # Scan for Bearish FVG formed after a sweep
         for idx in range(3, 25):
             c_first = parsed[-(idx + 2)]
             c_third = parsed[-idx]
