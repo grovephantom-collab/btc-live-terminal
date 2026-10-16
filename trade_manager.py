@@ -3,7 +3,6 @@ import time, uuid, logging, database, config, notifications
 log = logging.getLogger("TradeManager")
 
 def get_equity(conn) -> float:
-    # Initial paper balance 500 USD + realized PnL
     r = conn.execute("SELECT COALESCE(SUM(realized_pnl_usd), 0.0) as pnl FROM trades").fetchone()
     base = 500.0
     return max(50.0, base + float(r["pnl"] if r else 0.0))
@@ -31,14 +30,13 @@ def open_paper_trade(signal: dict, fencing_token: int):
 
         act = conn.execute("SELECT id FROM trades WHERE stage != 'CLOSED'").fetchone()
         if act:
-            return  # Max 1 open position rule intact
+            return
 
         sym = getattr(config, "SYMBOL", "BTCUSDT")
         direction = str(signal["direction"])
         setup_name = str(signal.get("setup_name", "SMC Setup"))
         score = float(signal.get("score", 85.0))
 
-        # 15m candle bucket key so same candle doesn't open duplicate trades
         candle_bucket = int(time.time() // 900)
         sig_key = f"{sym}_{direction}_{candle_bucket}"
         dup = conn.execute("SELECT id FROM trades WHERE signal_key = ?", (sig_key,)).fetchone()
@@ -111,13 +109,18 @@ def manage_positions(current_price: float, fencing_token: int):
         realized_so_far = float(trade.get("realized_pnl_usd") or 0.0)
         now_str = database.now_iso()
 
-        # Derive initial 1R distance from TP1 (set at 1.5R in smc_engine)
         initial_risk_dist = abs(tp1 - entry) / 1.5
         if initial_risk_dist <= 0:
             initial_risk_dist = max(abs(entry - sl), 1.0)
         initial_risk_usd = initial_risk_dist * orig_qty
 
-        # 1. Stop Loss / Trailing Stop Hit
+        def calc_safe_r(exit_px):
+            if initial_risk_dist <= 0:
+                return 0.0
+            raw_r = (exit_px - entry) / initial_risk_dist if direction == "LONG" else (entry - exit_px) / initial_risk_dist
+            return max(-5.0, min(round(raw_r, 2), 20.0))
+
+        # 1. Stop Loss Hit
         sl_hit = (current_price <= sl) if direction == "LONG" else (current_price >= sl)
         if sl_hit:
             pnl_usd = (sl - entry) * qty if direction == "LONG" else (entry - sl) * qty
@@ -125,10 +128,7 @@ def manage_positions(current_price: float, fencing_token: int):
             pnl_usd -= fee
             total_pnl = realized_so_far + pnl_usd
 
-            if initial_risk_usd > 0:
-                weighted_r = max(-5.0, min(round(total_pnl / initial_risk_usd, 2), 20.0))
-            else:
-                weighted_r = 0.0
+            weighted_r = max(-5.0, min(round(total_pnl / initial_risk_usd, 2), 20.0)) if initial_risk_usd > 0 else 0.0
 
             if stage == "RUNNER_TRAILING":
                 reason = "TRAIL_STOP_WIN"
@@ -158,11 +158,11 @@ def manage_positions(current_price: float, fencing_token: int):
             )
             return
 
-        # Buffer for zero brokerage on Break-Even
-        be_buffer = entry * 0.0008
+        # True Brokerage-Buffer Break-Even Price (Covers 0.1% exchange entry/exit fees)
+        be_buffer = entry * 0.0012
         be_price = (entry + be_buffer) if direction == "LONG" else (entry - be_buffer)
 
-        # Stage: ACTIVE / OPEN -> Check TP1 (50% Close + Shift SL to BE)
+        # Stage: ACTIVE / OPEN -> Check TP1 (50% Close + Shift SL to Brokerage-Safe BE)
         if stage in ("ACTIVE", "OPEN"):
             tp1_hit = (current_price >= tp1) if direction == "LONG" else (current_price <= tp1)
             if tp1_hit:
@@ -185,7 +185,7 @@ def manage_positions(current_price: float, fencing_token: int):
                 _send_tg(
                     f"✅ TP1 HIT ({direction})\n"
                     f"50% Position Booked: ${pnl:+.2f}\n"
-                    f"SL Shifted to Break-Even: ${be_price:.2f}"
+                    f"SL Shifted to Fee-Safe BE: ${be_price:.2f}"
                 )
                 return
 
