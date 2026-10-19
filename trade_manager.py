@@ -9,6 +9,13 @@ def _iso_to_epoch(iso_str: str) -> float:
     except Exception:
         return 0.0
 
+def get_dynamic_slippage(atr_value, entry_price, base_slippage=0.0003):
+    if not atr_value or entry_price <= 0:
+        return base_slippage
+    atr_pct = atr_value / entry_price
+    dynamic_slip = max(base_slippage, atr_pct * 0.1)
+    return min(dynamic_slip, 0.002)
+
 def get_equity(conn) -> float:
     r = conn.execute("SELECT COALESCE(SUM(realized_pnl_usd), 0.0) as pnl FROM trades").fetchone()
     base = 500.0
@@ -95,7 +102,7 @@ def open_paper_trade(signal: dict, fencing_token: int):
     finally:
         conn.close()
 
-def manage_positions(current_price: float, fencing_token: int, klines_15m: list = None):
+def manage_positions(current_price: float, fencing_token: int, klines_15m: list = None, current_atr: float = None):
     conn = database.db()
     try:
         t = conn.execute("SELECT * FROM trades WHERE stage != 'CLOSED' ORDER BY id DESC LIMIT 1").fetchone()
@@ -116,18 +123,14 @@ def manage_positions(current_price: float, fencing_token: int, klines_15m: list 
         realized_so_far = float(trade.get("realized_pnl_usd") or 0.0)
         now_str = database.now_iso()
 
-        # Check time of last update/open so we only inspect candles formed AFTER the trade/stage update
         last_update_epoch = _iso_to_epoch(trade.get("updated_at_utc") or trade.get("opened_at_utc") or "")
 
-        # Build list of price bars (High/Low) since last update + current live tick
         bars_to_check = []
         if klines_15m:
             for c in klines_15m:
-                # Only include candles that closed AFTER the trade was opened/updated
                 if float(c.get("close_time", 0)) > last_update_epoch:
                     bars_to_check.append((float(c["high"]), float(c["low"])))
         
-        # Always append current live spot price as the final check
         bars_to_check.append((current_price, current_price))
 
         initial_risk_dist = abs(tp1 - entry) / 1.5
@@ -138,13 +141,25 @@ def manage_positions(current_price: float, fencing_token: int, klines_15m: list 
         be_buffer = entry * 0.0012
         be_price = (entry + be_buffer) if direction == "LONG" else (entry - be_buffer)
 
-        # Iterate chronologically through recent candles + live price
+        base_slip = getattr(config, "SLIPPAGE", 0.0003)
+        current_slip = get_dynamic_slippage(current_atr, entry, base_slip)
+        fee_rate = getattr(config, "FEE_RATE", 0.0005)
+
+        trade_closed = False
         for bar_high, bar_low in bars_to_check:
-            # 1. Stop Loss Hit (Checked first for conservative risk management)
-            sl_hit = (bar_low <= sl) if direction == "LONG" else (bar_high >= sl)
-            if sl_hit:
-                pnl_usd = (sl - entry) * qty if direction == "LONG" else (entry - sl) * qty
-                fee = sl * qty * 0.001
+            if trade_closed:
+                break
+
+            def target_hit(level):
+                return bar_high >= level if direction == "LONG" else bar_low <= level
+
+            def stop_hit(level):
+                return bar_low <= level if direction == "LONG" else bar_high >= level
+
+            if stop_hit(sl):
+                exitp = sl * (1 - current_slip if direction == "LONG" else 1 + current_slip)
+                pnl_usd = (exitp - entry) * qty if direction == "LONG" else (entry - exitp) * qty
+                fee = abs(exitp * qty) * fee_rate
                 pnl_usd -= fee
                 total_pnl = realized_so_far + pnl_usd
 
@@ -178,13 +193,12 @@ def manage_positions(current_price: float, fencing_token: int, klines_15m: list 
                 )
                 return
 
-            # Stage: ACTIVE / OPEN -> Check TP1 (50% Close + Shift SL to Brokerage-Safe BE)
             if stage in ("ACTIVE", "OPEN"):
-                tp1_hit = (bar_high >= tp1) if direction == "LONG" else (bar_low <= tp1)
-                if tp1_hit:
+                if target_hit(tp1):
                     part_qty = round(orig_qty * 0.50, 6)
-                    pnl = (tp1 - entry) * part_qty if direction == "LONG" else (entry - tp1) * part_qty
-                    fee = tp1 * part_qty * 0.001
+                    exitp = tp1 * (1 - current_slip if direction == "LONG" else 1 + current_slip)
+                    pnl = (exitp - entry) * part_qty if direction == "LONG" else (entry - tp1) * part_qty
+                    fee = abs(exitp * part_qty) * fee_rate
                     pnl -= fee
                     new_qty = max(0.0, round(qty - part_qty, 6))
 
@@ -205,13 +219,12 @@ def manage_positions(current_price: float, fencing_token: int, klines_15m: list 
                     )
                     return
 
-            # Stage: TP1_HIT -> Check TP2 (30% Close + Lock in TP1 price as SL)
             elif stage == "TP1_HIT":
-                tp2_hit = (bar_high >= tp2) if direction == "LONG" else (bar_low <= tp2)
-                if tp2_hit:
+                if target_hit(tp2):
                     part_qty = round(orig_qty * 0.30, 6)
-                    pnl = (tp2 - entry) * part_qty if direction == "LONG" else (entry - tp2) * part_qty
-                    fee = tp2 * part_qty * 0.001
+                    exitp = tp2 * (1 - current_slip if direction == "LONG" else 1 + current_slip)
+                    pnl = (exitp - entry) * part_qty if direction == "LONG" else (entry - tp2) * part_qty
+                    fee = abs(exitp * part_qty) * fee_rate
                     pnl -= fee
                     new_qty = max(0.0, round(qty - part_qty, 6))
 
@@ -232,10 +245,8 @@ def manage_positions(current_price: float, fencing_token: int, klines_15m: list 
                     )
                     return
 
-            # Stage: TP2_HIT -> Check TP3 / Trailing Runner
             elif stage == "TP2_HIT":
-                tp3_hit = (bar_high >= tp3) if direction == "LONG" else (bar_low <= tp3)
-                if tp3_hit:
+                if target_hit(tp3):
                     conn.execute("""
                         UPDATE trades SET 
                             stage = 'RUNNER_TRAILING', tp3_done = 1, stop_price = ?, updated_at_utc = ?
@@ -249,7 +260,6 @@ def manage_positions(current_price: float, fencing_token: int, klines_15m: list 
                     )
                     return
 
-            # Stage: RUNNER_TRAILING -> Trail behind price dynamically
             elif stage == "RUNNER_TRAILING":
                 if direction == "LONG" and bar_high > (sl + initial_risk_dist):
                     new_sl = round(bar_high - (initial_risk_dist * 0.8), 2)
