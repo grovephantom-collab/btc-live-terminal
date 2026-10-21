@@ -19,7 +19,6 @@ def db() -> sqlite3.Connection:
         os.makedirs(os.path.dirname(os.path.abspath(config.DB_FILE)), exist_ok=True)
     c = sqlite3.connect(config.DB_FILE, timeout=20, isolation_level=None)
     c.row_factory = sqlite3.Row
-    # 30. SQLite WAL & Foreign Key Integrity
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("PRAGMA busy_timeout=20000")
     c.execute("PRAGMA synchronous=NORMAL")
@@ -99,7 +98,6 @@ def audit(c: sqlite3.Connection, tid: str, event: str, details: dict):
     c.execute("INSERT INTO trade_audit_log (trade_id,event_type,details_json,timestamp_utc) VALUES(?,?,?,?)",
               (tid, event, jd(details), now_iso()))
 
-# 29. Single-Leader Lease Lock
 def lease_tick() -> Tuple[bool, Optional[int]]:
     t = time.time()
     c = db()
