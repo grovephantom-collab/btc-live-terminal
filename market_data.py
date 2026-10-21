@@ -35,9 +35,11 @@ def fetch_price() -> Optional[float]:
     except Exception: pass
     return None
 
-def fetch_klines(interval: str, limit: int = 200) -> List[Dict[str, float]]:
+def fetch_klines(interval: str, limit: int = 100) -> List[Dict[str, float]]:
     gran_map = {"15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
     gran = gran_map.get(interval, 900)
+    
+    # Try Coinbase first
     try:
         url = f"https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity={gran}"
         r = HTTP.get(url, timeout=config.HTTP_TIMEOUT)
@@ -48,8 +50,24 @@ def fetch_klines(interval: str, limit: int = 200) -> List[Dict[str, float]]:
                 out = []
                 for k in raw:
                     t = int(k[0])
-                    if t + gran > now_s: continue
                     out.append({"time": t, "close_time": t + gran, "open": float(k[3]), "high": float(k[2]), "low": float(k[1]), "close": float(k[4]), "vol": float(k[5])})
+                out.sort(key=lambda z: z["time"])
+                return out[-limit:]
+    except Exception: pass
+
+    # Fallback to Binance Klines if Coinbase fails
+    binance_intervals = {"15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
+    b_interval = binance_intervals.get(interval, "15m")
+    try:
+        url = f"https://api.binance.com/api/v3/klines?symbol={config.SYMBOL}&interval={b_interval}&limit={limit}"
+        r = HTTP.get(url, timeout=config.HTTP_TIMEOUT)
+        if r.status_code == 200:
+            raw = r.json()
+            if isinstance(raw, list) and len(raw) >= 5:
+                out = []
+                for k in raw:
+                    t = int(k[0]) // 1000
+                    out.append({"time": t, "close_time": t + gran, "open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4]), "vol": float(k[5])})
                 out.sort(key=lambda z: z["time"])
                 return out[-limit:]
     except Exception: pass
@@ -79,15 +97,17 @@ def refresh_market_data(lock) -> bool:
             MARKET["session"] = session_now()
 
         ks = {}
-        limits = {"15m": 200, "1h": 100, "4h": 60, "1d": 30}
+        # Fetch essential timeframes safely
         for k in ("15m", "1h", "4h", "1d"):
-            bars = fetch_klines(k, limits[k])
-            if len(bars) < 15:
-                cached = MARKET.get("klines", {}).get(k, [])
-                if len(cached) >= 15: bars = cached
-                else: raise ValueError(f"Insufficient history for {k}")
+            bars = fetch_klines(k, 100)
+            if len(bars) < 5:
+                # Fallback to 15m data duplicated if higher TF fails temporarily
+                if k in ("4h", "1d") and "15m" in ks and len(ks["15m"]) >= 10:
+                    bars = ks["15m"]
+                else:
+                    raise ValueError(f"Insufficient history for {k}")
             ks[k] = bars
-            time.sleep(0.08)
+            time.sleep(0.05)
 
         poc = approx_poc(ks["15m"][-60:])
         with lock:
