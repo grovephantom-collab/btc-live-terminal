@@ -2,7 +2,6 @@ import queue, time, logging, requests
 import config
 
 log = logging.getLogger("TelegramEngine")
-# 31. Async Non-Blocking Alert Queue
 TG_QUEUE = queue.Queue(maxsize=100)
 HTTP = requests.Session()
 
@@ -19,9 +18,8 @@ def telegram_worker_loop():
                 for attempt in range(4):
                     try:
                         r = HTTP.post(f"https://api.telegram.org/bot{config.TG_TOKEN}/sendMessage",
-                                      json={"chat_id": config.TG_CHAT, "text": msg, "disable_web_page_preview": True}, timeout=8)
+                                    json={"chat_id": config.TG_CHAT, "text": msg, "disable_web_page_preview": True}, timeout=8)
                         if r.status_code == 200: break
-                        # 31. Rate-Limit (429) Auto Backoff
                         if r.status_code == 429:
                             w = float(r.json().get("parameters", {}).get("retry_after", 3))
                             time.sleep(min(30, max(1, w)))
