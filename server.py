@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-TIER 2: INSTITUTIONAL FRONTEND DASHBOARD (server.py - Streamlit)
-Fully compatible with live Render worker /vault-data pipeline.
+MOBILE-FIRST MINIMALIST SMC TERMINAL (server.py - Streamlit)
+Designed specifically for mobile view without heavy charts.
 """
 
 import os
@@ -11,7 +11,6 @@ from typing import Dict, Any, Optional
 import requests
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 
 # ==========================================
 # CONFIGURATION
@@ -21,14 +20,14 @@ VAULT_ENDPOINT = f"{BACKEND_URL}/vault-data"
 AUTO_REFRESH_SECONDS = int(os.getenv("AUTO_REFRESH_SECONDS", "5"))
 
 st.set_page_config(
-    page_title="SMC Institutional BTC/USDT Vault & Terminal",
+    page_title="BTCUSDT SMC TRADING TERMINAL",
     page_icon="⚡",
-    layout="wide",
+    layout="centered",
     initial_sidebar_state="collapsed",
 )
 
 # ==========================================
-# INSTITUTIONAL STYLING (DARK TERMINAL THEME)
+# MOBILE-OPTIMIZED INSTITUTIONAL STYLING
 # ==========================================
 st.markdown(
     """
@@ -42,49 +41,59 @@ st.markdown(
         }
         .block-container {
             padding-top: 1rem;
-            padding-bottom: 2rem;
-            max-width: 100%;
+            padding-bottom: 3rem;
+            max-width: 600px;
+        }
+        .terminal-header {
+            background: #0f172a;
+            border: 1px solid #1e293b;
+            border-radius: 12px;
+            padding: 16px 20px;
+            margin-bottom: 16px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
         }
         .metric-card {
-            background: linear-gradient(135deg, #0f172a 0%, #090d16 100%);
+            background: #0f172a;
             border: 1px solid #1e293b;
-            border-radius: 10px;
+            border-radius: 12px;
             padding: 16px 20px;
-            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
-            position: relative;
-            overflow: hidden;
-        }
-        .metric-card::before {
-            content: '';
-            position: absolute;
-            top: 0; left: 0; width: 3px; height: 100%;
-            background: #38bdf8;
+            margin-bottom: 12px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
         }
         .metric-label {
             color: #94a3b8;
-            font-size: 0.75rem;
+            font-size: 0.7rem;
             font-weight: 600;
-            letter-spacing: 0.06em;
+            letter-spacing: 0.08em;
             text-transform: uppercase;
             margin-bottom: 6px;
         }
         .metric-value {
-            color: #f8fafc;
-            font-size: 1.6rem;
+            color: #38bdf8;
+            font-size: 1.5rem;
             font-weight: 700;
             font-family: 'JetBrains Mono', monospace;
-            letter-spacing: -0.02em;
         }
-        .metric-sub {
-            color: #64748b;
-            font-size: 0.75rem;
-            margin-top: 6px;
+        .metric-value-green {
+            color: #10b981;
+            font-size: 1.5rem;
+            font-weight: 700;
             font-family: 'JetBrains Mono', monospace;
         }
-        .stAlert {
-            background-color: #0f172a;
-            color: #f8fafc;
+        .sub-text {
+            color: #64748b;
+            font-size: 0.75rem;
+            margin-top: 4px;
+            font-family: 'JetBrains Mono', monospace;
+        }
+        .table-container {
+            background: #0f172a;
             border: 1px solid #1e293b;
+            border-radius: 12px;
+            padding: 16px;
+            margin-top: 16px;
         }
     </style>
     """,
@@ -97,237 +106,153 @@ def fetch_vault_payload() -> Optional[Dict[str, Any]]:
         resp = requests.get(VAULT_ENDPOINT, timeout=6)
         resp.raise_for_status()
         return resp.json()
-    except Exception as exc:
-        st.error(f"⚠️ Unable to reach Institutional Scanner Engine at `{VAULT_ENDPOINT}`: {exc}")
+    except Exception:
         return None
 
 
-def render_chart_with_overlay(active_trade: Optional[Dict[str, Any]], spot_price: float) -> None:
-    if active_trade:
-        direction = active_trade.get("direction", "LONG")
-        setup_type = active_trade.get("setup_name") or active_trade.get("setup", "SMC SETUP")
-        entry = float(active_trade.get("entry_price", active_trade.get("entry", 0.0)))
-        sl = float(active_trade.get("stop_price", active_trade.get("sl", 0.0)))
-        tp1 = float(active_trade.get("tp1_price", active_trade.get("tp1", 0.0)))
-        tp2 = float(active_trade.get("tp2_price", active_trade.get("tp2", 0.0)))
-        risk_usd = round(abs(entry - sl), 2)
-        is_risk_free = active_trade.get("status") == "RISK_FREE" or active_trade.get("tp1_done") == 1
-
-        dir_color = "#10b981" if direction == "LONG" else "#ef4444"
-        be_badge = "🛡️ RISK-FREE (SL @ ENTRY)" if is_risk_free else "⚡ LIVE RISK ACTIVE ($5 FLOOR)"
-
-        overlay_html = f"""
-        <div style="
-            position: absolute;
-            top: 16px;
-            right: 20px;
-            z-index: 50;
-            width: 320px;
-            background: rgba(15, 23, 42, 0.94);
-            backdrop-filter: blur(12px);
-            border: 1px solid #334155;
-            border-radius: 10px;
-            padding: 16px;
-            color: #f8fafc;
-            font-family: 'JetBrains Mono', monospace;
-            box-shadow: 0 12px 30px rgba(0, 0, 0, 0.6);
-        ">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-                <span style="font-size:11px; font-weight:700; color:{dir_color}; letter-spacing:0.06em;">
-                    ● ACTIVE {direction} · {setup_type}
-                </span>
-            </div>
-            <div style="font-size:10px; color:#94a3b8; margin-bottom:10px; border-bottom:1px solid #1e293b; padding-bottom:6px;">
-                {be_badge}
-            </div>
-            <div style="display:grid; grid-template-columns: 1fr 1fr; row-gap: 10px; column-gap: 12px; font-size:11px;">
-                <div>
-                    <div style="color:#64748b; font-size:9px;">ENTRY PRICE</div>
-                    <div style="font-weight:700; color:#f8fafc;">${entry:,.2f}</div>
-                </div>
-                <div>
-                    <div style="color:#64748b; font-size:9px;">STOP LOSS</div>
-                    <div style="font-weight:700; color:#ef4444;">${sl:,.2f}</div>
-                </div>
-                <div>
-                    <div style="color:#64748b; font-size:9px;">TARGET 1 (1.5R)</div>
-                    <div style="font-weight:700; color:#38bdf8;">${tp1:,.2f}</div>
-                </div>
-                <div>
-                    <div style="color:#64748b; font-size:9px;">TARGET 2 (2.25R)</div>
-                    <div style="font-weight:700; color:#10b981;">${tp2:,.2f}</div>
-                </div>
-            </div>
-            <div style="margin-top:12px; padding-top:8px; border-top:1px solid #1e293b; display:flex; justify-content:space-between; font-size:10px; color:#94a3b8;">
-                <span>Risk/Coin: <b>${risk_usd:,.2f}</b></span>
-                <span>Spot: <b>${spot_price:,.2f}</b></span>
-            </div>
-        </div>
-        """
-    else:
-        overlay_html = """
-        <div style="
-            position: absolute;
-            top: 16px;
-            right: 20px;
-            z-index: 50;
-            background: rgba(15, 23, 42, 0.9);
-            border: 1px solid #1e293b;
-            border-radius: 8px;
-            padding: 10px 16px;
-            color: #94a3b8;
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 11px;
-            backdrop-filter: blur(8px);
-        ">
-            <span style="color:#38bdf8; font-weight:600;">● SCANNING 15M SMC STRUCTURE</span> · Standby
-        </div>
-        """
-
-    html_code = f"""
-    <div style="position: relative; width: 100%; height: 560px; border: 1px solid #1e293b; border-radius: 12px; overflow: hidden; background: #07090e;">
-        {overlay_html}
-        <div id="tv_chart_container" style="width: 100%; height: 100%;"></div>
-        <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
-        <script type="text/javascript">
-        new TradingView.widget({{
-            "autosize": true,
-            "symbol": "BINANCE:BTCUSDT",
-            "interval": "15",
-            "timezone": "Etc/UTC",
-            "theme": "dark",
-            "style": "1",
-            "locale": "en",
-            "enable_publishing": false,
-            "backgroundColor": "rgba(7, 9, 14, 1)",
-            "gridColor": "rgba(30, 41, 59, 0.3)",
-            "hide_top_toolbar": false,
-            "hide_legend": false,
-            "save_image": false,
-            "container_id": "tv_chart_container"
-        }});
-        </script>
-    </div>
-    """
-    components.html(html_code, height=575)
-
-
 def main() -> None:
-    head_left, head_right = st.columns([3, 1])
-    with head_left:
-        st.markdown("### ⚡ SMC Institutional BTC/USDT Terminal")
-        st.caption("Live Coinbase/Binance Feed · SMC Liquidity Model · Delta Exchange Automated Execution")
-    with head_right:
-        live_sync = st.toggle("Live Auto-Sync (5s)", value=True)
+    # Top Header
+    st.markdown(
+        """
+        <div class="terminal-header">
+            <div>
+                <div style="font-size: 1.05rem; font-weight: 700; font-family: 'JetBrains Mono', monospace; letter-spacing: -0.01em;">BTCUSDT SMC TRADING TERMINAL</div>
+                <div style="font-size: 0.75rem; color: #94a3b8; margin-top: 2px;">Institutional Orderflow Vault</div>
+            </div>
+            <div style="background: rgba(16, 185, 129, 0.1); border: 1px solid #10b981; color: #10b981; padding: 4px 10px; border-radius: 6px; font-size: 0.7rem; font-weight: 600; font-family: 'JetBrains Mono', monospace;">
+                ● ENGINE ONLINE
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     payload = fetch_vault_payload()
     if not payload:
-        st.warning("Connecting to Render Backend... Please ensure service is awake.")
-        if live_sync:
-            time.sleep(AUTO_REFRESH_SECONDS)
-            st.rerun()
+        st.warning("Connecting to Render Backend... Please wait.")
+        time.sleep(AUTO_REFRESH_SECONDS)
+        st.rerun()
         return
 
     # Data Extraction
     spot_price = float(payload.get("price") or 0.0)
     active_session = payload.get("session", "ACTIVE")
     realized_pnl = float(payload.get("realized_pnl_usd", 0.0))
-    equity_est = float(payload.get("equity_estimate_usd", 1000.0))
     open_trades_count = payload.get("open_trades", 0)
     stats = payload.get("stats", {"wins": 0, "losses": 0, "win_rate": 0.0, "total_r": 0.0})
-
+    
     active_list = payload.get("active", [])
     active_trade = active_list[0] if active_list else payload.get("active_trade")
     vault_trades = payload.get("vault", [])
 
-    # 1. LIVE METRICS BAR
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.markdown(
-            f"""
-            <div class="metric-card">
-                <div class="metric-label">BTC-USD Spot Price</div>
-                <div class="metric-value">${spot_price:,.2f}</div>
-                <div class="metric-sub">Session: {active_session}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with c2:
-        pnl_color = "#10b981" if realized_pnl >= 0 else "#ef4444"
-        st.markdown(
-            f"""
-            <div class="metric-card" style="border-left-color: {pnl_color};">
-                <div class="metric-label">Realized PnL (USD)</div>
-                <div class="metric-value" style="color: {pnl_color};">${realized_pnl:+,.2f}</div>
-                <div class="metric-sub">Est. Equity: ${equity_est:,.2f}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with c3:
-        st.markdown(
-            f"""
-            <div class="metric-card" style="border-left-color: #6366f1;">
-                <div class="metric-label">Active Exposure</div>
-                <div class="metric-value">{open_trades_count} Position</div>
-                <div class="metric-sub">Risk Floor: $5.00 Enforced</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with c4:
-        total_r = stats.get("total_r", 0.0)
-        win_rate = stats.get("win_rate", 0.0)
-        wins = stats.get("wins", 0)
-        losses = stats.get("losses", 0)
-        st.markdown(
-            f"""
-            <div class="metric-card" style="border-left-color: #10b981;">
-                <div class="metric-label">Vault Performance</div>
-                <div class="metric-value">{total_r:+.2f}R</div>
-                <div class="metric-sub">Win Rate: {win_rate}% ({wins}W / {losses}L)</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    # 1. BITCOIN PRICE
+    st.markdown(
+        f"""
+        <div class="metric-card">
+            <div class="metric-label">BITCOIN PRICE</div>
+            <div class="metric-value">${spot_price:,.2f}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    st.write("")
+    # 2. DEALING SESSION
+    st.markdown(
+        f"""
+        <div class="metric-card">
+            <div class="metric-label">DEALING SESSION</div>
+            <div style="color: #f59e0b; font-size: 1.25rem; font-weight: 700; font-family: 'JetBrains Mono', monospace;">{active_session}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    # 2. TRADINGVIEW CHART WITH OVERLAY
-    render_chart_with_overlay(active_trade, spot_price)
+    # 3. REALIZED NET PNL
+    pnl_class = "metric-value-green" if realized_pnl >= 0 else "metric-value"
+    st.markdown(
+        f"""
+        <div class="metric-card">
+            <div class="metric-label">REALIZED NET PNL</div>
+            <div class="{pnl_class}">${realized_pnl:+,.2f} USD</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    st.write("")
-    st.markdown("#### 🏛️ Institutional Trade Vault History")
+    # 4. WIN RATE / TRADES
+    win_rate = stats.get("win_rate", 0.0)
+    total_t = stats.get("wins", 0) + stats.get("losses", 0)
+    st.markdown(
+        f"""
+        <div class="metric-card">
+            <div class="metric-label">WIN RATE / TRADES</div>
+            <div class="metric-value">{win_rate}% <span style="font-size: 1rem; color: #94a3b8;">({total_t}T)</span></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    # 3. HISTORICAL VAULT TABLE
-    if vault_trades:
-        formatted_rows = []
-        for row in vault_trades:
-            pnl_r = row.get("weighted_pnl_r")
-            formatted_rows.append(
-                {
-                    "Time (UTC)": row.get("opened_at_utc", "")[:19].replace("T", " "),
-                    "Direction": row.get("direction", ""),
-                    "Setup": row.get("setup_name", ""),
-                    "Score": f"{float(row.get('score', 0)):.0f}",
-                    "Entry": f"${float(row.get('entry_price', 0)):,.2f}",
-                    "SL": f"${float(row.get('stop_price', 0)):,.2f}",
-                    "TP1": f"${float(row.get('tp1_price', 0)):,.2f}",
-                    "Outcome": row.get("close_reason") or row.get("stage", "ACTIVE"),
-                    "Net PnL ($)": f"${float(row.get('realized_pnl_usd', 0)):+.2f}",
-                    "PnL (R)": f"{float(pnl_r if pnl_r is not None else 0):+.2f}R",
-                    "Status": row.get("stage", "OPEN"),
-                }
-            )
-        vault_df = pd.DataFrame(formatted_rows)
-        st.dataframe(vault_df, use_container_width=True, hide_index=True)
+    # 5. ACTIVE POSITION STATUS
+    if active_trade:
+        dir_val = active_trade.get("direction", "LONG")
+        entry_val = float(active_trade.get("entry_price", 0))
+        sl_val = float(active_trade.get("stop_price", 0))
+        tp_val = float(active_trade.get("tp1_price", 0))
+        active_html = f"""
+        <b>ACTIVE {dir_val} POSITION</b><br>
+        Entry: ${entry_val:,.2f} | SL: ${sl_val:,.2f} | TP: ${tp_val:,.2f}
+        """
     else:
-        st.info("ℹ️ No historical trades in vault yet. Scanner engine is actively monitoring 15M liquidity zones.")
+        active_html = "No active trade open. Strategy scanning closed 15M candles for Liquidity Sweeps & FVG CE mitigations."
 
-    if live_sync:
-        time.sleep(AUTO_REFRESH_SECONDS)
-        st.rerun()
+    st.markdown(
+        f"""
+        <div class="metric-card">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                <span class="metric-label" style="margin-bottom:0;">ACTIVE POSITION STATUS</span>
+                <span style="font-size: 0.65rem; color: #64748b; font-family: 'JetBrains Mono', monospace;">Max 1 Open Risk Cap</span>
+            </div>
+            <div style="font-size: 0.85rem; color: #cbd5e1; margin-top: 8px; line-height: 1.4;">
+                {active_html}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # 6. VAULT HISTORY TABLE
+    st.markdown(
+        """
+        <div class="table-container">
+            <div class="metric-label" style="margin-bottom: 12px;">VAULT TRADE HISTORY</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if vault_trades:
+        rows = []
+        for row in vault_trades:
+            rows.append({
+                "Time": row.get("opened_at_utc", "")[11:19],
+                "Side": row.get("direction", ""),
+                "Entry": f"${float(row.get('entry_price', 0)):,.0f}",
+                "Reason": row.get("close_reason", "ACTIVE"),
+                "PnL ($)": f"${float(row.get('realized_pnl_usd', 0)):+.2f}"
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    else:
+        st.markdown(
+            """
+            <div style="color: #64748b; font-size: 0.8rem; font-family: 'JetBrains Mono', monospace; padding: 10px 0;">
+                No past trades logged yet. Scanner is standing by setup execution.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    time.sleep(AUTO_REFRESH_SECONDS)
+    st.rerun()
 
 
 if __name__ == "__main__":
