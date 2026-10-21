@@ -19,14 +19,12 @@ def ienv(name: str, default: int, minimum: int = 0) -> int:
     return v
 
 try:
-    # 1. P0 Fail-Safe Secrets Check
     API_SECRET_KEY = required("API_SECRET_KEY", 24)
     WORKER_AUTH_TOKEN = required("WORKER_AUTH_TOKEN", 24)
     
-    # 2. Paper-Only Air-Gap Isolation
     MODE = os.getenv("TRADING_MODE", "PAPER").strip().upper()
-    if MODE != "PAPER":
-        raise RuntimeError("Engine is hard-locked to PAPER mode for capital protection.")
+    if MODE not in ("PAPER", "TESTNET", "LIVE"):
+        raise RuntimeError("TRADING_MODE must be PAPER, TESTNET, or LIVE.")
 
     SYMBOL = os.getenv("SYMBOL", "BTCUSDT").strip().upper()
     PORT = ienv("PORT", 10000, 1)
@@ -37,7 +35,6 @@ try:
     LEASE_TTL = fenv("LEADER_TTL_SEC", 15, 5)
     MAX_DATA_AGE = fenv("MAX_DATA_AGE_SEC", 90, 10)
 
-    # 4. Account Risk Thresholds
     START_EQUITY = fenv("PAPER_EQUITY_USD", 1000, 10)
     RISK_PCT = fenv("RISK_PER_TRADE_PCT", 0.01, 0.0001)
     MAX_DAILY_LOSS = fenv("MAX_DAILY_LOSS_USD", 50, 1)
@@ -45,21 +42,24 @@ try:
     MAX_OPEN_TRADES = ienv("MAX_OPEN_TRADES", 1, 1)
     MAX_NOTIONAL = fenv("MAX_NOTIONAL_USD", 1000, 10)
 
-    # 5. Execution Fees & Slippage
     FEE_RATE = fenv("PAPER_FEE_RATE", 0.0005, 0)
     SLIPPAGE = fenv("PAPER_SLIPPAGE_RATE", 0.0003, 0)
     MIN_SCORE = fenv("MIN_SIGNAL_SCORE", 75, 0)
 
-    # 3. Structural SMC Thresholds
     MIN_GAP = fenv("MIN_FVG_GAP_USD", 35, 0)
     SWEEP_BUFFER = fenv("SWEEP_BUFFER_USD", 10, 0)
     SL_BUFFER = fenv("STRUCTURAL_SL_BUFFER_USD", 25, 0)
     MIN_STOP = fenv("MIN_STOP_DISTANCE_USD", 40, 1)
     MAX_STOP = fenv("MAX_STOP_DISTANCE_USD", 1500, 1)
 
-    # 6. Notifications
     TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+    # Delta Exchange Config
+    DELTA_API_KEY = os.getenv("DELTA_API_KEY", "").strip()
+    DELTA_API_SECRET = os.getenv("DELTA_API_SECRET", "").strip()
+    DELTA_TESTNET = os.getenv("DELTA_TESTNET", "true").strip().lower() == "true"
+    DELTA_PRODUCT_ID = int(os.getenv("DELTA_PRODUCT_ID", "27"))
 
     ALLOWED_SESSIONS = {
         x.strip().upper() for x in os.getenv("ALLOWED_SESSIONS", "LONDON EXPANSION,NEW YORK TREND").split(",") if x.strip()
