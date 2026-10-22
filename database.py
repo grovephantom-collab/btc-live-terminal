@@ -19,7 +19,13 @@ def db() -> sqlite3.Connection:
         os.makedirs(os.path.dirname(os.path.abspath(config.DB_FILE)), exist_ok=True)
     c = sqlite3.connect(config.DB_FILE, timeout=20, isolation_level=None)
     c.row_factory = sqlite3.Row
-    c.execute("PRAGMA journal_mode=WAL")
+    try:
+        c.execute("PRAGMA journal_mode=WAL")
+    except Exception:
+        try:
+            c.execute("PRAGMA journal_mode=DELETE")
+        except Exception:
+            pass
     c.execute("PRAGMA busy_timeout=20000")
     c.execute("PRAGMA synchronous=NORMAL")
     c.execute("PRAGMA foreign_keys=ON")
