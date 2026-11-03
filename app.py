@@ -27,8 +27,9 @@ def engine_supervision_loop():
                 ks = {k: list(v) for k, v in market_data.MARKET["klines"].items()}
                 sess = market_data.MARKET["session"]
                 poc = market_data.MARKET["poc"]
+                market_snapshot = dict(market_data.MARKET)
 
-            st = smc_engine.get_structure(ks)
+            st = smc_engine.get_structure(market_snapshot)
             trade_manager.manage_positions(p, token, ks.get("15m", []), st.get("atr"))
             sig = smc_engine.evaluate_signal(st, ks.get("15m", []), p, sess, poc)
 
@@ -71,6 +72,11 @@ def vault_data():
             "mode": config.MODE,
             "price": market_data.MARKET.get("price"),
             "session": market_data.MARKET.get("session", "ACTIVE"),
+            "in_killzone": market_data.MARKET.get("in_killzone", False),
+            "killzone_name": market_data.MARKET.get("killzone_name", "OFF_HOURS"),
+            "funding_rate": market_data.MARKET.get("funding_rate", 0.0001),
+            "pdh": market_data.MARKET.get("pdh"),
+            "pdl": market_data.MARKET.get("pdl"),
             "realized_pnl_usd": round(pnl, 2),
             "open_trades": len(active_rows),
             "stats": {
