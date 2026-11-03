@@ -56,56 +56,72 @@ def get_equity(conn) -> float:
     r = conn.execute("SELECT COALESCE(SUM(realized_pnl_usd), 0.0) as pnl FROM trades").fetchone()
     return max(4.0, config.START_EQUITY + float(r["pnl"] if r else 0.0))
 
-def _check_cooldown_and_daily_limits(conn) -> tuple:
+def _check_cooldown_and_circuit_breakers(conn) -> tuple:
     now_dt = datetime.now(timezone.utc)
     today_prefix = now_dt.date().isoformat()
 
     daily_rows = conn.execute(
-        "SELECT realized_pnl_usd, stage FROM trades WHERE opened_at_utc LIKE ?",
+        "SELECT realized_pnl_usd, stage, close_reason FROM trades WHERE opened_at_utc LIKE ?",
         (f"{today_prefix}%",)
     ).fetchall()
     
-    if len(daily_rows) >= getattr(config, "MAX_DAILY_TRADES", 4):
-        return False, "Max daily trades reached"
+    if len(daily_rows) >= getattr(config, "MAX_DAILY_TRADES", 3):
+        return False, "Max daily trades (3) reached. Capital preserved."
 
     daily_pnl = sum(float(r["realized_pnl_usd"] or 0.0) for r in daily_rows)
-    max_daily_loss = getattr(config, "MAX_DAILY_LOSS", 3.0)
+    max_daily_loss = getattr(config, "MAX_DAILY_LOSS", 2.50)
     if daily_pnl <= -abs(max_daily_loss):
-        return False, f"Daily loss limit hit (${daily_pnl:.2f})"
+        return False, f"Daily Loss Limit hit (${daily_pnl:.2f}). Trading paused for today."
 
-    last_closed = conn.execute(
-        "SELECT close_reason, closed_at_utc FROM trades WHERE stage = 'CLOSED' AND closed_at_utc IS NOT NULL ORDER BY id DESC LIMIT 1"
-    ).fetchone()
+    recent_closed = conn.execute(
+        "SELECT close_reason, closed_at_utc FROM trades WHERE stage = 'CLOSED' AND closed_at_utc IS NOT NULL ORDER BY id DESC LIMIT 2"
+    ).fetchall()
 
-    if last_closed and last_closed["closed_at_utc"]:
+    # 2 Consecutive SL Hits -> 2 Hours Mandatory Trading Pause
+    if len(recent_closed) >= 2:
+        reasons = [r["close_reason"] or "" for r in recent_closed]
+        if all("STOP_LOSS" in r for r in reasons):
+            try:
+                last_dt = datetime.fromisoformat(recent_closed[0]["closed_at_utc"])
+                elapsed_pause = (now_dt - last_dt).total_seconds()
+                pause_limit = getattr(config, "CONSECUTIVE_SL_PAUSE_SEC", 7200)
+                if elapsed_pause < pause_limit:
+                    rem_m = int((pause_limit - elapsed_pause) // 60)
+                    return False, f"Circuit Breaker: 2 Consecutive SLs hit -> Paused for {rem_m}m to avoid chop."
+            except Exception:
+                pass
+
+    if recent_closed and recent_closed[0]["closed_at_utc"]:
         try:
-            closed_dt = datetime.fromisoformat(last_closed["closed_at_utc"])
+            closed_dt = datetime.fromisoformat(recent_closed[0]["closed_at_utc"])
             elapsed = (now_dt - closed_dt).total_seconds()
-            reason = last_closed["close_reason"] or ""
-            sl_cooldown = getattr(config, "SL_COOLDOWN_SECONDS", 2700)
-            min_cooldown = getattr(config, "TRADE_COOLDOWN_SECONDS", 900)
+            reason = recent_closed[0]["close_reason"] or ""
+            sl_cooldown = getattr(config, "SL_COOLDOWN_SECONDS", 3600)
+            min_cooldown = getattr(config, "TRADE_COOLDOWN_SECONDS", 1200)
 
             if "STOP_LOSS" in reason and elapsed < sl_cooldown:
-                return False, f"SL Cooldown active ({int((sl_cooldown - elapsed) // 60)}m left)"
+                rem_m = int((sl_cooldown - elapsed) // 60)
+                return False, f"SL Cooldown active ({rem_m}m remaining). Waiting for market stabilization."
             if elapsed < min_cooldown:
-                return False, f"Trade Cooldown active ({int((min_cooldown - elapsed) // 60)}m left)"
+                rem_m = int((min_cooldown - elapsed) // 60)
+                return False, f"Trade Cooldown active ({rem_m}m remaining)."
         except Exception:
             pass
 
     return True, "OK"
 
-def calculate_small_cap_delta_size(equity_usd: float, entry: float, sl: float) -> tuple:
+def calculate_auto_compounding_size(equity_usd: float, entry: float, sl: float) -> tuple:
     risk_per_btc = abs(entry - sl)
     if risk_per_btc <= 0:
         return 0.0, 0, 0.0
 
     lot_size_btc = getattr(config, "DELTA_LOT_SIZE_BTC", 0.001)
-    max_lots = getattr(config, "MAX_LOTS_SMALL_CAP", 3)
-    min_risk = getattr(config, "MIN_RISK_USD", 0.50)
-    max_risk = getattr(config, "MAX_RISK_USD", 1.50)
+    max_lots = getattr(config, "MAX_LOTS_CAP", 5)
+    min_risk = getattr(config, "MIN_RISK_USD", 0.35)
+    max_risk = getattr(config, "MAX_RISK_USD", 1.20)
 
-    target_risk_usd = max(min_risk, min(max_risk, equity_usd * float(config.RISK_PCT)))
-    raw_qty_btc = target_risk_usd / risk_per_btc
+    target_risk = max(min_risk, min(max_risk * (equity_usd / 12.0), equity_usd * float(config.RISK_PCT)))
+    raw_qty_btc = target_risk / risk_per_btc
 
     lots = max(1, min(max_lots, int(round(raw_qty_btc / lot_size_btc))))
     qty_btc = round(lots * lot_size_btc, 4)
@@ -122,9 +138,9 @@ def open_paper_trade(signal: dict, fencing_token: int):
         if act:
             return
 
-        allowed, reason = _check_cooldown_and_daily_limits(conn)
+        allowed, reason = _check_cooldown_and_circuit_breakers(conn)
         if not allowed:
-            log.info("Trade skipped by Risk Gate: %s", reason)
+            log.info("Trade skipped by Circuit Breaker: %s", reason)
             return
 
         entry, sl = float(signal["entry"]), float(signal["sl"])
@@ -138,7 +154,7 @@ def open_paper_trade(signal: dict, fencing_token: int):
             return
 
         equity = get_equity(conn)
-        qty, lots, risk_usd = calculate_small_cap_delta_size(equity, entry, sl)
+        qty, lots, risk_usd = calculate_auto_compounding_size(equity, entry, sl)
         if qty <= 0 or lots <= 0:
             return
 
@@ -146,6 +162,7 @@ def open_paper_trade(signal: dict, fencing_token: int):
         now_str = database.now_iso()
         inr_rate = getattr(config, "USD_INR_RATE", 86.0)
         risk_inr = round(risk_usd * inr_rate, 0)
+        sl_points = round(abs(entry - sl), 1)
 
         conn.execute("""
             INSERT INTO trades (trade_id, signal_key, symbol, direction, setup_name, score, entry_price, stop_price, tp1_price, tp2_price, tp3_price, initial_qty, remaining_qty, stage, opened_at_utc, updated_at_utc)
@@ -159,13 +176,14 @@ def open_paper_trade(signal: dict, fencing_token: int):
 
         if hasattr(notifications, "enqueue_telegram"):
             notifications.enqueue_telegram(
-                f"🚀 *TRADE OPENED ({signal['direction']})*\n"
+                f"🚀 *INSTITUTIONAL TRADE OPENED ({signal['direction']})*\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"• Setup: {signal['setup_name']}\n"
-                f"• Entry: ${entry:,.2f} | SL: ${sl:,.2f}\n"
-                f"• TP1: ${signal['tp1']:,.2f} | TP2: ${signal['tp2']:,.2f}\n"
+                f"• Entry: ${entry:,.2f} | SL: ${sl:,.2f} ({sl_points} pts)\n"
+                f"• TP1: ${signal['tp1']:,.2f} | TP2: ${signal['tp2']:,.2f} | Runner: ${signal['tp3']:,.2f}\n"
                 f"• Delta Size: {lots} Lot ({qty} BTC)\n"
-                f"• Max Risk: ${risk_usd:.2f} (~₹{risk_inr:.0f})"
+                f"• Max Risk: ${risk_usd:.2f} (~₹{risk_inr:.0f})\n"
+                f"• Account Equity: ${equity:.2f} USD"
             )
 
         if config.MODE in ("TESTNET", "LIVE"):
@@ -191,6 +209,7 @@ def manage_positions(current_price: float, fencing_token: int, klines_15m: list 
         sl = float(trade_dict["stop_price"])
         tp1 = float(trade_dict["tp1_price"])
         tp2 = float(trade_dict["tp2_price"])
+        tp3 = float(trade_dict["tp3_price"])
         rem_qty = float(trade_dict["remaining_qty"])
         init_qty = float(trade_dict["initial_qty"])
         tp1_done = bool(trade_dict["tp1_done"])
@@ -218,19 +237,19 @@ def manage_positions(current_price: float, fencing_token: int, klines_15m: list 
             """, (total_realized, fee_usd, close_reason, now_str, now_str, tid))
             conn.commit()
 
-            msg_title = "🛡️ BREAK-EVEN SL HIT" if tp1_done else "🛑 STOP LOSS HIT"
+            msg_title = "🛡️ BREAK-EVEN SL HIT (PROFIT SECURED)" if tp1_done else "🛑 STOP LOSS HIT"
             log.info("%s for %s at $%.2f | Realized PnL: $%+.2f", msg_title, tid, exec_exit, total_realized)
             if hasattr(notifications, "enqueue_telegram"):
                 notifications.enqueue_telegram(
                     f"{msg_title} ({direction})\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"• Exit Price: ${exec_exit:,.2f}\n"
-                    f"• Net Trade PnL: ${total_realized:+.2f} USD\n"
+                    f"• Net PnL: ${total_realized:+.2f} USD\n"
                     f"• Reason: {close_reason}"
                 )
             return
 
-        # 2. TAKE PROFIT 1 HIT (Book 50% & Move SL to Break-Even)
+        # 2. TAKE PROFIT 1 HIT (1.4R -> Book 50% & Move SL to Entry + 25 pts)
         if not tp1_done:
             tp1_hit = (is_long and current_price >= tp1) or (not is_long and current_price <= tp1)
             if tp1_hit:
@@ -240,7 +259,7 @@ def manage_positions(current_price: float, fencing_token: int, klines_15m: list 
                 fee_usd = round((entry + tp1) * booked_qty * float(config.FEE_RATE), 3)
                 booked_pnl = round((gain_pts * booked_qty) - fee_usd, 2)
 
-                be_offset = max(15.0, entry * 0.0012)
+                be_offset = 25.0
                 new_sl = round(entry + be_offset if is_long else entry - be_offset, 2)
 
                 conn.execute("""
@@ -258,35 +277,67 @@ def manage_positions(current_price: float, fencing_token: int, klines_15m: list 
                         f"━━━━━━━━━━━━━━━━━━━━\n"
                         f"• TP1: ${tp1:,.2f}\n"
                         f"• Locked Profit: ${booked_pnl:+.2f} USD\n"
-                        f"• SL Moved to Break-Even: ${new_sl:,.2f}"
+                        f"• SL Trailed to Zero-Risk BE: ${new_sl:,.2f}"
                     )
                 return
 
-        # 3. TAKE PROFIT 2 HIT (Close Remaining Position)
+        # 3. TAKE PROFIT 2 HIT (2.4R -> Book 30% & Trail SL to TP1 level)
         if tp1_done and not tp2_done:
             tp2_hit = (is_long and current_price >= tp2) or (not is_long and current_price <= tp2)
             if tp2_hit:
+                booked_qty = round(init_qty * 0.30, 6)
+                new_rem_qty = max(0.0, round(rem_qty - booked_qty, 6))
                 gain_pts = (tp2 - entry) if is_long else (entry - tp2)
-                fee_usd = round((entry + tp2) * rem_qty * float(config.FEE_RATE), 3)
+                fee_usd = round((entry + tp2) * booked_qty * float(config.FEE_RATE), 3)
+                booked_pnl = round((gain_pts * booked_qty) - fee_usd, 2)
+
+                new_sl = round(tp1, 2)
+
+                conn.execute("""
+                    UPDATE trades
+                    SET tp2_done = 1, remaining_qty = ?, stop_price = ?,
+                        realized_pnl_usd = realized_pnl_usd + ?, total_fee_usd = total_fee_usd + ?, updated_at_utc = ?
+                    WHERE trade_id = ?
+                """, (new_rem_qty, new_sl, booked_pnl, fee_usd, now_str, tid))
+                conn.commit()
+
+                log.info("TP2 Reached for %s! Booked 30%% ($%+.2f), SL trailed to TP1 $%.2f for runner", tid, booked_pnl, new_sl)
+                if hasattr(notifications, "enqueue_telegram"):
+                    notifications.enqueue_telegram(
+                        f"🎯 *TARGET 2 HIT (30% BOOKED)*\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"• TP2: ${tp2:,.2f}\n"
+                        f"• Locked Profit: ${booked_pnl:+.2f} USD\n"
+                        f"• SL Trailed to TP1: ${new_sl:,.2f}\n"
+                        f"• 20% Runner Trailing for Target 3 (${tp3:,.2f})!"
+                    )
+                return
+
+        # 4. RUNNER FULL TARGET (TP3 3.5R -> 100% Exit)
+        if tp1_done and tp2_done:
+            tp3_hit = (is_long and current_price >= tp3) or (not is_long and current_price <= tp3)
+            if tp3_hit:
+                gain_pts = (tp3 - entry) if is_long else (entry - tp3)
+                fee_usd = round((entry + tp3) * rem_qty * float(config.FEE_RATE), 3)
                 final_pnl = round((gain_pts * rem_qty) - fee_usd, 2)
                 total_realized = round(float(trade_dict["realized_pnl_usd"]) + final_pnl, 2)
 
                 conn.execute("""
                     UPDATE trades
-                    SET stage = 'CLOSED', tp2_done = 1, remaining_qty = 0, realized_pnl_usd = ?,
-                        unrealized_pnl_usd = 0, total_fee_usd = total_fee_usd + ?, close_reason = 'TP2_HIT',
+                    SET stage = 'CLOSED', remaining_qty = 0, realized_pnl_usd = ?,
+                        unrealized_pnl_usd = 0, total_fee_usd = total_fee_usd + ?, close_reason = 'TP3_RUNNER_HIT',
                         closed_at_utc = ?, updated_at_utc = ?
                     WHERE trade_id = ?
                 """, (total_realized, fee_usd, now_str, now_str, tid))
                 conn.commit()
 
-                log.info("TP2 Reached for %s! Full position closed with total PnL: $%+.2f", tid, total_realized)
+                log.info("TP3 Runner Reached for %s! Total Trade PnL: $%+.2f", tid, total_realized)
                 if hasattr(notifications, "enqueue_telegram"):
                     notifications.enqueue_telegram(
-                        f"🏁 *TARGET 2 HIT (100% CLOSED)*\n"
+                        f"🏆 *TARGET 3 (RUNNER FULL EXIT)*\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"• Exit: ${tp2:,.2f}\n"
-                        f"• Total Realized PnL: ${total_realized:+.2f} USD"
+                        f"• Final Target: ${tp3:,.2f}\n"
+                        f"• Total Blockbuster PnL: ${total_realized:+.2f} USD"
                     )
                 return
 
