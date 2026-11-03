@@ -100,7 +100,7 @@ def main() -> None:
         '<div class="terminal-header">'
         '<div>'
         '<div style="font-size: 1.05rem; font-weight: 700; font-family: \'JetBrains Mono\', monospace;">BTCUSDT SMC TRADING TERMINAL</div>'
-        '<div style="font-size: 0.75rem; color: #94a3b8; margin-top: 2px;">Stock Learner + Booming Bulls Confluence | Delta Small-Cap</div>'
+        '<div style="font-size: 0.75rem; color: #94a3b8; margin-top: 2px;">Institutional Confluence Engine | Delta Small-Cap</div>'
         '</div>'
         '<div style="background: rgba(16, 185, 129, 0.1); border: 1px solid #10b981; color: #10b981; padding: 4px 10px; border-radius: 6px; font-size: 0.7rem; font-weight: 600; font-family: \'JetBrains Mono\', monospace;">● ENGINE ONLINE</div>'
         '</div>',
@@ -116,6 +116,12 @@ def main() -> None:
 
     spot_price = float(payload.get("price") or 0.0)
     active_session = payload.get("session", "ACTIVE")
+    kz_name = payload.get("killzone_name", "OFF_HOURS")
+    in_kz = payload.get("in_killzone", False)
+    funding = float(payload.get("funding_rate", 0.0001))
+    pdh = payload.get("pdh")
+    pdl = payload.get("pdl")
+
     realized_pnl = float(payload.get("realized_pnl_usd", 0.0))
     realized_inr = realized_pnl * USD_INR
     stats = payload.get("stats", {"wins": 0, "losses": 0, "win_rate": 0.0, "total_r": 0.0})
@@ -129,8 +135,14 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
+    kz_badge = f"<span style='color: #10b981;'>● {kz_name} (ACTIVE)</span>" if in_kz else f"<span style='color: #94a3b8;'>○ {kz_name}</span>"
     st.markdown(
-        f'<div class="metric-card"><div class="metric-label">DEALING SESSION</div><div style="color: #f59e0b; font-size: 1.25rem; font-weight: 700; font-family: \'JetBrains Mono\', monospace;">{active_session}</div></div>',
+        f'<div class="metric-card"><div class="metric-label">DEALING SESSION & KILLZONE</div>'
+        f'<div style="color: #f59e0b; font-size: 1.15rem; font-weight: 700; font-family: \'JetBrains Mono\', monospace;">{active_session} | {kz_badge}</div>'
+        f'<div style="font-size: 0.75rem; color: #94a3b8; margin-top: 4px;">Funding Rate: {funding*100:+.4f}% | PDH: ${pdh:,.0f} | PDL: ${pdl:,.0f}</div></div>' if (pdh and pdl) else
+        f'<div class="metric-card"><div class="metric-label">DEALING SESSION & KILLZONE</div>'
+        f'<div style="color: #f59e0b; font-size: 1.15rem; font-weight: 700; font-family: \'JetBrains Mono\', monospace;">{active_session} | {kz_badge}</div>'
+        f'<div style="font-size: 0.75rem; color: #94a3b8; margin-top: 4px;">Funding Rate: {funding*100:+.4f}%</div></div>',
         unsafe_allow_html=True,
     )
 
@@ -149,24 +161,28 @@ def main() -> None:
 
     if active_trade and active_trade.get("stage") != "CLOSED":
         dir_val = active_trade.get("direction", "LONG")
-        setup_val = active_trade.get("setup_name", "SMC Confluence")
+        setup_val = active_trade.get("setup_name", "Institutional Setup")
         entry_val = float(active_trade.get("entry_price", 0))
         sl_val = float(active_trade.get("stop_price", 0))
         tp_val = float(active_trade.get("tp1_price", 0))
+        tp2_val = float(active_trade.get("tp2_price", 0))
+        tp3_val = float(active_trade.get("tp3_price", 0))
         qty_val = float(active_trade.get("remaining_qty", 0.001))
         lots_val = max(1, int(round(qty_val / 0.001)))
+        sl_pts = abs(entry_val - sl_val)
         active_html = (
             f"<b>ACTIVE {dir_val} ({lots_val} Lot | {setup_val})</b><br>"
-            f"Entry: ${entry_val:,.2f} | SL: ${sl_val:,.2f} | TP1: ${tp_val:,.2f}"
+            f"Entry: ${entry_val:,.2f} | SL: ${sl_val:,.2f} ({sl_pts:.0f} pts)<br>"
+            f"TP1: ${tp_val:,.2f} (50%) | TP2: ${tp2_val:,.2f} (30%) | Runner: ${tp3_val:,.2f} (20%)"
         )
     else:
-        active_html = "No active trade open. Waiting for confirmed closed 15M candle (1H + 15M Liquidity Sweep or EMA20 Pullback)."
+        active_html = "No active trade. Scanner waiting for confirmed Institutional Regime + PDH/PDL Sweep or Traffic-Light Pullback."
 
     st.markdown(
         f'<div class="metric-card">'
         f'<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">'
         f'<span class="metric-label" style="margin-bottom:0;">ACTIVE POSITION STATUS</span>'
-        f'<span style="font-size: 0.65rem; color: #64748b; font-family: \'JetBrains Mono\', monospace;">45m SL Cooldown | 1-3 Lots</span>'
+        f'<span style="font-size: 0.65rem; color: #64748b; font-family: \'JetBrains Mono\', monospace;">3-Tier Runner | Auto-Compounding</span>'
         f'</div>'
         f'<div style="font-size: 0.85rem; color: #cbd5e1; margin-top: 8px; line-height: 1.4;">{active_html}</div>'
         f'</div>',
