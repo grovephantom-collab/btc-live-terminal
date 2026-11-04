@@ -49,44 +49,50 @@ try:
     LEASE_TTL = fenv("LEADER_TTL_SEC", 20, 5)
     MAX_DATA_AGE = fenv("MAX_DATA_AGE_SEC", 90, 10)
 
-    # --- AUTO-COMPOUNDING & SMALL CAPITAL DELTA SETTINGS (Rs 500 - Rs 1000 = ~$6 - $12 USD) ---
+    # --- SMALL CAPITAL DELTA EXCHANGE SIZING (Rs 500 - Rs 1000 = ~$6 - $12 USD) ---
     USD_INR_RATE = fenv("USD_INR_RATE", 86.0, 50.0)
     START_EQUITY = fenv("PAPER_EQUITY_USD", 12.0, 5.0)          # ~$12 USD (~Rs 1,000 capital)
-    RISK_PCT = fenv("RISK_PER_TRADE_PCT", 0.05, 0.005)          # 5% target risk per trade
-    MIN_RISK_USD = fenv("MIN_RISK_USD", 0.35, 0.10)             # Min $0.35 (~Rs 30) risk per trade
-    MAX_RISK_USD = fenv("MAX_RISK_USD", 1.20, 0.25)             # Hard cap $1.20 (~Rs 100) max loss on initial capital
-    DELTA_LOT_SIZE_BTC = fenv("DELTA_LOT_SIZE_BTC", 0.001, 0.0001) # 1 Lot on Delta = 0.001 BTC
-    MAX_LOTS_CAP = ienv("MAX_LOTS_CAP", 5, 1)                   # Scalable up to 5 lots as equity compounds
+    RISK_PCT = fenv("RISK_PER_TRADE_PCT", 0.05, 0.005)          # 5% max risk
+    MIN_RISK_USD = fenv("MIN_RISK_USD", 0.35, 0.10)             # Min $0.35 (~Rs 30) risk
+    MAX_RISK_USD = fenv("MAX_RISK_USD", 0.85, 0.20)             # Hard cap $0.85 (~Rs 73) loss
+    DELTA_LOT_SIZE_BTC = fenv("DELTA_LOT_SIZE_BTC", 0.001, 0.0001) # 1 Lot = 0.001 BTC on Delta
+    MAX_LOTS_CAP = ienv("MAX_LOTS_CAP", 3, 1)                   # Max 1-2 lots
     LEVERAGE = ienv("DEFAULT_LEVERAGE", 25, 1)
 
-    MAX_DAILY_LOSS = fenv("MAX_DAILY_LOSS_USD", 2.50, 0.5)      # Daily stop: -$2.50 (~Rs 215)
-    MAX_DAILY_TRADES = ienv("MAX_DAILY_TRADES", 3, 1)           # Max 3 high-probability setups per day
+    MAX_DAILY_LOSS = fenv("MAX_DAILY_LOSS_USD", 2.20, 0.5)      # Daily stop: -$2.20 (~Rs 190)
+    MAX_DAILY_TRADES = ienv("MAX_DAILY_TRADES", 3, 1)           # Max 3 high-conviction trades per day
     MAX_OPEN_TRADES = ienv("MAX_OPEN_TRADES", 1, 1)
-    MAX_NOTIONAL = fenv("MAX_NOTIONAL_USD", 350.0, 10.0)
+    MAX_NOTIONAL = fenv("MAX_NOTIONAL_USD", 250.0, 10.0)
 
-    # --- ANTI-WHIPSAW, CIRCUIT BREAKERS & SESSIONS ---
-    SL_COOLDOWN_SECONDS = ienv("SL_COOLDOWN_SECONDS", 3600, 300)       # 60 mins wait after SL hit
-    CONSECUTIVE_SL_PAUSE_SEC = ienv("CONSECUTIVE_SL_PAUSE_SEC", 7200, 600) # 2 hours pause after 2 SL hits
-    TRADE_COOLDOWN_SECONDS = ienv("TRADE_COOLDOWN_SECONDS", 1200, 60)   # 20 mins wait after profit exit
+    # --- ANTI-WHIPSAW & CIRCUIT BREAKER RULES ---
+    SL_COOLDOWN_SECONDS = ienv("SL_COOLDOWN_SECONDS", 3600, 300)        # 60 mins wait after SL hit
+    CONSECUTIVE_SL_PAUSE_SEC = ienv("CONSECUTIVE_SL_PAUSE_SEC", 9000, 600) # 2.5 hours pause after 2 SL hits
+    TRADE_COOLDOWN_SECONDS = ienv("TRADE_COOLDOWN_SECONDS", 1200, 60)    # 20 mins wait after profit exit
     
-    # Session Killzone Filter: Only trade London & New York high-volume hours
-    STRICT_KILLZONE_ONLY = os.getenv("STRICT_KILLZONE_ONLY", "true").strip().lower() == "true"
+    # Session Filter: London & New York
+    STRICT_KILLZONE_ONLY = os.getenv("STRICT_KILLZONE_ONLY", "false").strip().lower() == "true"
 
     FEE_RATE = fenv("PAPER_FEE_RATE", 0.0005, 0)
     SLIPPAGE = fenv("PAPER_SLIPPAGE_RATE", 0.0002, 0)
-    MIN_SCORE = fenv("MIN_SIGNAL_SCORE", 85, 0)
+    MIN_SCORE = fenv("MIN_SIGNAL_SCORE", 88, 0)
 
-    # --- STRUCTURAL WIDE STOP LOSS & TARGET BOUNDARIES ---
+    # --- 1-DAY (24-HOUR) STRUCTURAL LOOKBACK & MACRO TREND LOCK ---
+    SWING_LOOKBACK_BARS = ienv("SWING_LOOKBACK_BARS", 96, 20)      # 96 bars = 24 Hours of 15M candles (1 Day)
+    STRICT_TREND_LOCK = os.getenv("STRICT_TREND_LOCK", "true").strip().lower() == "true" # 100% block counter-trend trades
+    ENABLE_DAILY_BREAKOUT = os.getenv("ENABLE_DAILY_BREAKOUT", "true").strip().lower() == "true" # Trade expansion breakouts
+
+    # --- VOLATILITY-NORMALIZED WIDE STOP LOSS BOUNDARIES ---
     MIN_GAP = fenv("MIN_FVG_GAP_USD", 35, 0)
     SWEEP_BUFFER = fenv("SWEEP_BUFFER_USD", 20, 0)
-    SL_BUFFER = fenv("STRUCTURAL_SL_BUFFER_USD", 45, 5)
-    MIN_STOP = fenv("MIN_STOP_DISTANCE_USD", 320, 100)          # Min 320 pts SL (safe against noise wicks)
-    MAX_STOP = fenv("MAX_STOP_DISTANCE_USD", 580, 150)          # Max 580 pts SL
-    MIN_ADX_TREND = fenv("MIN_ADX_TREND", 21.0, 10.0)
+    SL_BUFFER = fenv("STRUCTURAL_SL_BUFFER_USD", 50, 5)         # 50 pts buffer beyond swing anchor
+    MIN_STOP = fenv("MIN_STOP_DISTANCE_USD", 380, 150)          # Hard floor 380 pts (anti-noise)
+    MAX_STOP = fenv("MAX_STOP_DISTANCE_USD", 620, 200)          # Hard ceiling 620 pts
+    MIN_ADX_TREND = fenv("MIN_ADX_TREND", 22.0, 10.0)           # ADX >= 22 for trend continuation
+    MAX_CHOP_BANDWIDTH = fenv("MAX_CHOP_BANDWIDTH", 0.018, 0.005)
 
-    # Funding Rate Filter Thresholds
-    MAX_FUNDING_FOR_LONG = fenv("MAX_FUNDING_FOR_LONG", 0.00035, 0.0)   # Block Long if funding > +0.035%
-    MIN_FUNDING_FOR_SHORT = fenv("MIN_FUNDING_FOR_SHORT", -0.00020, -1.0) # Block Short if funding < -0.020%
+    # Funding Rate Filter
+    MAX_FUNDING_FOR_LONG = fenv("MAX_FUNDING_FOR_LONG", 0.00035, 0.0)
+    MIN_FUNDING_FOR_SHORT = fenv("MIN_FUNDING_FOR_SHORT", -0.00020, -1.0)
 
     TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
