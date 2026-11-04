@@ -5,13 +5,15 @@ import config
 
 log = logging.getLogger("DataEngine")
 HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "Mozilla/5.0 ProSMC/3.0"})
+HTTP.headers.update({"User-Agent": "Mozilla/5.0 QuantTerminal/4.0"})
 
 MARKET: Dict[str, Any] = {
     "price": None, "price_ts": 0, "klines": {}, "klines_ts": 0,
     "session": "INITIALIZING", "in_killzone": False, "killzone_name": "OFF_HOURS",
     "poc": None, "funding_rate": 0.0001,
-    "pdh": None, "pdl": None, "asian_high": None, "asian_low": None,
+    "pdh": None, "pdl": None, "daily_open": None,
+    "day_high_24h": None, "day_low_24h": None,
+    "asian_high": None, "asian_low": None,
     "news_blackout": False, "error": None
 }
 
@@ -101,10 +103,11 @@ def fetch_price() -> Optional[float]:
 
     return None
 
-def fetch_klines(interval: str, limit: int = 100) -> List[Dict[str, float]]:
+def fetch_klines(interval: str, limit: int = 120) -> List[Dict[str, float]]:
     gran_map = {"15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
     gran = gran_map.get(interval, 900)
     
+    # Try Coinbase first
     try:
         url = f"https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity={gran}"
         r = HTTP.get(url, timeout=config.HTTP_TIMEOUT)
@@ -125,6 +128,7 @@ def fetch_klines(interval: str, limit: int = 100) -> List[Dict[str, float]]:
     except Exception:
         pass
 
+    # Fallback to Binance
     binance_intervals = {"15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
     b_interval = binance_intervals.get(interval, "15m")
     try:
@@ -163,8 +167,22 @@ def fetch_klines(interval: str, limit: int = 100) -> List[Dict[str, float]]:
 def extract_pdh_pdl(daily_candles: list) -> tuple:
     if len(daily_candles) >= 2:
         prev_day = daily_candles[-2]
-        return float(prev_day["high"]), float(prev_day["low"])
-    return None, None
+        today_open = float(daily_candles[-1].get("open", daily_candles[-2]["close"]))
+        return float(prev_day["high"]), float(prev_day["low"]), today_open
+    elif len(daily_candles) == 1:
+        return float(daily_candles[0]["high"]), float(daily_candles[0]["low"]), float(daily_candles[0]["open"])
+    return None, None, None
+
+def extract_24h_levels(candles_15m: list) -> tuple:
+    """Computes rolling 24-hour High, Low, and Open from 96 candles of 15m."""
+    bars_24h = candles_15m[-96:] if len(candles_15m) >= 96 else candles_15m
+    if bars_24h:
+        h24 = max(c["high"] for c in bars_24h)
+        l24 = min(c["low"] for c in bars_24h)
+        vol24 = sum(c.get("vol", 0.0) for c in bars_24h)
+        open24 = float(bars_24h[0]["open"])
+        return h24, l24, vol24, open24
+    return None, None, 0.0, None
 
 def extract_asian_range(candles_15m: list) -> tuple:
     now_dt = datetime.now(timezone.utc)
@@ -215,18 +233,21 @@ def refresh_market_data(lock) -> bool:
 
         ks = {}
         for k in ("15m", "1h", "4h", "1d"):
-            bars = fetch_klines(k, 100)
+            bars = fetch_klines(k, 120)
             if len(bars) < 5:
                 if "15m" in ks and len(ks["15m"]) >= 10:
                     bars = ks["15m"]
                 else:
-                    bars = fetch_klines(k, 100)
+                    bars = fetch_klines(k, 120)
             ks[k] = bars
             time.sleep(0.02)
 
-        pdh, pdl = extract_pdh_pdl(ks.get("1d", []))
+        pdh, pdl, d_open = extract_pdh_pdl(ks.get("1d", []))
+        h24, l24, vol24, open24 = extract_24h_levels(ks.get("15m", []))
+        if d_open is None:
+            d_open = open24
         arh, arl = extract_asian_range(ks.get("15m", []))
-        poc = approx_poc(ks.get("15m", [])[-60:])
+        poc = approx_poc(ks.get("15m", [])[-96:])
 
         with lock:
             MARKET.update(
@@ -235,6 +256,9 @@ def refresh_market_data(lock) -> bool:
                 poc=poc,
                 pdh=pdh,
                 pdl=pdl,
+                daily_open=d_open,
+                day_high_24h=h24,
+                day_low_24h=l24,
                 asian_high=arh,
                 asian_low=arl,
                 error=None
