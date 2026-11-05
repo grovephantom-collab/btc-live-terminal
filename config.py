@@ -80,6 +80,8 @@ try:
     SWING_LOOKBACK_BARS = ienv("SWING_LOOKBACK_BARS", 96, 20)      # 96 bars = 24 Hours of 15M candles (1 Day)
     STRICT_TREND_LOCK = os.getenv("STRICT_TREND_LOCK", "true").strip().lower() == "true" # 100% block counter-trend trades
     ENABLE_DAILY_BREAKOUT = os.getenv("ENABLE_DAILY_BREAKOUT", "true").strip().lower() == "true" # Trade expansion breakouts
+    ENABLE_CHOCH_STRATEGY = os.getenv("ENABLE_CHOCH_STRATEGY", "true").strip().lower() == "true" # Trade structural trend shifts
+    MIN_HEADROOM_RATIO = fenv("MIN_HEADROOM_RATIO", 1.25, 1.0)     # Minimum distance to nearest major resistance/support
 
     # --- VOLATILITY-NORMALIZED WIDE STOP LOSS BOUNDARIES ---
     MIN_GAP = fenv("MIN_FVG_GAP_USD", 35, 0)
