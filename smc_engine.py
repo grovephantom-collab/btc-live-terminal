@@ -97,7 +97,8 @@ def get_structure(market_dict: dict) -> dict:
     """
     Computes:
     - 1-Day (24-Hour / 96-bar) Swing Extremes & Daily Liquidity Pools (PDH, PDL, 24h High/Low)
-    - Macro Multi-Timeframe Trend Consensus (1H EMA50/200 + Daily Open + 15M EMA200)
+    - CHoCH (Change of Character) Structural Shift Detection
+    - Multi-Timeframe Macro Trend Consensus (1H EMA50/200 + Daily Open + 15M EMA200)
     - Anti-Whipsaw Regime Classifier (ADX + Bollinger Bandwidth)
     """
     klines = market_dict.get("klines", {})
@@ -144,6 +145,26 @@ def get_structure(market_dict: dict) -> dict:
     asian_high = market_dict.get("asian_high")
     asian_low = market_dict.get("asian_low")
 
+    # ==========================================================================
+    # CHoCH (CHANGE OF CHARACTER) STRUCTURAL SHIFT DETECTION
+    # ==========================================================================
+    choch_status = "NONE"
+    choch_level = None
+
+    if len(highs) >= 15:
+        # 1. Bearish CHoCH: Closing below the 1-hour consolidation floor of the last 4-5 candles
+        consolidation_floor = min(lows[-5:-1])
+        if (cur_close < consolidation_floor) and (closes[-1] < closes[-2]):
+            choch_status = "BEARISH_CHOCH"
+            choch_level = consolidation_floor
+
+        # 2. Bullish CHoCH: Closing above the 1-hour consolidation ceiling of the last 4-5 candles
+        elif choch_status == "NONE":
+            consolidation_ceiling = max(highs[-5:-1])
+            if (cur_close > consolidation_ceiling) and (closes[-1] > closes[-2]):
+                choch_status = "BULLISH_CHOCH"
+                choch_level = consolidation_ceiling
+
     # Multi-Timeframe Macro Trend Consensus (1H + 15M + Daily Open)
     bull_score = 0
     bear_score = 0
@@ -177,7 +198,12 @@ def get_structure(market_dict: dict) -> dict:
         else:
             bear_score += 2
 
-    if bull_score >= 4:
+    # Dynamic CHoCH Overrides: A confirmed structural break takes immediate priority!
+    if choch_status == "BEARISH_CHOCH":
+        macro_bias = "BEARISH"
+    elif choch_status == "BULLISH_CHOCH":
+        macro_bias = "BULLISH"
+    elif bull_score >= 4:
         macro_bias = "BULLISH"
     elif bear_score >= 4:
         macro_bias = "BEARISH"
@@ -214,6 +240,8 @@ def get_structure(market_dict: dict) -> dict:
         "bb_bandwidth": bb_bandwidth,
         "vol_sma20": vol_sma20,
         "atr": atr_15m,
+        "choch_status": choch_status,
+        "choch_level": choch_level,
         "macro_bias": macro_bias,
         "htf_bias": macro_bias,
         "is_choppy": is_choppy,
@@ -262,11 +290,11 @@ def _build_trade_levels(direction: str, entry: float, raw_sl: float, atr: float,
 
 def evaluate_signal(structure: dict, candles_15m: list, current_price: float, session: str, poc: float) -> dict:
     """
-    Institutional 1-Day Confluence Execution Engine:
-    1. STRICT TREND LOCK: Zero counter-trend shorts when 1D/1H is Bullish; zero counter-trend longs when Bearish.
-    2. INSTITUTIONAL DAILY BREAKOUT: If price blasts above PDH with strong body and volume in a Bull Trend, ride the LONG expansion!
-    3. 1-DAY (24-HOUR) LIQUIDITY SWEEP: True rejection wicks (>= 38%) at verified 24h/PDH/PDL levels.
-    4. 24-HOUR TREND CONTINUATION PULLBACK: Active only when ADX >= 22 in non-choppy regime.
+    Institutional Confluence Execution Engine:
+    1. CHoCH STRUCTURAL BREAKDOWN / BREAKOUT: Catches massive trend reversals at the inception of liquidation drops.
+    2. INSTITUTIONAL DAILY EXPANSION BREAKOUT: Rides multi-day breakouts when PDH/PDL are shattered with momentum.
+    3. SUPPLY / RESISTANCE HEADROOM FILTER: Forbids longing directly into overhead resistance walls.
+    4. 1-DAY LIQUIDITY SWEEPS & TRAFFIC-LIGHT PULLBACKS.
     """
     if len(candles_15m) < 35 or not structure:
         return None
@@ -301,8 +329,8 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
     pdl = structure.get("pdl")
     day_high_24h = structure.get("day_high_24h")
     day_low_24h = structure.get("day_low_24h")
-    asian_high = structure.get("asian_high")
-    asian_low = structure.get("asian_low")
+    asian_high = market_dict_high = structure.get("asian_high")
+    asian_low = market_dict_low = structure.get("asian_low")
 
     ema9 = structure["ema9"]
     ema20 = structure["ema20"]
@@ -310,6 +338,8 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
     ema200 = structure["ema200"]
     rsi = structure["rsi"]
     vol_sma20 = structure.get("vol_sma20", 1.0)
+    choch_status = structure.get("choch_status", "NONE")
+    choch_level = structure.get("choch_level")
 
     if current_price and abs(current_price - cl) > (atr * 0.85):
         return None
@@ -325,8 +355,49 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
     highest_recent = max(x[1] for x in recent_closed)
 
     # ==========================================================================
+    # STRATEGY 0: INSTITUTIONAL CHoCH STRUCTURAL BREAKDOWN / BREAKOUT (MEGA REVERSALS)
+    # Catches the exact trend reversal point (like the $80,000 drop down to $75,500)
+    # ==========================================================================
+    enable_choch = getattr(config, "ENABLE_CHOCH_STRATEGY", True)
+    if enable_choch and choch_status != "NONE" and choch_level:
+        # Bearish CHoCH: Market lost consolidation floor with heavy momentum
+        if choch_status == "BEARISH_CHOCH" and funding >= min_short_funding:
+            bearish_breakdown_bar = (cl < o) and (cl < choch_level)
+            vol_expansion = vol >= vol_sma20 * 1.01
+            rsi_bearish = rsi <= 58.0
+            
+            if bearish_breakdown_bar and vol_expansion and rsi_bearish:
+                sl_anchor = max(highest_recent, choch_level + 40.0)
+                return _build_trade_levels(
+                    direction="SHORT",
+                    entry=current_price or cl,
+                    raw_sl=sl_anchor,
+                    atr=atr,
+                    setup_name="Institutional CHoCH Structural Breakdown",
+                    score=99.0,
+                    candle_time=c_time
+                )
+
+        # Bullish CHoCH: Market broke above consolidation ceiling with heavy momentum
+        if choch_status == "BULLISH_CHOCH" and funding <= max_long_funding:
+            bullish_breakout_bar = (cl > o) and (cl > choch_level)
+            vol_expansion = vol >= vol_sma20 * 1.01
+            rsi_bullish = rsi >= 42.0
+            
+            if bullish_breakout_bar and vol_expansion and rsi_bullish:
+                sl_anchor = min(lowest_recent, choch_level - 40.0)
+                return _build_trade_levels(
+                    direction="LONG",
+                    entry=current_price or cl,
+                    raw_sl=sl_anchor,
+                    atr=atr,
+                    setup_name="Institutional CHoCH Structural Breakout",
+                    score=99.0,
+                    candle_time=c_time
+                )
+
+    # ==========================================================================
     # STRATEGY 1: INSTITUTIONAL DAILY EXPANSION BREAKOUT (RIDE THE MOMENTUM)
-    # When price punches through PDH in a Bull Trend, NEVER short it! Ride the LONG!
     # ==========================================================================
     enable_breakout = getattr(config, "ENABLE_DAILY_BREAKOUT", True)
     if enable_breakout and not is_choppy:
@@ -372,10 +443,8 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
 
     # ==========================================================================
     # STRATEGY 2: INSTITUTIONAL 1-DAY (PDH/PDL / 24H) LIQUIDITY TRAP REVERSAL
-    # STRICT: Never take counter-trend sweep against Macro Bullish or Bearish Bias!
     # ==========================================================================
     daily_low_target = pdl or day_low_24h or asian_low
-    # Long sweep only allowed if Macro Bias is NOT Bearish
     allow_long_sweep = (macro_bias != "BEARISH") if strict_trend_lock else True
     if daily_low_target and allow_long_sweep and funding <= max_long_funding:
         swept_daily_low = (lowest_recent <= daily_low_target - 15.0) and (cl > daily_low_target)
@@ -392,7 +461,6 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
             )
 
     daily_high_target = pdh or day_high_24h or asian_high
-    # Short sweep allowed ONLY if Macro Bias is NOT Bullish! (Prevents suicidal shorts during bull rallies!)
     allow_short_sweep = (macro_bias != "BULLISH") if strict_trend_lock else True
     if daily_high_target and allow_short_sweep and funding >= min_short_funding:
         swept_daily_high = (highest_recent >= daily_high_target + 15.0) and (cl < daily_high_target)
@@ -440,41 +508,66 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
             )
 
     # ==========================================================================
-    # STRATEGY 4: TRAFFIC-LIGHT TREND CONTINUATION PULLBACK
-    # CRITICAL: 100% DISABLED DURING SIDEWAYS CHOP OR WHEN ADX < 22!
+    # STRATEGY 4: TRAFFIC-LIGHT TREND CONTINUATION PULLBACK (WITH HEADROOM FILTER)
     # ==========================================================================
     min_adx = getattr(config, "MIN_ADX_TREND", 22.0)
     if not is_choppy and adx >= min_adx:
+        entry_candidate = current_price or cl
+
         # Bullish Pullback: Macro Bullish + Price > 9 > 20 > 50 > 200 EMA
         trend_bullish = (macro_bias == "BULLISH") and (cl > ema200) and (ema9 > ema20 > ema50 > ema200)
         touched_bull_zone = (l <= ema20 * 1.0015) and (cl >= ema20 * 0.999)
         strong_bull_candle = (cl > o) and (body_ratio >= 0.50) and (upper_wick_ratio <= 0.25) and (cl > prev_h)
+
         if trend_bullish and touched_bull_zone and strong_bull_candle and (48.0 <= rsi <= 68.0) and (funding <= max_long_funding):
+            # Check headroom to nearest overhead resistance ceiling
+            overhead_res = [x for x in [pdh, day_high_24h, sh] if x and x > entry_candidate]
+            nearest_resistance = min(overhead_res) if overhead_res else 999999.0
+            headroom = nearest_resistance - entry_candidate
             pullback_low = min(l, prev_l)
-            return _build_trade_levels(
-                direction="LONG",
-                entry=current_price or cl,
-                raw_sl=pullback_low,
-                atr=atr,
-                setup_name="Traffic-Light EMA Trend Pullback",
-                score=91.0,
-                candle_time=c_time
-            )
+            est_sl_dist = max(getattr(config, "MIN_STOP", 380.0), (entry_candidate - pullback_low) + 50.0)
+
+            # Skip if resistance is too close to allow 1.20R profit run!
+            if headroom >= (est_sl_dist * 1.20):
+                return _build_trade_levels(
+                    direction="LONG",
+                    entry=entry_candidate,
+                    raw_sl=pullback_low,
+                    atr=atr,
+                    setup_name="Traffic-Light EMA Trend Pullback",
+                    score=91.0,
+                    candle_time=c_time
+                )
+            else:
+                log.info("Long Pullback skipped: Overhead resistance at $%.1f is too close (Headroom: %.0f < Required: %.0f pts)",
+                         nearest_resistance, headroom, est_sl_dist * 1.20)
 
         # Bearish Pullback: Macro Bearish + Price < 9 < 20 < 50 < 200 EMA
         trend_bearish = (macro_bias == "BEARISH") and (cl < ema200) and (ema9 < ema20 < ema50 < ema200)
         touched_bear_zone = (h >= ema20 * 0.9985) and (cl <= ema20 * 1.001)
         strong_bear_candle = (cl < o) and (body_ratio >= 0.50) and (lower_wick_ratio <= 0.25) and (cl < prev_l)
+
         if trend_bearish and touched_bear_zone and strong_bear_candle and (32.0 <= rsi <= 52.0) and (funding >= min_short_funding):
+            # Check headroom to nearest underlying support floor
+            underlying_sup = [x for x in [pdl, day_low_24h, sl] if x and x < entry_candidate]
+            nearest_support = max(underlying_sup) if underlying_sup else 0.0
+            headroom = entry_candidate - nearest_support
             pullback_high = max(h, prev_h)
-            return _build_trade_levels(
-                direction="SHORT",
-                entry=current_price or cl,
-                raw_sl=pullback_high,
-                atr=atr,
-                setup_name="Traffic-Light EMA Trend Pullback",
-                score=91.0,
-                candle_time=c_time
-            )
+            est_sl_dist = max(getattr(config, "MIN_STOP", 380.0), (pullback_high - entry_candidate) + 50.0)
+
+            # Skip if support is too close
+            if headroom >= (est_sl_dist * 1.20):
+                return _build_trade_levels(
+                    direction="SHORT",
+                    entry=entry_candidate,
+                    raw_sl=pullback_high,
+                    atr=atr,
+                    setup_name="Traffic-Light EMA Trend Pullback",
+                    score=91.0,
+                    candle_time=c_time
+                )
+            else:
+                log.info("Short Pullback skipped: Underlying support at $%.1f is too close (Headroom: %.0f < Required: %.0f pts)",
+                         nearest_support, headroom, est_sl_dist * 1.20)
 
     return None
