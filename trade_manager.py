@@ -58,39 +58,41 @@ def get_equity(conn) -> float:
 
 def _check_cooldown_and_circuit_breakers(conn) -> tuple:
     now_dt = datetime.now(timezone.utc)
-    today_prefix = now_dt.date().isoformat()
+    today_start = now_dt.strftime("%Y-%m-%d 00:00:00")
 
-    daily_rows = conn.execute(
-        "SELECT realized_pnl_usd, stage, close_reason FROM trades WHERE opened_at_utc LIKE ?",
-        (f"{today_prefix}%",)
-    ).fetchall()
-    
-    if len(daily_rows) >= getattr(config, "MAX_DAILY_TRADES", 3):
-        return False, "Max daily trades (3) reached. Capital preserved."
+    # 1. Daily Max Trades Cap (max 3 trades per day)
+    cnt = conn.execute(
+        "SELECT COUNT(*) as c FROM trades WHERE opened_at_utc >= ?", (today_start,)
+    ).fetchone()["c"]
+    if cnt >= config.MAX_DAILY_TRADES:
+        return False, f"Daily limit reached ({cnt}/{config.MAX_DAILY_TRADES} trades)."
 
-    daily_pnl = sum(float(r["realized_pnl_usd"] or 0.0) for r in daily_rows)
-    max_daily_loss = getattr(config, "MAX_DAILY_LOSS", 2.50)
-    if daily_pnl <= -abs(max_daily_loss):
-        return False, f"Daily Loss Limit hit (${daily_pnl:.2f}). Trading paused for today."
+    # 2. Daily Loss Limit (Circuit Breaker: -$2.20 USD = ~Rs 190)
+    day_pnl = float(conn.execute(
+        "SELECT COALESCE(SUM(realized_pnl_usd), 0.0) as s FROM trades WHERE closed_at_utc >= ?", (today_start,)
+    ).fetchone()["s"] or 0.0)
+    if day_pnl <= -abs(config.MAX_DAILY_LOSS):
+        return False, f"Daily Circuit Breaker Triggered: Net loss ${day_pnl:.2f} <= -${config.MAX_DAILY_LOSS:.2f}."
 
+    # 3. Two Consecutive SL Protection (Auto Pause for 2.5 hours)
     recent_closed = conn.execute(
         "SELECT close_reason, closed_at_utc FROM trades WHERE stage = 'CLOSED' AND closed_at_utc IS NOT NULL ORDER BY id DESC LIMIT 2"
     ).fetchall()
 
-    # 2 Consecutive SL Hits -> 2 Hours Mandatory Trading Pause
     if len(recent_closed) >= 2:
         reasons = [r["close_reason"] or "" for r in recent_closed]
         if all("STOP_LOSS" in r for r in reasons):
             try:
                 last_dt = datetime.fromisoformat(recent_closed[0]["closed_at_utc"])
                 elapsed_pause = (now_dt - last_dt).total_seconds()
-                pause_limit = getattr(config, "CONSECUTIVE_SL_PAUSE_SEC", 7200)
+                pause_limit = getattr(config, "CONSECUTIVE_SL_PAUSE_SEC", 9000) # 2.5 hours
                 if elapsed_pause < pause_limit:
                     rem_m = int((pause_limit - elapsed_pause) // 60)
-                    return False, f"Circuit Breaker: 2 Consecutive SLs hit -> Paused for {rem_m}m to avoid chop."
+                    return False, f"Circuit Breaker Active: 2 Consecutive SLs hit -> Paused for {rem_m}m to protect account."
             except Exception:
                 pass
 
+    # 4. Post-SL Cooldown: 60 mins wait
     if recent_closed and recent_closed[0]["closed_at_utc"]:
         try:
             closed_dt = datetime.fromisoformat(recent_closed[0]["closed_at_utc"])
@@ -110,19 +112,26 @@ def _check_cooldown_and_circuit_breakers(conn) -> tuple:
 
     return True, "OK"
 
-def calculate_auto_compounding_size(equity_usd: float, entry: float, sl: float) -> tuple:
+def calculate_small_cap_delta_size(equity_usd: float, entry: float, sl: float) -> tuple:
+    """
+    Auto-Compounding Position Sizing tailored for Rs 500 - Rs 1,000 on Delta Exchange:
+    - 1 Lot = 0.001 BTC
+    - Risk per trade capped between $0.35 (~Rs 30) and $0.85 (~Rs 73)
+    - Returns (qty_btc, lots, actual_risk_usd)
+    """
     risk_per_btc = abs(entry - sl)
     if risk_per_btc <= 0:
         return 0.0, 0, 0.0
 
     lot_size_btc = getattr(config, "DELTA_LOT_SIZE_BTC", 0.001)
-    max_lots = getattr(config, "MAX_LOTS_CAP", 5)
+    max_lots = getattr(config, "MAX_LOTS_CAP", 3)
     min_risk = getattr(config, "MIN_RISK_USD", 0.35)
-    max_risk = getattr(config, "MAX_RISK_USD", 1.20)
+    max_risk = getattr(config, "MAX_RISK_USD", 0.85)
 
     target_risk = max(min_risk, min(max_risk * (equity_usd / 12.0), equity_usd * float(config.RISK_PCT)))
     raw_qty_btc = target_risk / risk_per_btc
 
+    # Convert to integer Delta lots (minimum 1 lot, max 2 lots for Rs 500-1000 account)
     lots = max(1, min(max_lots, int(round(raw_qty_btc / lot_size_btc))))
     qty_btc = round(lots * lot_size_btc, 4)
     actual_risk_usd = round(qty_btc * risk_per_btc, 2)
@@ -154,7 +163,7 @@ def open_paper_trade(signal: dict, fencing_token: int):
             return
 
         equity = get_equity(conn)
-        qty, lots, risk_usd = calculate_auto_compounding_size(equity, entry, sl)
+        qty, lots, risk_usd = calculate_small_cap_delta_size(equity, entry, sl)
         if qty <= 0 or lots <= 0:
             return
 
@@ -176,7 +185,7 @@ def open_paper_trade(signal: dict, fencing_token: int):
 
         if hasattr(notifications, "enqueue_telegram"):
             notifications.enqueue_telegram(
-                f"🚀 *INSTITUTIONAL TRADE OPENED ({signal['direction']})*\n"
+                f"🚀 *HIGH-CONVICTION TRADE OPENED ({signal['direction']})*\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"• Setup: {signal['setup_name']}\n"
                 f"• Entry: ${entry:,.2f} | SL: ${sl:,.2f} ({sl_points} pts)\n"
@@ -193,6 +202,14 @@ def open_paper_trade(signal: dict, fencing_token: int):
         conn.close()
 
 def manage_positions(current_price: float, fencing_token: int, klines_15m: list = None, current_atr: float = None):
+    """
+    Active Trade Manager:
+    - Guaranteed Stop Loss execution
+    - Early Structural Invalidation (CHoCH / Stale Drift Early Cut)
+    - TP1 (1.4R): Books 50% & moves SL to Break-Even + 25 points (Guaranteed Zero-Risk!)
+    - TP2 (2.4R): Books 30% & trails SL to TP1 level
+    - TP3 (3.5R): Full exit
+    """
     if not current_price or current_price <= 0:
         return
     conn = database.db()
@@ -219,7 +236,7 @@ def manage_positions(current_price: float, fencing_token: int, klines_15m: list 
 
         is_long = direction == "LONG"
 
-        # 1. STOP LOSS HIT CHECK
+        # 1. STOP LOSS HIT CHECK (OR BREAK-EVEN EXIT)
         sl_hit = (is_long and current_price <= sl) or (not is_long and current_price >= sl)
         if sl_hit:
             exec_exit = sl if config.MODE == "PAPER" else current_price
@@ -249,6 +266,46 @@ def manage_positions(current_price: float, fencing_token: int, klines_15m: list 
                 )
             return
 
+        # 1.5 EARLY STRUCTURAL INVALIDATION EXIT (STALE TRADE & MOMENTUM DECAY)
+        # If in trade for > 4 hours without reaching TP1, and price is drifting against us
+        if not tp1_done and trade_dict.get("opened_at_utc"):
+            try:
+                open_dt = datetime.fromisoformat(trade_dict["opened_at_utc"])
+                now_dt = datetime.fromisoformat(now_str)
+                elapsed_sec = (now_dt - open_dt).total_seconds()
+                atr_val = current_atr or 220.0
+                adverse_dist = (entry - current_price) if is_long else (current_price - entry)
+                
+                # If trade is stale (> 4 hours) and adverse movement exceeds 0.6 ATR, cut early
+                if elapsed_sec >= 14400 and adverse_dist >= (atr_val * 0.60):
+                    exec_exit = current_price
+                    price_diff = (exec_exit - entry) if is_long else (entry - exec_exit)
+                    fee_usd = round((entry + exec_exit) * rem_qty * float(config.FEE_RATE), 3)
+                    leg_pnl = round((price_diff * rem_qty) - fee_usd, 2)
+                    total_realized = round(float(trade_dict["realized_pnl_usd"]) + leg_pnl, 2)
+                    close_reason = "STRUCTURAL_INVALIDATION_EXIT"
+
+                    conn.execute("""
+                        UPDATE trades
+                        SET stage = 'CLOSED', remaining_qty = 0, realized_pnl_usd = ?, unrealized_pnl_usd = 0,
+                            total_fee_usd = total_fee_usd + ?, close_reason = ?, closed_at_utc = ?, updated_at_utc = ?
+                        WHERE trade_id = ?
+                    """, (total_realized, fee_usd, close_reason, now_str, now_str, tid))
+                    conn.commit()
+
+                    log.info("Early Structural Cut for %s at $%.2f | Realized PnL: $%+.2f", tid, exec_exit, total_realized)
+                    if hasattr(notifications, "enqueue_telegram"):
+                        notifications.enqueue_telegram(
+                            f"⚠️ *EARLY STRUCTURAL EXIT ({direction})*\n"
+                            f"━━━━━━━━━━━━━━━━━━━━\n"
+                            f"• Exit Price: ${exec_exit:,.2f}\n"
+                            f"• Net PnL: ${total_realized:+.2f} USD\n"
+                            f"• Reason: Momentum stalled for >4 hours; exited early to avoid full SL."
+                        )
+                    return
+            except Exception:
+                pass
+
         # 2. TAKE PROFIT 1 HIT (1.4R -> Book 50% & Move SL to Entry + 25 pts)
         if not tp1_done:
             tp1_hit = (is_long and current_price >= tp1) or (not is_long and current_price <= tp1)
@@ -259,6 +316,7 @@ def manage_positions(current_price: float, fencing_token: int, klines_15m: list 
                 fee_usd = round((entry + tp1) * booked_qty * float(config.FEE_RATE), 3)
                 booked_pnl = round((gain_pts * booked_qty) - fee_usd, 2)
 
+                # Move SL to Entry + 25 points (Long) or Entry - 25 points (Short)
                 be_offset = 25.0
                 new_sl = round(entry + be_offset if is_long else entry - be_offset, 2)
 
