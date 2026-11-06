@@ -152,13 +152,13 @@ def get_structure(market_dict: dict) -> dict:
     choch_level = None
 
     if len(highs) >= 15:
-        # 1. Bearish CHoCH: Closing below the 1-hour consolidation floor of the last 4-5 candles
+        # 1. Bearish CHoCH: Closing below the consolidation floor of the last 5 candles
         consolidation_floor = min(lows[-5:-1])
         if (cur_close < consolidation_floor) and (closes[-1] < closes[-2]):
             choch_status = "BEARISH_CHOCH"
             choch_level = consolidation_floor
 
-        # 2. Bullish CHoCH: Closing above the 1-hour consolidation ceiling of the last 4-5 candles
+        # 2. Bullish CHoCH: Closing above the consolidation ceiling of the last 5 candles
         elif choch_status == "NONE":
             consolidation_ceiling = max(highs[-5:-1])
             if (cur_close > consolidation_ceiling) and (closes[-1] > closes[-2]):
@@ -291,7 +291,7 @@ def _build_trade_levels(direction: str, entry: float, raw_sl: float, atr: float,
 def evaluate_signal(structure: dict, candles_15m: list, current_price: float, session: str, poc: float) -> dict:
     """
     Institutional Confluence Execution Engine:
-    1. CHoCH STRUCTURAL BREAKDOWN / BREAKOUT: Catches massive trend reversals at the inception of liquidation drops.
+    1. CHoCH STRUCTURAL BREAKDOWN / BREAKOUT: Catches genuine trend reversals (Strict ADX >= 22 + Anti-Chop).
     2. INSTITUTIONAL DAILY EXPANSION BREAKOUT: Rides multi-day breakouts when PDH/PDL are shattered with momentum.
     3. SUPPLY / RESISTANCE HEADROOM FILTER: Forbids longing directly into overhead resistance walls.
     4. 1-DAY LIQUIDITY SWEEPS & TRAFFIC-LIGHT PULLBACKS.
@@ -356,15 +356,21 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
 
     # ==========================================================================
     # STRATEGY 0: INSTITUTIONAL CHoCH STRUCTURAL BREAKDOWN / BREAKOUT (MEGA REVERSALS)
-    # Catches the exact trend reversal point (like the $80,000 drop down to $75,500)
+    # STRICT ANTI-CHOP: CHoCH is strictly disabled during sideways chop (ADX < 22)!
+    # Prevents taking false whipsaw trades inside tight $500 consolidation boxes.
     # ==========================================================================
-    enable_choch = getattr(config, "ENABLE_CHOCH_STRATEGY", True)
+    min_adx = getattr(config, "MIN_ADX_TREND", 22.0)
+    enable_choch = getattr(config, "ENABLE_CHOCH_STRATEGY", True) and (not is_choppy) and (adx >= min_adx)
+
     if enable_choch and choch_status != "NONE" and choch_level:
-        # Bearish CHoCH: Market lost consolidation floor with heavy momentum
-        if choch_status == "BEARISH_CHOCH" and funding >= min_short_funding:
+        range_span = max(1.0, sh - sl)
+        rel_pos = (cl - sl) / range_span
+
+        # Bearish CHoCH: Don't short if price is already dumped into the bottom 20% of range
+        if choch_status == "BEARISH_CHOCH" and funding >= min_short_funding and rel_pos >= 0.20:
             bearish_breakdown_bar = (cl < o) and (cl < choch_level)
-            vol_expansion = vol >= vol_sma20 * 1.01
-            rsi_bearish = rsi <= 58.0
+            vol_expansion = vol >= vol_sma20 * 1.02
+            rsi_bearish = rsi <= 56.0
             
             if bearish_breakdown_bar and vol_expansion and rsi_bearish:
                 sl_anchor = max(highest_recent, choch_level + 40.0)
@@ -378,11 +384,11 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
                     candle_time=c_time
                 )
 
-        # Bullish CHoCH: Market broke above consolidation ceiling with heavy momentum
-        if choch_status == "BULLISH_CHOCH" and funding <= max_long_funding:
+        # Bullish CHoCH: Don't long if price is already pumped into the top 20% of range
+        if choch_status == "BULLISH_CHOCH" and funding <= max_long_funding and rel_pos <= 0.80:
             bullish_breakout_bar = (cl > o) and (cl > choch_level)
-            vol_expansion = vol >= vol_sma20 * 1.01
-            rsi_bullish = rsi >= 42.0
+            vol_expansion = vol >= vol_sma20 * 1.02
+            rsi_bullish = rsi >= 44.0
             
             if bullish_breakout_bar and vol_expansion and rsi_bullish:
                 sl_anchor = min(lowest_recent, choch_level - 40.0)
