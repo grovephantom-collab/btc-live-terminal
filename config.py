@@ -89,7 +89,7 @@ try:
     SL_BUFFER = fenv("STRUCTURAL_SL_BUFFER_USD", 50, 5)         # 50 pts buffer beyond swing anchor
     MIN_STOP = fenv("MIN_STOP_DISTANCE_USD", 380, 150)          # Hard floor 380 pts (anti-noise)
     MAX_STOP = fenv("MAX_STOP_DISTANCE_USD", 620, 200)          # Hard ceiling 620 pts
-    MIN_ADX_TREND = fenv("MIN_ADX_TREND", 22.0, 10.0)           # ADX >= 22 for trend continuation
+    MIN_ADX_TREND = fenv("MIN_ADX_TREND", 22.0, 10.0)           # ADX >= 22 for trend continuation & CHoCH
     MAX_CHOP_BANDWIDTH = fenv("MAX_CHOP_BANDWIDTH", 0.018, 0.005)
 
     # Funding Rate Filter
