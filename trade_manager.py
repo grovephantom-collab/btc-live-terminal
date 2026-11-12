@@ -6,10 +6,67 @@ log = logging.getLogger("TradeManager")
 HTTP = requests.Session()
 
 DELTA_BASE_URL = "https://testnet-api.delta.exchange" if config.DELTA_TESTNET else "https://api.delta.exchange"
+_PRODUCT_ID_CACHE = {}
+_WALLET_CACHE = {"ts": 0.0, "balance": None, "available": None}
 
 def _get_delta_signature(secret: str, method: str, path: str, payload_str: str, timestamp: str) -> str:
-    message = timestamp + method + path + payload_str
+    message = method + timestamp + path + payload_str
     return hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+
+def get_delta_product_id(delta_symbol: str) -> int:
+    sym = delta_symbol.strip().upper()
+    if sym in _PRODUCT_ID_CACHE:
+        return _PRODUCT_ID_CACHE[sym]
+    try:
+        r = HTTP.get(f"{DELTA_BASE_URL}/v2/products", timeout=6)
+        if r.status_code == 200:
+            for p in r.json().get("result", []):
+                p_sym = str(p.get("symbol", "")).upper()
+                if p_sym:
+                    _PRODUCT_ID_CACHE[p_sym] = int(p["id"])
+            if sym in _PRODUCT_ID_CACHE:
+                return _PRODUCT_ID_CACHE[sym]
+    except Exception as e:
+        log.warning("Delta product lookup failed for %s: %s", sym, e)
+    return config.DELTA_PRODUCT_ID
+
+def fetch_delta_wallet_balance(force: bool = False) -> dict:
+    if config.MODE == "PAPER" or not config.DELTA_API_KEY or not config.DELTA_API_SECRET:
+        return {"balance": None, "available": None}
+    now = time.time()
+    if not force and (now - _WALLET_CACHE["ts"]) < 20.0 and _WALLET_CACHE["balance"] is not None:
+        return {"balance": _WALLET_CACHE["balance"], "available": _WALLET_CACHE["available"]}
+    path = "/v2/wallet/balances"
+    timestamp = str(int(now))
+    sig = _get_delta_signature(config.DELTA_API_SECRET, "GET", path, "", timestamp)
+    headers = {"api-key": config.DELTA_API_KEY, "signature": sig, "timestamp": timestamp}
+    try:
+        r = HTTP.get(f"{DELTA_BASE_URL}{path}", headers=headers, timeout=6)
+        if r.status_code == 200:
+            total_bal = 0.0
+            avail_bal = 0.0
+            for w in r.json().get("result", []):
+                if str(w.get("asset_symbol", "")).upper() in ("USD", "USDT"):
+                    total_bal += float(w.get("balance", 0.0) or 0.0)
+                    avail_bal += float(w.get("available_balance", 0.0) or 0.0)
+            _WALLET_CACHE.update(ts=now, balance=round(total_bal, 2), available=round(avail_bal, 2))
+            return {"balance": _WALLET_CACHE["balance"], "available": _WALLET_CACHE["available"]}
+    except Exception as e:
+        log.warning("Delta wallet balance fetch error: %s", e)
+    return {"balance": _WALLET_CACHE["balance"], "available": _WALLET_CACHE["available"]}
+
+def _set_delta_leverage(product_id: int, leverage: int):
+    if not config.DELTA_API_KEY or not config.DELTA_API_SECRET:
+        return
+    path = f"/v2/products/{product_id}/orders/leverage"
+    timestamp = str(int(time.time()))
+    payload_str = json.dumps({"leverage": str(int(leverage))}, separators=(",", ":"))
+    sig = _get_delta_signature(config.DELTA_API_SECRET, "POST", path, payload_str, timestamp)
+    headers = {"api-key": config.DELTA_API_KEY, "signature": sig, "timestamp": timestamp, "Content-Type": "application/json"}
+    try:
+        HTTP.post(f"{DELTA_BASE_URL}{path}", headers=headers, data=payload_str, timeout=5)
+    except Exception:
+        pass
 
 def place_delta_order(symbol: str, side: str, lots: int, stop_loss: float, take_profit: float):
     if config.MODE == "PAPER":
@@ -18,19 +75,22 @@ def place_delta_order(symbol: str, side: str, lots: int, stop_loss: float, take_
         log.warning("Delta API credentials missing. Skipping exchange execution.")
         return None
 
+    params = config.get_asset_params(symbol)
+    product_id = get_delta_product_id(params["delta_symbol"])
+    _set_delta_leverage(product_id, config.LEVERAGE)
+
     path = "/v2/orders"
     url = f"{DELTA_BASE_URL}{path}"
     timestamp = str(int(time.time()))
-    
     payload = {
-        "product_id": config.DELTA_PRODUCT_ID,
+        "product_id": product_id,
         "size": int(max(1, lots)),
         "side": side.lower(),
         "order_type": "market_order",
-        "bracket_order": {
-            "stop_loss_price": str(round(stop_loss, 2)),
-            "take_profit_price": str(round(take_profit, 2))
-        }
+        "bracket_stop_loss_price": str(round(stop_loss, 2)),
+        "bracket_take_profit_price": str(round(take_profit, 2)),
+        "bracket_stop_loss_limit_price": str(round(stop_loss, 2)),
+        "bracket_take_profit_limit_price": str(round(take_profit, 2)),
     }
     payload_str = json.dumps(payload, separators=(",", ":"))
     signature = _get_delta_signature(config.DELTA_API_SECRET, "POST", path, payload_str, timestamp)
@@ -40,14 +100,14 @@ def place_delta_order(symbol: str, side: str, lots: int, stop_loss: float, take_
         "timestamp": timestamp,
         "Content-Type": "application/json"
     }
-    
+
     try:
         r = HTTP.post(url, headers=headers, data=payload_str, timeout=10)
         if r.status_code in (200, 201):
-            log.info("Delta Order Placed [%s] (%d lots): %s", symbol, lots, r.json())
+            log.info("Delta Order Placed [%s pid=%d] (%d lots): %s", symbol, product_id, lots, r.json())
             return r.json()
         else:
-            log.error("Delta Order Failed [%s]: %s", symbol, r.text)
+            log.error("Delta Order Failed [%s pid=%d]: %s", symbol, product_id, r.text)
     except Exception as e:
         log.error("Delta API Exception [%s]: %s", symbol, e)
     return None
@@ -56,7 +116,7 @@ def get_equity(conn) -> float:
     r = conn.execute("SELECT COALESCE(SUM(realized_pnl_usd), 0.0) as pnl FROM trades").fetchone()
     return max(4.0, config.START_EQUITY + float(r["pnl"] if r else 0.0))
 
-def _check_cooldown_and_circuit_breakers(conn) -> tuple:
+def _check_cooldown_and_circuit_breakers(conn, symbol: str = None) -> tuple:
     now_dt = datetime.now(timezone.utc)
     today_start = now_dt.strftime("%Y-%m-%d 00:00:00")
 
@@ -72,9 +132,15 @@ def _check_cooldown_and_circuit_breakers(conn) -> tuple:
     if day_pnl <= -abs(config.MAX_DAILY_LOSS):
         return False, f"Daily Circuit Breaker Triggered: Net loss ${day_pnl:.2f} <= -${config.MAX_DAILY_LOSS:.2f}."
 
-    recent_closed = conn.execute(
-        "SELECT close_reason, closed_at_utc FROM trades WHERE stage = 'CLOSED' AND closed_at_utc IS NOT NULL ORDER BY id DESC LIMIT 2"
-    ).fetchall()
+    if symbol:
+        recent_closed = conn.execute(
+            "SELECT close_reason, closed_at_utc FROM trades WHERE stage = 'CLOSED' AND symbol = ? AND closed_at_utc IS NOT NULL ORDER BY id DESC LIMIT 2",
+            (symbol,)
+        ).fetchall()
+    else:
+        recent_closed = conn.execute(
+            "SELECT close_reason, closed_at_utc FROM trades WHERE stage = 'CLOSED' AND closed_at_utc IS NOT NULL ORDER BY id DESC LIMIT 2"
+        ).fetchall()
 
     if len(recent_closed) >= 2:
         reasons = [r["close_reason"] or "" for r in recent_closed]
@@ -115,11 +181,11 @@ def calculate_small_cap_delta_size(equity_usd: float, entry: float, sl: float, s
 
     params = config.get_asset_params(symbol)
     lot_size = params["lot_size"]
-    max_lots = getattr(config, "MAX_LOTS_CAP", 3)
-    min_risk = getattr(config, "MIN_RISK_USD", 0.35)
-    max_risk = getattr(config, "MAX_RISK_USD", 0.85)
+    max_lots = getattr(config, "MAX_LOTS_CAP", 10)
+    min_risk = getattr(config, "MIN_RISK_USD", 0.50)
+    max_risk = getattr(config, "MAX_RISK_USD", 2.20)
 
-    target_risk = max(min_risk, min(max_risk * (equity_usd / 12.0), equity_usd * float(config.RISK_PCT)))
+    target_risk = max(min_risk, min(max_risk * max(1.0, equity_usd / 58.0), equity_usd * float(config.RISK_PCT)))
     raw_qty = target_risk / risk_per_unit
 
     lots = max(1, min(max_lots, int(round(raw_qty / lot_size))))
@@ -133,9 +199,11 @@ def open_paper_trade(signal: dict, fencing_token: int):
     try:
         if not database.leader_ok(fencing_token):
             return
-        
+        if database.get_setting("auto_trade_enabled", "1") != "1":
+            return
+
         sym = signal.get("symbol", config.SYMBOL)
-        
+
         act = conn.execute("SELECT id FROM trades WHERE stage != 'CLOSED' AND symbol = ?", (sym,)).fetchone()
         if act:
             return
@@ -144,7 +212,7 @@ def open_paper_trade(signal: dict, fencing_token: int):
         if total_act >= getattr(config, "MAX_OPEN_TRADES", 2):
             return
 
-        allowed, reason = _check_cooldown_and_circuit_breakers(conn)
+        allowed, reason = _check_cooldown_and_circuit_breakers(conn, sym)
         if not allowed:
             log.info("Trade skipped by Circuit Breaker for %s: %s", sym, reason)
             return
@@ -216,7 +284,6 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
     is_long = direction == "LONG"
     params = config.get_asset_params(sym)
 
-    # 1. STOP LOSS HIT CHECK
     sl_hit = (is_long and current_price <= sl) or (not is_long and current_price >= sl)
     if sl_hit:
         exec_exit = sl if config.MODE == "PAPER" else current_price
@@ -235,7 +302,6 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
         conn.commit()
 
         msg_title = "🛡️ BREAK-EVEN SL HIT (PROFIT SECURED)" if tp1_done else "🛑 STOP LOSS HIT"
-        log.info("%s [%s] for %s at $%.2f | Realized PnL: $%+.2f", msg_title, sym, tid, exec_exit, total_realized)
         if hasattr(notifications, "enqueue_telegram"):
             notifications.enqueue_telegram(
                 f"{msg_title} ({params['display_name']} {direction})\n"
@@ -246,7 +312,6 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
             )
         return
 
-    # 1.5 EARLY STRUCTURAL INVALIDATION EXIT
     if not tp1_done and trade_dict.get("opened_at_utc"):
         try:
             open_dt = datetime.fromisoformat(trade_dict["opened_at_utc"])
@@ -254,7 +319,6 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
             elapsed_sec = (now_dt - open_dt).total_seconds()
             adverse_dist = (entry - current_price) if is_long else (current_price - entry)
             trigger_dist = (params["default_atr"] * 0.60)
-            
             if elapsed_sec >= 14400 and adverse_dist >= trigger_dist:
                 exec_exit = current_price
                 price_diff = (exec_exit - entry) if is_long else (entry - exec_exit)
@@ -271,7 +335,6 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
                 """, (total_realized, fee_usd, close_reason, now_str, now_str, tid))
                 conn.commit()
 
-                log.info("Early Structural Cut [%s] for %s at $%.2f | Realized PnL: $%+.2f", sym, tid, exec_exit, total_realized)
                 if hasattr(notifications, "enqueue_telegram"):
                     notifications.enqueue_telegram(
                         f"⚠️ *EARLY STRUCTURAL EXIT ({params['display_name']} {direction})*\n"
@@ -284,22 +347,17 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
         except Exception:
             pass
 
-    # 1.8 DYNAMIC PROFIT LOCK (+0.8R Risk Slash & +1.0R Zero-Risk Break-Even)
-    enable_dyn_lock = getattr(config, "ENABLE_DYNAMIC_PROFIT_LOCK", True)
-    if enable_dyn_lock and not tp1_done:
+    if getattr(config, "ENABLE_DYNAMIC_PROFIT_LOCK", True) and not tp1_done:
         sl_dist = abs(entry - sl)
         if sl_dist > 0:
             current_gain = (current_price - entry) if is_long else (entry - current_price)
             r_mult = current_gain / sl_dist
-
             if r_mult >= 1.0:
                 be_buffer = 0.2 if params["is_gold"] else 15.0
                 target_sl = round(entry + be_buffer if is_long else entry - be_buffer, 2)
-                should_move = (is_long and target_sl > sl) or (not is_long and target_sl < sl)
-                if should_move:
+                if (is_long and target_sl > sl) or (not is_long and target_sl < sl):
                     conn.execute("UPDATE trades SET stop_price = ?, updated_at_utc = ? WHERE trade_id = ?", (target_sl, now_str, tid))
                     conn.commit()
-                    log.info("Profit Lock [+1.0R]: SL moved to Zero-Risk $%.2f for %s", target_sl, tid)
                     if hasattr(notifications, "enqueue_telegram"):
                         notifications.enqueue_telegram(
                             f"🛡️ *PROFIT LOCK (+1.0R RUN)*\n"
@@ -310,22 +368,17 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
             elif r_mult >= 0.80:
                 tight_dist = sl_dist * 0.25
                 target_sl = round(entry - tight_dist if is_long else entry + tight_dist, 2)
-                should_move = (is_long and target_sl > sl) or (not is_long and target_sl < sl)
-                if should_move:
+                if (is_long and target_sl > sl) or (not is_long and target_sl < sl):
                     conn.execute("UPDATE trades SET stop_price = ?, updated_at_utc = ? WHERE trade_id = ?", (target_sl, now_str, tid))
                     conn.commit()
-                    log.info("Risk Slash [+0.8R]: Risk slashed to 0.25R ($%.2f) for %s", target_sl, tid)
 
-    # 2. TAKE PROFIT 1 HIT
     if not tp1_done:
-        tp1_hit = (is_long and current_price >= tp1) or (not is_long and current_price <= tp1)
-        if tp1_hit:
+        if (is_long and current_price >= tp1) or (not is_long and current_price <= tp1):
             booked_qty = round(init_qty * 0.50, 6)
             new_rem_qty = max(0.0, round(rem_qty - booked_qty, 6))
             gain_pts = (tp1 - entry) if is_long else (entry - tp1)
             fee_usd = round((entry + tp1) * booked_qty * float(config.FEE_RATE), 3)
             booked_pnl = round((gain_pts * booked_qty) - fee_usd, 2)
-
             be_offset = 0.3 if params["is_gold"] else 25.0
             new_sl = round(entry + be_offset if is_long else entry - be_offset, 2)
 
@@ -337,7 +390,6 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
             """, (new_rem_qty, new_sl, booked_pnl, fee_usd, now_str, tid))
             conn.commit()
 
-            log.info("TP1 Reached [%s] for %s! Booked 50%% ($%+.2f), SL moved to BE $%.2f", sym, tid, booked_pnl, new_sl)
             if hasattr(notifications, "enqueue_telegram"):
                 notifications.enqueue_telegram(
                     f"🎯 *TARGET 1 HIT ({params['display_name']})*\n"
@@ -348,16 +400,13 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
                 )
             return
 
-    # 3. TAKE PROFIT 2 HIT
     if tp1_done and not tp2_done:
-        tp2_hit = (is_long and current_price >= tp2) or (not is_long and current_price <= tp2)
-        if tp2_hit:
+        if (is_long and current_price >= tp2) or (not is_long and current_price <= tp2):
             booked_qty = round(init_qty * 0.30, 6)
             new_rem_qty = max(0.0, round(rem_qty - booked_qty, 6))
             gain_pts = (tp2 - entry) if is_long else (entry - tp2)
             fee_usd = round((entry + tp2) * booked_qty * float(config.FEE_RATE), 3)
             booked_pnl = round((gain_pts * booked_qty) - fee_usd, 2)
-
             new_sl = round(tp1, 2)
 
             conn.execute("""
@@ -368,7 +417,6 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
             """, (new_rem_qty, new_sl, booked_pnl, fee_usd, now_str, tid))
             conn.commit()
 
-            log.info("TP2 Reached [%s] for %s! Booked 30%% ($%+.2f), SL trailed to TP1 $%.2f", sym, tid, booked_pnl, new_sl)
             if hasattr(notifications, "enqueue_telegram"):
                 notifications.enqueue_telegram(
                     f"🎯 *TARGET 2 HIT ({params['display_name']})*\n"
@@ -380,10 +428,8 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
                 )
             return
 
-    # 4. RUNNER FULL TARGET
     if tp1_done and tp2_done:
-        tp3_hit = (is_long and current_price >= tp3) or (not is_long and current_price <= tp3)
-        if tp3_hit:
+        if (is_long and current_price >= tp3) or (not is_long and current_price <= tp3):
             gain_pts = (tp3 - entry) if is_long else (entry - tp3)
             fee_usd = round((entry + tp3) * rem_qty * float(config.FEE_RATE), 3)
             final_pnl = round((gain_pts * rem_qty) - fee_usd, 2)
@@ -398,7 +444,6 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
             """, (total_realized, fee_usd, now_str, now_str, tid))
             conn.commit()
 
-            log.info("TP3 Runner Reached [%s] for %s! Total Trade PnL: $%+.2f", sym, tid, total_realized)
             if hasattr(notifications, "enqueue_telegram"):
                 notifications.enqueue_telegram(
                     f"🏆 *TARGET 3 FULL EXIT ({params['display_name']})*\n"
@@ -420,7 +465,6 @@ def manage_all_positions(fencing_token: int, lock):
         active_trades = conn.execute("SELECT * FROM trades WHERE stage != 'CLOSED'").fetchall()
         if not active_trades:
             return
-
         for row in active_trades:
             trade_dict = dict(row)
             sym = trade_dict.get("symbol") or "BTCUSDT"
