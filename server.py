@@ -1,8 +1,8 @@
-import os, time, requests, logging
+import os, time, requests, logging, threading
 from typing import Dict, Any, Optional
 import streamlit as st
 import pandas as pd
-import config
+import config, database, market_data, smc_engine, trade_manager, notifications
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("Dashboard")
@@ -14,6 +14,11 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+AUTO_REFRESH_SECONDS = 8
+USD_INR = float(getattr(config, "USD_INR_RATE", 86.0))
+_LOCAL_LOCK = threading.Lock()
+_LOCAL_STRUCT = {}
+
 def _get_backend_url() -> str:
     url = os.getenv("BACKEND_URL", "").strip()
     if not url:
@@ -21,15 +26,132 @@ def _get_backend_url() -> str:
             url = str(st.secrets.get("BACKEND_URL", "")).strip()
         except Exception:
             url = ""
-    if not url:
-        url = f"http://127.0.0.1:{config.PORT}"
+    if "aapka-render" in url or "your-render" in url or "example" in url:
+        url = ""
     return url.rstrip("/")
 
-BACKEND_BASE = _get_backend_url()
-VAULT_ENDPOINT = f"{BACKEND_BASE}/vault-data"
-TOGGLE_ENDPOINT = f"{BACKEND_BASE}/toggle-bot"
-AUTO_REFRESH_SECONDS = 8
-USD_INR = float(getattr(config, "USD_INR_RATE", 86.0))
+@st.cache_resource
+def _ensure_local_data_ready():
+    database.init_db()
+    market_data.refresh_all_market_data(_LOCAL_LOCK)
+    return True
+
+def _build_local_payload() -> Dict[str, Any]:
+    _ensure_local_data_ready()
+    market_data.refresh_all_market_data(_LOCAL_LOCK)
+    c = database.db()
+    try:
+        ts = [dict(r) for r in c.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 50").fetchall()]
+        active_rows = [dict(r) for r in c.execute("SELECT * FROM trades WHERE stage != 'CLOSED' ORDER BY id DESC LIMIT 10").fetchall()]
+        pnl = float(c.execute("SELECT COALESCE(SUM(realized_pnl_usd),0) p FROM trades").fetchone()["p"] or 0.0)
+        unrealized = float(c.execute("SELECT COALESCE(SUM(unrealized_pnl_usd),0) u FROM trades WHERE stage != 'CLOSED'").fetchone()["u"] or 0.0)
+
+        closed_asc = c.execute("SELECT symbol, realized_pnl_usd, closed_at_utc FROM trades WHERE stage = 'CLOSED' ORDER BY id ASC").fetchall()
+        wins = [float(r["realized_pnl_usd"] or 0.0) for r in closed_asc if float(r["realized_pnl_usd"] or 0.0) > 0]
+        losses = [float(r["realized_pnl_usd"] or 0.0) for r in closed_asc if float(r["realized_pnl_usd"] or 0.0) <= 0]
+        total_closed = len(wins) + len(losses)
+        win_rate = round((len(wins) / total_closed) * 100.0, 1) if total_closed > 0 else 0.0
+        gross_win = sum(wins)
+        gross_loss = abs(sum(losses))
+        profit_factor = round(gross_win / gross_loss, 2) if gross_loss > 0 else (round(gross_win, 2) if gross_win > 0 else 0.0)
+
+        eq = float(config.START_EQUITY)
+        peak = eq
+        max_dd = 0.0
+        equity_curve = [{"trade": 0, "equity": round(eq, 2), "drawdown": 0.0}]
+        for idx, r in enumerate(closed_asc, start=1):
+            eq += float(r["realized_pnl_usd"] or 0.0)
+            if eq > peak:
+                peak = eq
+            dd = round(((peak - eq) / peak) * 100.0, 2) if peak > 0 else 0.0
+            if dd > max_dd:
+                max_dd = dd
+            equity_curve.append({"trade": idx, "equity": round(eq, 2), "drawdown": -dd})
+
+        delta_wallet = trade_manager.fetch_delta_wallet_balance()
+        wallet_bal = delta_wallet["balance"] if delta_wallet["balance"] is not None else round(config.START_EQUITY + pnl, 2)
+        wallet_avail = delta_wallet["available"] if delta_wallet["available"] is not None else round(wallet_bal, 2)
+        auto_enabled = database.get_setting("auto_trade_enabled", "1") == "1"
+
+        markets_info = {}
+        for sym in config.SYMBOLS:
+            m = dict(market_data.get_market(sym))
+            st_info = smc_engine.get_structure(m, sym) or {}
+            params = config.get_asset_params(sym)
+            markets_info[sym] = {
+                "symbol": sym,
+                "display_name": params["display_name"],
+                "price": m.get("price"),
+                "session": m.get("session", "ACTIVE"),
+                "in_killzone": m.get("in_killzone", False),
+                "killzone_name": m.get("killzone_name", "OFF_HOURS"),
+                "funding_rate": m.get("funding_rate", 0.0001),
+                "pdh": m.get("pdh"),
+                "pdl": m.get("pdl"),
+                "macro_bias": st_info.get("macro_bias", "NEUTRAL"),
+                "adx": round(float(st_info.get("adx", 0.0)), 1),
+                "rsi": round(float(st_info.get("rsi", 50.0)), 1),
+                "cvd_pct": round(float(st_info.get("cvd_ratio", 0.5)) * 100.0, 1),
+                "choch_status": st_info.get("choch_status", "NONE"),
+            }
+
+        btc_m = market_data.get_market("BTCUSDT")
+        return {
+            "mode": config.MODE,
+            "auto_trade_enabled": auto_enabled,
+            "symbols": config.SYMBOLS,
+            "markets": markets_info,
+            "wallet": {
+                "balance_usd": wallet_bal,
+                "available_usd": wallet_avail,
+                "is_live_synced": delta_wallet["balance"] is not None
+            },
+            "session": btc_m.get("session", "ACTIVE"),
+            "killzone_name": btc_m.get("killzone_name", "OFF_HOURS"),
+            "realized_pnl_usd": round(pnl, 2),
+            "unrealized_pnl_usd": round(unrealized, 2),
+            "stats": {
+                "wins": len(wins),
+                "losses": len(losses),
+                "total_trades": total_closed,
+                "win_rate": win_rate,
+                "profit_factor": profit_factor,
+                "max_drawdown_pct": round(max_dd, 2),
+            },
+            "equity_curve": equity_curve,
+            "vault": ts,
+            "active": active_rows
+        }
+    finally:
+        c.close()
+
+def fetch_vault_payload() -> Dict[str, Any]:
+    backend_base = _get_backend_url()
+    if backend_base:
+        try:
+            resp = requests.get(f"{backend_base}/vault-data", timeout=8)
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception:
+            pass
+    try:
+        resp = requests.get(f"http://127.0.0.1:{config.PORT}/vault-data", timeout=2)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return _build_local_payload()
+
+def toggle_bot_state() -> None:
+    backend_base = _get_backend_url()
+    if backend_base:
+        try:
+            requests.post(f"{backend_base}/toggle-bot", timeout=5)
+            return
+        except Exception:
+            pass
+    cur = database.get_setting("auto_trade_enabled", "1")
+    database.set_setting("auto_trade_enabled", "0" if cur == "1" else "1")
 
 st.markdown(
     """
@@ -49,34 +171,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-def fetch_vault_payload() -> tuple:
-    try:
-        resp = requests.get(VAULT_ENDPOINT, timeout=12)
-        resp.raise_for_status()
-        return resp.json(), None
-    except Exception as e:
-        return None, str(e)
-
-def toggle_bot_state() -> None:
-    try:
-        requests.post(TOGGLE_ENDPOINT, timeout=8)
-    except Exception:
-        pass
-
 def main() -> None:
-    payload, err = fetch_vault_payload()
-    if not payload:
-        st.error(f"Backend se connect nahi ho pa raha: `{VAULT_ENDPOINT}`")
-        if "127.0.0.1" in BACKEND_BASE:
-            st.info(
-                "**Fix (Streamlit Cloud):** Manage App → Settings → **Secrets** me ye line add karein:\n\n"
-                "`BACKEND_URL = \"https://aapka-render-app.onrender.com\"`"
-            )
-        else:
-            st.caption(f"Error detail: {err}")
-        time.sleep(AUTO_REFRESH_SECONDS)
-        st.rerun()
-        return
+    payload = fetch_vault_payload()
 
     mode = payload.get("mode", "PAPER")
     auto_on = payload.get("auto_trade_enabled", True)
