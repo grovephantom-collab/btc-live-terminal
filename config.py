@@ -35,16 +35,16 @@ def resolve_db_path(filename: str = "institutional_vault.db") -> str:
 try:
     API_SECRET_KEY = required("API_SECRET_KEY", 24, "institutional_sec_key_1234567890")
     WORKER_AUTH_TOKEN = required("WORKER_AUTH_TOKEN", 24, "worker_auth_token_secret_123456789")
-    
+
     MODE = os.getenv("TRADING_MODE", "PAPER").strip().upper()
     if MODE not in ("PAPER", "TESTNET", "LIVE"):
         raise RuntimeError("TRADING_MODE must be PAPER, TESTNET, or LIVE.")
 
-    # --- MULTI-SYMBOL DUAL SCANNER (BTCUSDT + PAXGUSDT / GOLD) ---
-    SYMBOLS_STR = os.getenv("SYMBOLS", os.getenv("SYMBOL", "BTCUSDT,PAXGUSDT")).strip()
+    # --- MULTI-MARKET SCANNER: BTC, ETH, SOL, GOLD (PAXG) ---
+    SYMBOLS_STR = os.getenv("SYMBOLS", os.getenv("SYMBOL", "BTCUSDT,ETHUSDT,SOLUSDT,PAXGUSDT")).strip()
     SYMBOLS = [s.strip().upper() for s in SYMBOLS_STR.split(",") if s.strip()]
     if not SYMBOLS:
-        SYMBOLS = ["BTCUSDT", "PAXGUSDT"]
+        SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "PAXGUSDT"]
     SYMBOL = SYMBOLS[0]
 
     PORT = ienv("PORT", 10000, 1)
@@ -55,66 +55,63 @@ try:
     LEASE_TTL = fenv("LEADER_TTL_SEC", 20, 5)
     MAX_DATA_AGE = fenv("MAX_DATA_AGE_SEC", 90, 10)
 
-    # --- SMALL CAPITAL SIZING (Rs 500 - Rs 1000 = ~$6 - $12 USD) ---
+    # --- Rs 5,000 (~$58 USD) CAPITAL SIZING & RISK MANAGEMENT ---
     USD_INR_RATE = fenv("USD_INR_RATE", 86.0, 50.0)
-    START_EQUITY = fenv("PAPER_EQUITY_USD", 12.0, 5.0)          # ~$12 USD (~Rs 1,000 capital)
-    RISK_PCT = fenv("RISK_PER_TRADE_PCT", 0.05, 0.005)          # 5% max risk
-    MIN_RISK_USD = fenv("MIN_RISK_USD", 0.35, 0.10)             # Min $0.35 (~Rs 30) risk
-    MAX_RISK_USD = fenv("MAX_RISK_USD", 0.85, 0.20)             # Hard cap $0.85 (~Rs 73) loss
-    MAX_LOTS_CAP = ienv("MAX_LOTS_CAP", 3, 1)                   # Max 1-2 lots per asset
+    START_EQUITY = fenv("PAPER_EQUITY_USD", 58.0, 5.0)
+    RISK_PCT = fenv("RISK_PER_TRADE_PCT", 0.025, 0.005)
+    MIN_RISK_USD = fenv("MIN_RISK_USD", 0.50, 0.10)
+    MAX_RISK_USD = fenv("MAX_RISK_USD", 2.20, 0.20)
+    MAX_LOTS_CAP = ienv("MAX_LOTS_CAP", 10, 1)
     LEVERAGE = ienv("DEFAULT_LEVERAGE", 25, 1)
 
-    MAX_DAILY_LOSS = fenv("MAX_DAILY_LOSS_USD", 2.50, 0.5)      # Daily stop: -$2.50 (~Rs 215)
-    MAX_DAILY_TRADES = ienv("MAX_DAILY_TRADES", 4, 1)           # Max 4 trades per day across assets
-    MAX_OPEN_TRADES = ienv("MAX_OPEN_TRADES", 2, 1)             # Can hold 1 BTC + 1 Gold trade simultaneously
-    MAX_NOTIONAL = fenv("MAX_NOTIONAL_USD", 250.0, 10.0)
+    MAX_DAILY_LOSS = fenv("MAX_DAILY_LOSS_USD", 5.00, 0.5)
+    MAX_DAILY_TRADES = ienv("MAX_DAILY_TRADES", 6, 1)
+    MAX_OPEN_TRADES = ienv("MAX_OPEN_TRADES", 2, 1)
+    MAX_NOTIONAL = fenv("MAX_NOTIONAL_USD", 600.0, 10.0)
 
     # --- ANTI-WHIPSAW & CIRCUIT BREAKER RULES ---
-    SL_COOLDOWN_SECONDS = ienv("SL_COOLDOWN_SECONDS", 3600, 300)        # 60 mins wait after SL hit
-    CONSECUTIVE_SL_PAUSE_SEC = ienv("CONSECUTIVE_SL_PAUSE_SEC", 9000, 600) # 2.5 hours pause after 2 SL hits
-    TRADE_COOLDOWN_SECONDS = ienv("TRADE_COOLDOWN_SECONDS", 1200, 60)    # 20 mins wait after profit exit
-    
-    # Session Filter: London & New York
+    SL_COOLDOWN_SECONDS = ienv("SL_COOLDOWN_SECONDS", 3600, 300)
+    CONSECUTIVE_SL_PAUSE_SEC = ienv("CONSECUTIVE_SL_PAUSE_SEC", 9000, 600)
+    TRADE_COOLDOWN_SECONDS = ienv("TRADE_COOLDOWN_SECONDS", 1200, 60)
+
     STRICT_KILLZONE_ONLY = os.getenv("STRICT_KILLZONE_ONLY", "false").strip().lower() == "true"
-    FILTER_DEAD_HOURS = os.getenv("FILTER_DEAD_HOURS", "true").strip().lower() == "true" # Skip 01:00-05:30 AM IST dead zone
+    FILTER_DEAD_HOURS = os.getenv("FILTER_DEAD_HOURS", "true").strip().lower() == "true"
 
     FEE_RATE = fenv("PAPER_FEE_RATE", 0.0005, 0)
     SLIPPAGE = fenv("PAPER_SLIPPAGE_RATE", 0.0002, 0)
     MIN_SCORE = fenv("MIN_SIGNAL_SCORE", 88, 0)
 
-    # --- 1-DAY (24-HOUR) STRUCTURAL LOOKBACK & MACRO TREND LOCK ---
-    SWING_LOOKBACK_BARS = ienv("SWING_LOOKBACK_BARS", 96, 20)      # 96 bars = 24 Hours of 15M candles (1 Day)
-    STRICT_TREND_LOCK = os.getenv("STRICT_TREND_LOCK", "true").strip().lower() == "true" # 100% block counter-trend trades
-    ENABLE_DAILY_BREAKOUT = os.getenv("ENABLE_DAILY_BREAKOUT", "true").strip().lower() == "true" # Trade expansion breakouts
-    ENABLE_CHOCH_STRATEGY = os.getenv("ENABLE_CHOCH_STRATEGY", "true").strip().lower() == "true" # Trade structural trend shifts
-    ENABLE_PREMIUM_DISCOUNT_FILTER = os.getenv("ENABLE_PREMIUM_DISCOUNT_FILTER", "true").strip().lower() == "true" # Strict SMC Equilibrium
-    ENABLE_CVD_FILTER = os.getenv("ENABLE_CVD_FILTER", "true").strip().lower() == "true" # Orderflow Volume Delta confirmation
-    ENABLE_DYNAMIC_PROFIT_LOCK = os.getenv("ENABLE_DYNAMIC_PROFIT_LOCK", "true").strip().lower() == "true" # +0.8R / +1.0R dynamic SL tightening
-    MIN_HEADROOM_RATIO = fenv("MIN_HEADROOM_RATIO", 1.25, 1.0)     # Minimum distance to nearest major resistance/support
-    MIN_ADX_TREND = fenv("MIN_ADX_TREND", 22.0, 10.0)           # ADX >= 22 for trend continuation & CHoCH
+    # --- 1-DAY STRUCTURAL LOOKBACK & INSTITUTIONAL FILTERS ---
+    SWING_LOOKBACK_BARS = ienv("SWING_LOOKBACK_BARS", 96, 20)
+    STRICT_TREND_LOCK = os.getenv("STRICT_TREND_LOCK", "true").strip().lower() == "true"
+    ENABLE_DAILY_BREAKOUT = os.getenv("ENABLE_DAILY_BREAKOUT", "true").strip().lower() == "true"
+    ENABLE_CHOCH_STRATEGY = os.getenv("ENABLE_CHOCH_STRATEGY", "true").strip().lower() == "true"
+    ENABLE_PREMIUM_DISCOUNT_FILTER = os.getenv("ENABLE_PREMIUM_DISCOUNT_FILTER", "true").strip().lower() == "true"
+    ENABLE_CVD_FILTER = os.getenv("ENABLE_CVD_FILTER", "true").strip().lower() == "true"
+    ENABLE_DYNAMIC_PROFIT_LOCK = os.getenv("ENABLE_DYNAMIC_PROFIT_LOCK", "true").strip().lower() == "true"
+    MIN_HEADROOM_RATIO = fenv("MIN_HEADROOM_RATIO", 1.25, 1.0)
+    MIN_ADX_TREND = fenv("MIN_ADX_TREND", 22.0, 10.0)
     MAX_CHOP_BANDWIDTH = fenv("MAX_CHOP_BANDWIDTH", 0.018, 0.005)
 
-    # Funding Rate Filter
     MAX_FUNDING_FOR_LONG = fenv("MAX_FUNDING_FOR_LONG", 0.00035, 0.0)
     MIN_FUNDING_FOR_SHORT = fenv("MIN_FUNDING_FOR_SHORT", -0.00020, -1.0)
 
     TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-    # Delta Exchange Config
     DELTA_API_KEY = os.getenv("DELTA_API_KEY", "").strip()
     DELTA_API_SECRET = os.getenv("DELTA_API_SECRET", "").strip()
-    DELTA_TESTNET = os.getenv("DELTA_TESTNET", "true").strip().lower() == "true"
+    _default_testnet = "false" if MODE == "LIVE" else "true"
+    DELTA_TESTNET = os.getenv("DELTA_TESTNET", _default_testnet).strip().lower() == "true"
     DELTA_PRODUCT_ID = int(os.getenv("DELTA_PRODUCT_ID", "27"))
 
 except Exception as e:
     sys.exit(f"Startup Config Error: {e}")
 
 def get_asset_params(symbol: str) -> dict:
-    """Returns asset-specific volatility, sizing, and feed parameters."""
+    """Returns asset-specific volatility, sizing, and Delta Exchange contract specs."""
     sym = symbol.strip().upper()
-    is_gold = ("XAU" in sym) or ("GOLD" in sym) or ("PAXG" in sym)
-    if is_gold:
+    if ("XAU" in sym) or ("GOLD" in sym) or ("PAXG" in sym):
         return {
             "symbol": sym,
             "is_gold": True,
@@ -122,14 +119,48 @@ def get_asset_params(symbol: str) -> dict:
             "cb_symbol": "PAXG-USD",
             "bin_symbol": "PAXGUSDT",
             "delta_symbol": "PAXGUSD",
-            "min_stop": float(os.getenv("GOLD_MIN_STOP", "3.8")),         # 38 pips ($3.80)
-            "max_stop": float(os.getenv("GOLD_MAX_STOP", "6.8")),         # 68 pips ($6.80)
-            "sl_buffer": float(os.getenv("GOLD_SL_BUFFER", "0.6")),       # 6 pips buffer
-            "min_gap": float(os.getenv("GOLD_MIN_GAP", "0.8")),           # 8 pips FVG
-            "sweep_buffer": float(os.getenv("GOLD_SWEEP_BUFFER", "0.4")), # 4 pips sweep buffer
-            "lot_size": float(os.getenv("GOLD_LOT_SIZE", "0.01")),        # 0.01 oz micro lot
+            "min_stop": float(os.getenv("GOLD_MIN_STOP", "3.8")),
+            "max_stop": float(os.getenv("GOLD_MAX_STOP", "6.8")),
+            "sl_buffer": float(os.getenv("GOLD_SL_BUFFER", "0.6")),
+            "min_gap": float(os.getenv("GOLD_MIN_GAP", "0.8")),
+            "sweep_buffer": float(os.getenv("GOLD_SWEEP_BUFFER", "0.4")),
+            "lot_size": float(os.getenv("GOLD_LOT_SIZE", "0.01")),
             "default_price": 2700.0,
             "default_atr": 4.5
+        }
+    if "ETH" in sym:
+        return {
+            "symbol": sym,
+            "is_gold": False,
+            "display_name": "Ethereum (ETH)",
+            "cb_symbol": "ETH-USD",
+            "bin_symbol": "ETHUSDT",
+            "delta_symbol": "ETHUSD",
+            "min_stop": float(os.getenv("ETH_MIN_STOP", "16.0")),
+            "max_stop": float(os.getenv("ETH_MAX_STOP", "32.0")),
+            "sl_buffer": float(os.getenv("ETH_SL_BUFFER", "2.5")),
+            "min_gap": float(os.getenv("ETH_MIN_GAP", "2.0")),
+            "sweep_buffer": float(os.getenv("ETH_SWEEP_BUFFER", "1.5")),
+            "lot_size": float(os.getenv("ETH_LOT_SIZE", "0.01")),
+            "default_price": 3000.0,
+            "default_atr": 14.0
+        }
+    if "SOL" in sym:
+        return {
+            "symbol": sym,
+            "is_gold": False,
+            "display_name": "Solana (SOL)",
+            "cb_symbol": "SOL-USD",
+            "bin_symbol": "SOLUSDT",
+            "delta_symbol": "SOLUSD",
+            "min_stop": float(os.getenv("SOL_MIN_STOP", "1.2")),
+            "max_stop": float(os.getenv("SOL_MAX_STOP", "2.8")),
+            "sl_buffer": float(os.getenv("SOL_SL_BUFFER", "0.2")),
+            "min_gap": float(os.getenv("SOL_MIN_GAP", "0.15")),
+            "sweep_buffer": float(os.getenv("SOL_SWEEP_BUFFER", "0.1")),
+            "lot_size": float(os.getenv("SOL_LOT_SIZE", "0.1")),
+            "default_price": 180.0,
+            "default_atr": 1.1
         }
     return {
         "symbol": sym,
@@ -138,12 +169,12 @@ def get_asset_params(symbol: str) -> dict:
         "cb_symbol": "BTC-USD",
         "bin_symbol": "BTCUSDT",
         "delta_symbol": "BTCUSD",
-        "min_stop": float(os.getenv("MIN_STOP_DISTANCE_USD", "380")),    # Hard floor 380 pts
-        "max_stop": float(os.getenv("MAX_STOP_DISTANCE_USD", "620")),    # Hard ceiling 620 pts
-        "sl_buffer": float(os.getenv("STRUCTURAL_SL_BUFFER_USD", "50")),  # 50 pts buffer
-        "min_gap": float(os.getenv("MIN_FVG_GAP_USD", "35")),             # 35 pts FVG
-        "sweep_buffer": float(os.getenv("SWEEP_BUFFER_USD", "20")),       # 20 pts sweep
-        "lot_size": float(os.getenv("DELTA_LOT_SIZE_BTC", "0.001")),      # 0.001 BTC
+        "min_stop": float(os.getenv("MIN_STOP_DISTANCE_USD", "380")),
+        "max_stop": float(os.getenv("MAX_STOP_DISTANCE_USD", "620")),
+        "sl_buffer": float(os.getenv("STRUCTURAL_SL_BUFFER_USD", "50")),
+        "min_gap": float(os.getenv("MIN_FVG_GAP_USD", "35")),
+        "sweep_buffer": float(os.getenv("SWEEP_BUFFER_USD", "20")),
+        "lot_size": float(os.getenv("DELTA_LOT_SIZE_BTC", "0.001")),
         "default_price": 75000.0,
         "default_atr": 220.0
     }
