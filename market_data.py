@@ -37,7 +37,6 @@ def session_and_killzone() -> tuple:
     kz_name = "OFF_HOURS"
     is_dead_hour = False
 
-    # Dead Asian Hours: 19:30 to 23:59 UTC (01:00 AM to 05:30 AM IST)
     if total_m >= 1170:
         is_dead_hour = True
         session_name = "DEAD ZONE (OFF-PEAK)"
@@ -48,11 +47,9 @@ def session_and_killzone() -> tuple:
     elif h < 21:
         session_name = "NEW YORK TREND"
 
-    # London Open Killzone: 07:00 - 11:00 UTC (12:30 PM - 04:30 PM IST)
     if 420 <= total_m <= 660:
         in_kz = True
         kz_name = "LONDON KILLZONE"
-    # New York Open Killzone: 12:30 - 17:30 UTC (06:00 PM - 11:00 PM IST)
     elif 750 <= total_m <= 1050:
         in_kz = True
         kz_name = "NEW YORK KILLZONE"
@@ -70,12 +67,10 @@ def check_economic_news_blackout() -> bool:
     return False
 
 def calc_volume_delta(candles_15m: list) -> float:
-    """Calculates Net Cumulative Volume Delta Ratio (0.0 to 1.0) over recent 10 bars."""
     if len(candles_15m) < 3:
         return 0.50
     buyer_vols, seller_vols = [], []
     for c in candles_15m[-10:]:
-        o = float(c.get("open", 0.0))
         h = float(c.get("high", 0.0))
         l = float(c.get("low", 0.0))
         cl = float(c.get("close", 0.0))
@@ -85,7 +80,6 @@ def calc_volume_delta(candles_15m: list) -> float:
         s_ratio = (h - cl) / rng
         buyer_vols.append(v * b_ratio)
         seller_vols.append(v * s_ratio)
-    
     total_b = sum(buyer_vols)
     total_s = sum(seller_vols)
     tot = total_b + total_s + 1e-9
@@ -126,15 +120,16 @@ def fetch_price(symbol: str) -> Optional[float]:
     except Exception:
         pass
 
-    try:
-        r = HTTP.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": bin_sym}, timeout=config.HTTP_TIMEOUT)
-        if r.status_code == 200:
-            p = float(r.json()["price"])
-            if math.isfinite(p) and p > 0:
-                return p
-    except Exception:
-        pass
-    
+    for b_base in ("https://data-api.binance.vision", "https://api.binance.com"):
+        try:
+            r = HTTP.get(f"{b_base}/api/v3/ticker/price", params={"symbol": bin_sym}, timeout=config.HTTP_TIMEOUT)
+            if r.status_code == 200:
+                p = float(r.json()["price"])
+                if math.isfinite(p) and p > 0:
+                    return p
+        except Exception:
+            pass
+
     try:
         url = f"https://api.delta.exchange/v2/tickers/{delta_sym}"
         r = HTTP.get(url, timeout=config.HTTP_TIMEOUT)
@@ -153,7 +148,7 @@ def fetch_klines(symbol: str, interval: str, limit: int = 120) -> List[Dict[str,
     params = config.get_asset_params(symbol)
     cb_sym = params["cb_symbol"]
     bin_sym = params["bin_symbol"]
-    
+
     try:
         url = f"https://api.exchange.coinbase.com/products/{cb_sym}/candles?granularity={gran}"
         r = HTTP.get(url, timeout=config.HTTP_TIMEOUT)
@@ -176,20 +171,44 @@ def fetch_klines(symbol: str, interval: str, limit: int = 120) -> List[Dict[str,
 
     binance_intervals = {"15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
     b_interval = binance_intervals.get(interval, "15m")
+    for b_base in ("https://data-api.binance.vision", "https://api.binance.com"):
+        try:
+            url = f"{b_base}/api/v3/klines?symbol={bin_sym}&interval={b_interval}&limit={limit}"
+            r = HTTP.get(url, timeout=config.HTTP_TIMEOUT)
+            if r.status_code == 200:
+                raw = r.json()
+                if isinstance(raw, list) and len(raw) >= 5:
+                    out = []
+                    for k in raw:
+                        t = int(k[0]) // 1000
+                        out.append({
+                            "time": t, "close_time": t + gran,
+                            "open": float(k[1]), "high": float(k[2]),
+                            "low": float(k[3]), "close": float(k[4]),
+                            "vol": float(k[5])
+                        })
+                    out.sort(key=lambda z: z["time"])
+                    return out[-limit:]
+        except Exception:
+            pass
+
     try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={bin_sym}&interval={b_interval}&limit={limit}"
+        delta_sym = params["delta_symbol"]
+        end_ts = int(time.time())
+        start_ts = end_ts - (limit * gran)
+        url = f"https://api.delta.exchange/v2/history/candles?resolution={interval}&symbol={delta_sym}&start={start_ts}&end={end_ts}"
         r = HTTP.get(url, timeout=config.HTTP_TIMEOUT)
         if r.status_code == 200:
-            raw = r.json()
+            raw = r.json().get("result", [])
             if isinstance(raw, list) and len(raw) >= 5:
                 out = []
                 for k in raw:
-                    t = int(k[0]) // 1000
+                    t = int(k["time"])
                     out.append({
                         "time": t, "close_time": t + gran,
-                        "open": float(k[1]), "high": float(k[2]),
-                        "low": float(k[3]), "close": float(k[4]),
-                        "vol": float(k[5])
+                        "open": float(k["open"]), "high": float(k["high"]),
+                        "low": float(k["low"]), "close": float(k["close"]),
+                        "vol": float(k.get("volume", 1.0))
                     })
                 out.sort(key=lambda z: z["time"])
                 return out[-limit:]
@@ -235,7 +254,6 @@ def extract_asian_range(candles_15m: list) -> tuple:
     now_dt = datetime.now(timezone.utc)
     today_start_epoch = int(datetime(now_dt.year, now_dt.month, now_dt.day, 0, 0, tzinfo=timezone.utc).timestamp())
     asian_end_epoch = today_start_epoch + (7 * 3600)
-
     asian_bars = [c for c in candles_15m if today_start_epoch <= c.get("time", 0) <= asian_end_epoch]
     if asian_bars:
         arh = max(c["high"] for c in asian_bars)
@@ -304,18 +322,9 @@ def refresh_symbol_market_data(symbol: str, lock) -> bool:
         with lock:
             m = get_market(symbol)
             m.update(
-                klines=ks,
-                klines_ts=time.time(),
-                poc=poc,
-                pdh=pdh,
-                pdl=pdl,
-                daily_open=d_open,
-                day_high_24h=h24,
-                day_low_24h=l24,
-                asian_high=arh,
-                asian_low=arl,
-                cvd_ratio=cvd,
-                error=None
+                klines=ks, klines_ts=time.time(), poc=poc, pdh=pdh, pdl=pdl,
+                daily_open=d_open, day_high_24h=h24, day_low_24h=l24,
+                asian_high=arh, asian_low=arl, cvd_ratio=cvd, error=None
             )
         return True
     except Exception as e:
