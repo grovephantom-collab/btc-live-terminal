@@ -14,7 +14,18 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-BACKEND_BASE = os.getenv("BACKEND_URL", f"http://127.0.0.1:{config.PORT}").rstrip("/")
+def _get_backend_url() -> str:
+    url = os.getenv("BACKEND_URL", "").strip()
+    if not url:
+        try:
+            url = str(st.secrets.get("BACKEND_URL", "")).strip()
+        except Exception:
+            url = ""
+    if not url:
+        url = f"http://127.0.0.1:{config.PORT}"
+    return url.rstrip("/")
+
+BACKEND_BASE = _get_backend_url()
 VAULT_ENDPOINT = f"{BACKEND_BASE}/vault-data"
 TOGGLE_ENDPOINT = f"{BACKEND_BASE}/toggle-bot"
 AUTO_REFRESH_SECONDS = 8
@@ -38,24 +49,31 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-def fetch_vault_payload() -> Optional[Dict[str, Any]]:
+def fetch_vault_payload() -> tuple:
     try:
-        resp = requests.get(VAULT_ENDPOINT, timeout=6)
+        resp = requests.get(VAULT_ENDPOINT, timeout=12)
         resp.raise_for_status()
-        return resp.json()
-    except Exception:
-        return None
+        return resp.json(), None
+    except Exception as e:
+        return None, str(e)
 
 def toggle_bot_state() -> None:
     try:
-        requests.post(TOGGLE_ENDPOINT, timeout=5)
+        requests.post(TOGGLE_ENDPOINT, timeout=8)
     except Exception:
         pass
 
 def main() -> None:
-    payload = fetch_vault_payload()
+    payload, err = fetch_vault_payload()
     if not payload:
-        st.warning("Connecting to Quant Backend... Please wait.")
+        st.error(f"Backend se connect nahi ho pa raha: `{VAULT_ENDPOINT}`")
+        if "127.0.0.1" in BACKEND_BASE:
+            st.info(
+                "**Fix (Streamlit Cloud):** Manage App → Settings → **Secrets** me ye line add karein:\n\n"
+                "`BACKEND_URL = \"https://aapka-render-app.onrender.com\"`"
+            )
+        else:
+            st.caption(f"Error detail: {err}")
         time.sleep(AUTO_REFRESH_SECONDS)
         st.rerun()
         return
