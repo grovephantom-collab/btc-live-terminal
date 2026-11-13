@@ -90,6 +90,41 @@ def _calc_adx(highs: list, lows: list, closes: list, period: int = 14) -> float:
         adx = (adx * (period - 1) + d) / period
     return round(float(adx), 1)
 
+def _calc_vwap(closed_15: list, lookback: int = 48) -> float:
+    """Calculates Institutional Volume-Weighted Average Price (VWAP) over recent session bars."""
+    bars = closed_15[-lookback:] if len(closed_15) >= lookback else closed_15
+    if not bars:
+        return 0.0
+    pv_sum = 0.0
+    v_sum = 0.0
+    for b in bars:
+        typical = (b[1] + b[2] + b[3]) / 3.0
+        vol = max(1e-6, b[4])
+        pv_sum += typical * vol
+        v_sum += vol
+    return pv_sum / max(1e-6, v_sum)
+
+def _detect_order_blocks(closed_15: list, atr: float) -> tuple:
+    """
+    Detects fresh Bullish & Bearish Institutional Order Blocks (OB):
+    - Bullish OB: Last bearish candle before a strong bullish displacement impulse (>0.85x ATR).
+    - Bearish OB: Last bullish candle before a strong bearish displacement impulse (>0.85x ATR).
+    """
+    if len(closed_15) < 12:
+        return None, None
+    bull_ob = None
+    bear_ob = None
+    recent = closed_15[-18:-1]
+    for i in range(len(recent) - 2):
+        c0 = recent[i]
+        c1 = recent[i + 1]
+        c2 = recent[i + 2]
+        if c0[3] < c0[0] and c1[3] > c1[0] and (c2[3] - c0[2]) >= (atr * 0.85) and c1[3] > c0[1]:
+            bull_ob = (c0[2], c0[1])
+        if c0[3] > c0[0] and c1[3] < c1[0] and (c0[1] - c2[3]) >= (atr * 0.85) and c1[3] < c0[2]:
+            bear_ob = (c0[2], c0[1])
+    return bull_ob, bear_ob
+
 def _detect_fvg_and_displacement(closed_15: list, atr: float, min_gap: float) -> tuple:
     if len(closed_15) < 6:
         return False, False
@@ -227,6 +262,8 @@ def get_structure(market_dict: dict, symbol: str = "BTCUSDT") -> dict:
         macro_bias = "NEUTRAL"
 
     bull_fvg, bear_fvg = _detect_fvg_and_displacement(closed_15, atr_15m, asset_params["min_gap"])
+    vwap_15m = _calc_vwap(closed_15, 48)
+    bull_ob, bear_ob = _detect_order_blocks(closed_15, atr_15m)
 
     ema_spread_pct = abs(ema20 - ema50) / ema50
     is_choppy = (adx_15m < 20.0) and ((bb_bandwidth < 0.004) or (ema_spread_pct < 0.0015))
@@ -259,6 +296,9 @@ def get_structure(market_dict: dict, symbol: str = "BTCUSDT") -> dict:
         "htf_4h_bias": htf_4h_bias,
         "bull_fvg": bull_fvg,
         "bear_fvg": bear_fvg,
+        "vwap": vwap_15m,
+        "bull_ob": bull_ob,
+        "bear_ob": bear_ob,
         "is_choppy": is_choppy,
         "funding_rate": market_dict.get("funding_rate", 0.0001),
         "in_killzone": market_dict.get("in_killzone", False),
@@ -345,6 +385,9 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
     htf_4h_bias = structure.get("htf_4h_bias", "NEUTRAL")
     bull_fvg = structure.get("bull_fvg", False)
     bear_fvg = structure.get("bear_fvg", False)
+    vwap = float(structure.get("vwap") or 0.0)
+    bull_ob = structure.get("bull_ob")
+    bear_ob = structure.get("bear_ob")
     strict_trend_lock = getattr(config, "STRICT_TREND_LOCK", True)
     cvd_ratio = structure.get("cvd_ratio", 0.50)
     enable_cvd = getattr(config, "ENABLE_CVD_FILTER", True)
@@ -399,9 +442,25 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
     allow_long_cvd = (cvd_ratio >= 0.48) if enable_cvd else True
     allow_short_cvd = (cvd_ratio <= 0.52) if enable_cvd else True
 
+    # 4H Super-Trend & BTC Leader Correlation Gates
     long_htf_ok = (htf_4h_bias != "BEARISH") and _btc_leader_allows(symbol, "LONG")
     short_htf_ok = (htf_4h_bias != "BULLISH") and _btc_leader_allows(symbol, "SHORT")
+
+    # Institutional Volume Spike (1.20x average volume or FVG displacement)
     vol_spike_ok = (vol >= vol_sma20 * 1.20)
+
+    # Pro Upgrade #1: Anti-Exhaustion Climax Guard (Never buy top after >2.25x ATR 3-bar pump or RSI > 73; never short bottom after >2.25x ATR dump or RSI < 27)
+    three_bar_run = abs(cl - parsed[-4][0]) if len(parsed) >= 5 else 0.0
+    long_not_exhausted = (rsi <= 73.0) and not (cl > parsed[-4][0] and three_bar_run > (atr * 2.25))
+    short_not_exhausted = (rsi >= 27.0) and not (cl < parsed[-4][0] and three_bar_run > (atr * 2.25))
+    long_htf_ok = long_htf_ok and long_not_exhausted
+    short_htf_ok = short_htf_ok and short_not_exhausted
+
+    # Pro Upgrade #2: Session VWAP & Order Block (OB) Institutional Confluence
+    vwap_long_ok = (cl >= vwap * 0.9985) if vwap > 0 else True
+    vwap_short_ok = (cl <= vwap * 1.0015) if vwap > 0 else True
+    touched_bull_ob = bool(bull_ob and (l <= bull_ob[1] + (atr * 0.15)) and (cl >= bull_ob[0]))
+    touched_bear_ob = bool(bear_ob and (h >= bear_ob[0] - (atr * 0.15)) and (cl <= bear_ob[1]))
 
     min_adx = getattr(config, "MIN_ADX_TREND", 22.0)
     enable_choch = getattr(config, "ENABLE_CHOCH_STRATEGY", True) and (not is_choppy) and (adx >= min_adx)
@@ -456,8 +515,8 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
 
     if not is_choppy and adx >= min_adx:
         entry_candidate = current_price or cl
-        trend_bullish = (macro_bias == "BULLISH") and long_htf_ok and (cl > ema200) and (ema9 > ema20 > ema50)
-        touched_bull_zone = (l <= ema20 * 1.0015) and (cl >= ema20 * 0.999)
+        trend_bullish = (macro_bias == "BULLISH") and long_htf_ok and vwap_long_ok and (cl > ema200) and (ema9 > ema20 > ema50)
+        touched_bull_zone = ((l <= ema20 * 1.0015) and (cl >= ema20 * 0.999)) or touched_bull_ob
         strong_bull_candle = (cl > o) and (body_ratio >= 0.50) and (upper_wick_ratio <= 0.25) and (cl > prev_h) and (bull_fvg or vol >= vol_sma20 * 1.15)
         if trend_bullish and touched_bull_zone and strong_bull_candle and (48.0 <= rsi <= 68.0) and (funding <= max_long_funding) and allow_long_cvd:
             if not in_premium or not enable_prem_disc:
@@ -466,10 +525,10 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
                 pullback_low = min(l, prev_l)
                 est_sl_dist = max(params["min_stop"], (entry_candidate - pullback_low) + params["sl_buffer"])
                 if headroom >= (est_sl_dist * 1.20):
-                    return _build_trade_levels("LONG", entry_candidate, pullback_low, atr, "Sniper EMA + FVG Trend Pullback", 94.0, c_time, symbol)
+                    return _build_trade_levels("LONG", entry_candidate, pullback_low, atr, "Sniper EMA + OB + VWAP Pullback", 94.0, c_time, symbol)
 
-        trend_bearish = (macro_bias == "BEARISH") and short_htf_ok and (cl < ema200) and (ema9 < ema20 < ema50)
-        touched_bear_zone = (h >= ema20 * 0.9985) and (cl <= ema20 * 1.001)
+        trend_bearish = (macro_bias == "BEARISH") and short_htf_ok and vwap_short_ok and (cl < ema200) and (ema9 < ema20 < ema50)
+        touched_bear_zone = ((h >= ema20 * 0.9985) and (cl <= ema20 * 1.001)) or touched_bear_ob
         strong_bear_candle = (cl < o) and (body_ratio >= 0.50) and (lower_wick_ratio <= 0.25) and (cl < prev_l) and (bear_fvg or vol >= vol_sma20 * 1.15)
         if trend_bearish and touched_bear_zone and strong_bear_candle and (32.0 <= rsi <= 52.0) and (funding >= min_short_funding) and allow_short_cvd:
             if not in_discount or not enable_prem_disc:
@@ -478,6 +537,6 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
                 pullback_high = max(h, prev_h)
                 est_sl_dist = max(params["min_stop"], (pullback_high - entry_candidate) + params["sl_buffer"])
                 if headroom >= (est_sl_dist * 1.20):
-                    return _build_trade_levels("SHORT", entry_candidate, pullback_high, atr, "Sniper EMA + FVG Trend Pullback", 94.0, c_time, symbol)
+                    return _build_trade_levels("SHORT", entry_candidate, pullback_high, atr, "Sniper EMA + OB + VWAP Pullback", 94.0, c_time, symbol)
 
     return None
