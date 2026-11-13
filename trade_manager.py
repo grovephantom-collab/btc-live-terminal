@@ -87,10 +87,10 @@ def place_delta_order(symbol: str, side: str, lots: int, stop_loss: float, take_
         "size": int(max(1, lots)),
         "side": side.lower(),
         "order_type": "market_order",
-        "bracket_stop_loss_price": str(round(stop_loss, 2)),
-        "bracket_take_profit_price": str(round(take_profit, 2)),
-        "bracket_stop_loss_limit_price": str(round(stop_loss, 2)),
-        "bracket_take_profit_limit_price": str(round(take_profit, 2)),
+        "bracket_stop_loss_price": str(round(stop_loss, int(params.get("decimals", 2)))),
+        "bracket_take_profit_price": str(round(take_profit, int(params.get("decimals", 2)))),
+        "bracket_stop_loss_limit_price": str(round(stop_loss, int(params.get("decimals", 2)))),
+        "bracket_take_profit_limit_price": str(round(take_profit, int(params.get("decimals", 2)))),
     }
     payload_str = json.dumps(payload, separators=(",", ":"))
     signature = _get_delta_signature(config.DELTA_API_SECRET, "POST", path, payload_str, timestamp)
@@ -181,7 +181,7 @@ def calculate_small_cap_delta_size(equity_usd: float, entry: float, sl: float, s
 
     params = config.get_asset_params(symbol)
     lot_size = params["lot_size"]
-    max_lots = getattr(config, "MAX_LOTS_CAP", 10)
+    max_lots = getattr(config, "MAX_LOTS_CAP", 15)
     min_risk = getattr(config, "MIN_RISK_USD", 0.50)
     max_risk = getattr(config, "MAX_RISK_USD", 2.20)
 
@@ -209,7 +209,7 @@ def open_paper_trade(signal: dict, fencing_token: int):
             return
 
         total_act = conn.execute("SELECT COUNT(*) as c FROM trades WHERE stage != 'CLOSED'").fetchone()["c"]
-        if total_act >= getattr(config, "MAX_OPEN_TRADES", 2):
+        if total_act >= getattr(config, "MAX_OPEN_TRADES", 3):
             return
 
         allowed, reason = _check_cooldown_and_circuit_breakers(conn, sym)
@@ -236,8 +236,9 @@ def open_paper_trade(signal: dict, fencing_token: int):
         now_str = database.now_iso()
         inr_rate = getattr(config, "USD_INR_RATE", 86.0)
         risk_inr = round(risk_usd * inr_rate, 0)
-        sl_points = round(abs(entry - sl), 2)
         params = config.get_asset_params(sym)
+        dec = int(params.get("decimals", 2))
+        sl_points = round(abs(entry - sl), dec)
 
         conn.execute("""
             INSERT INTO trades (trade_id, signal_key, symbol, direction, setup_name, score, entry_price, stop_price, tp1_price, tp2_price, tp3_price, initial_qty, remaining_qty, stage, opened_at_utc, updated_at_utc)
@@ -254,8 +255,8 @@ def open_paper_trade(signal: dict, fencing_token: int):
                 f"🚀 *HIGH-CONVICTION TRADE OPENED ({params['display_name']} {signal['direction']})*\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"• Setup: {signal['setup_name']}\n"
-                f"• Entry: ${entry:,.2f} | SL: ${sl:,.2f} ({sl_points} pts)\n"
-                f"• TP1: ${signal['tp1']:,.2f} | TP2: ${signal['tp2']:,.2f} | Runner: ${signal['tp3']:,.2f}\n"
+                f"• Entry: ${entry:,.{dec}f} | SL: ${sl:,.{dec}f} ({sl_points} pts)\n"
+                f"• TP1: ${signal['tp1']:,.{dec}f} | TP2: ${signal['tp2']:,.{dec}f} | Runner: ${signal['tp3']:,.{dec}f}\n"
                 f"• Size: {lots} Lot ({qty})\n"
                 f"• Max Risk: ${risk_usd:.2f} (~₹{risk_inr:.0f})\n"
                 f"• Account Equity: ${equity:.2f} USD"
@@ -283,6 +284,7 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
     now_str = database.now_iso()
     is_long = direction == "LONG"
     params = config.get_asset_params(sym)
+    dec = int(params.get("decimals", 2))
 
     sl_hit = (is_long and current_price <= sl) or (not is_long and current_price >= sl)
     if sl_hit:
@@ -291,7 +293,8 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
         fee_usd = round((entry + exec_exit) * rem_qty * float(config.FEE_RATE), 3)
         leg_pnl = round((price_diff * rem_qty) - fee_usd, 2)
         total_realized = round(float(trade_dict["realized_pnl_usd"]) + leg_pnl, 2)
-        close_reason = "BREAK_EVEN_EXIT" if tp1_done else "STOP_LOSS_HIT"
+        in_profit_sl = (is_long and sl >= entry) or (not is_long and sl <= entry)
+        close_reason = "BREAK_EVEN_EXIT" if (tp1_done or in_profit_sl) else "STOP_LOSS_HIT"
 
         conn.execute("""
             UPDATE trades
@@ -301,12 +304,12 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
         """, (total_realized, fee_usd, close_reason, now_str, now_str, tid))
         conn.commit()
 
-        msg_title = "🛡️ BREAK-EVEN SL HIT (PROFIT SECURED)" if tp1_done else "🛑 STOP LOSS HIT"
+        msg_title = "🛡️ BREAK-EVEN SL HIT (PROFIT SECURED)" if (tp1_done or in_profit_sl) else "🛑 STOP LOSS HIT"
         if hasattr(notifications, "enqueue_telegram"):
             notifications.enqueue_telegram(
                 f"{msg_title} ({params['display_name']} {direction})\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"• Exit Price: ${exec_exit:,.2f}\n"
+                f"• Exit Price: ${exec_exit:,.{dec}f}\n"
                 f"• Net PnL: ${total_realized:+.2f} USD\n"
                 f"• Reason: {close_reason}"
             )
@@ -339,7 +342,7 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
                     notifications.enqueue_telegram(
                         f"⚠️ *EARLY STRUCTURAL EXIT ({params['display_name']} {direction})*\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"• Exit Price: ${exec_exit:,.2f}\n"
+                        f"• Exit Price: ${exec_exit:,.{dec}f}\n"
                         f"• Net PnL: ${total_realized:+.2f} USD\n"
                         f"• Reason: Momentum stalled for >4 hours; exited early to avoid full SL."
                     )
@@ -353,8 +356,8 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
             current_gain = (current_price - entry) if is_long else (entry - current_price)
             r_mult = current_gain / sl_dist
             if r_mult >= 1.0:
-                be_buffer = 0.2 if params["is_gold"] else 15.0
-                target_sl = round(entry + be_buffer if is_long else entry - be_buffer, 2)
+                be_buffer = float(params.get("be_buffer", 0.25 if params["is_gold"] else 15.0))
+                target_sl = round(entry + be_buffer if is_long else entry - be_buffer, dec)
                 if (is_long and target_sl > sl) or (not is_long and target_sl < sl):
                     conn.execute("UPDATE trades SET stop_price = ?, updated_at_utc = ? WHERE trade_id = ?", (target_sl, now_str, tid))
                     conn.commit()
@@ -362,12 +365,12 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
                         notifications.enqueue_telegram(
                             f"🛡️ *PROFIT LOCK (+1.0R RUN)*\n"
                             f"━━━━━━━━━━━━━━━━━━━━\n"
-                            f"• {params['display_name']} is up +1.0R (+${current_gain:.1f})!\n"
-                            f"• SL Trailed to Zero-Risk: ${target_sl:,.2f}"
+                            f"• {params['display_name']} is up +1.0R (+${current_gain:.{dec}f})!\n"
+                            f"• SL Trailed to Zero-Risk: ${target_sl:,.{dec}f}"
                         )
             elif r_mult >= 0.80:
                 tight_dist = sl_dist * 0.25
-                target_sl = round(entry - tight_dist if is_long else entry + tight_dist, 2)
+                target_sl = round(entry - tight_dist if is_long else entry + tight_dist, dec)
                 if (is_long and target_sl > sl) or (not is_long and target_sl < sl):
                     conn.execute("UPDATE trades SET stop_price = ?, updated_at_utc = ? WHERE trade_id = ?", (target_sl, now_str, tid))
                     conn.commit()
@@ -379,8 +382,8 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
             gain_pts = (tp1 - entry) if is_long else (entry - tp1)
             fee_usd = round((entry + tp1) * booked_qty * float(config.FEE_RATE), 3)
             booked_pnl = round((gain_pts * booked_qty) - fee_usd, 2)
-            be_offset = 0.3 if params["is_gold"] else 25.0
-            new_sl = round(entry + be_offset if is_long else entry - be_offset, 2)
+            be_offset = float(params.get("be_buffer", 0.3 if params["is_gold"] else 20.0)) * 1.25
+            new_sl = round(entry + be_offset if is_long else entry - be_offset, dec)
 
             conn.execute("""
                 UPDATE trades
@@ -394,9 +397,9 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
                 notifications.enqueue_telegram(
                     f"🎯 *TARGET 1 HIT ({params['display_name']})*\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"• TP1: ${tp1:,.2f}\n"
+                    f"• TP1: ${tp1:,.{dec}f}\n"
                     f"• Locked Profit: ${booked_pnl:+.2f} USD\n"
-                    f"• SL Trailed to Zero-Risk BE: ${new_sl:,.2f}"
+                    f"• SL Trailed to Zero-Risk BE: ${new_sl:,.{dec}f}"
                 )
             return
 
@@ -407,7 +410,7 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
             gain_pts = (tp2 - entry) if is_long else (entry - tp2)
             fee_usd = round((entry + tp2) * booked_qty * float(config.FEE_RATE), 3)
             booked_pnl = round((gain_pts * booked_qty) - fee_usd, 2)
-            new_sl = round(tp1, 2)
+            new_sl = round(tp1, dec)
 
             conn.execute("""
                 UPDATE trades
@@ -421,10 +424,10 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
                 notifications.enqueue_telegram(
                     f"🎯 *TARGET 2 HIT ({params['display_name']})*\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"• TP2: ${tp2:,.2f}\n"
+                    f"• TP2: ${tp2:,.{dec}f}\n"
                     f"• Locked Profit: ${booked_pnl:+.2f} USD\n"
-                    f"• SL Trailed to TP1: ${new_sl:,.2f}\n"
-                    f"• 20% Runner Trailing for Target 3 (${tp3:,.2f})!"
+                    f"• SL Trailed to TP1: ${new_sl:,.{dec}f}\n"
+                    f"• 20% Runner Trailing for Target 3 (${tp3:,.{dec}f})!"
                 )
             return
 
@@ -448,7 +451,7 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
                 notifications.enqueue_telegram(
                     f"🏆 *TARGET 3 FULL EXIT ({params['display_name']})*\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"• Final Target: ${tp3:,.2f}\n"
+                    f"• Final Target: ${tp3:,.{dec}f}\n"
                     f"• Total Blockbuster PnL: ${total_realized:+.2f} USD"
                 )
             return
