@@ -16,6 +16,18 @@ st.set_page_config(
 )
 
 USD_INR = float(getattr(config, "USD_INR_RATE", 86.0))
+def _fmt_p(val: float) -> str:
+    v = float(val or 0.0)
+    if v == 0:
+        return "$0.00"
+    if v < 1.0:
+        return f"${v:,.5f}"
+    if v < 10.0:
+        return f"${v:,.4f}"
+    if v < 100.0:
+        return f"${v:,.3f}"
+    return f"${v:,.2f}"
+
 DEFAULT_RENDER_URL = "https://btc-live-terminal.onrender.com"
 _LOCAL_LOCK = threading.Lock()
 _LOCAL_STRUCT: Dict[str, Dict[str, Any]] = {}
@@ -42,14 +54,13 @@ def _get_backend_candidates() -> list:
     return candidates
 
 def _enrich_remote_payload(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Ensures remote /vault-data payload has complete SMC zone, ADX, RSI, CVD, and daily counters."""
     mkts = data.get("markets", {})
     for sym, m in mkts.items():
         p_cur = float(m.get("price") or 0.0)
         pdh = float(m.get("pdh") or p_cur * 1.015)
         pdl = float(m.get("pdl") or p_cur * 0.985)
         if not m.get("zone_name"):
-            rel_pos = (p_cur - pdl) / max(0.01, pdh - pdl) if p_cur > 0 else 0.5
+            rel_pos = (p_cur - pdl) / max(0.0001, pdh - pdl) if p_cur > 0 else 0.5
             m["zone_name"] = "DISCOUNT" if rel_pos < 0.45 else ("PREMIUM" if rel_pos > 0.55 else "EQUILIBRIUM")
         if not m.get("adx") or float(m.get("adx") or 0.0) <= 0:
             m["adx"] = 26.4
@@ -95,7 +106,6 @@ def _enrich_remote_payload(data: Dict[str, Any]) -> Dict[str, Any]:
     return data
 
 def _run_local_step():
-    """Fallback local scanner + trade execution step when running standalone without Render."""
     is_leader, token = database.lease_tick()
     market_data.refresh_all_market_data(_LOCAL_LOCK)
     if is_leader and token is not None:
@@ -188,7 +198,7 @@ def _build_local_payload() -> Dict[str, Any]:
             p_cur = float(m.get("price") or params["default_price"])
             pdh = float(m.get("pdh") or m.get("day_high_24h") or p_cur * 1.015)
             pdl = float(m.get("pdl") or m.get("day_low_24h") or p_cur * 0.985)
-            rel_pos = (p_cur - pdl) / max(0.01, pdh - pdl) if p_cur > 0 else 0.5
+            rel_pos = (p_cur - pdl) / max(0.0001, pdh - pdl) if p_cur > 0 else 0.5
             zone_name = "DISCOUNT" if rel_pos < 0.45 else ("PREMIUM" if rel_pos > 0.55 else "EQUILIBRIUM")
 
             markets_info[sym] = {
@@ -252,7 +262,6 @@ def fetch_vault_payload() -> Dict[str, Any]:
     if _CACHED_PAYLOAD and (now - _LAST_FETCH_TS) < 4.0:
         return _CACHED_PAYLOAD
 
-    # 1. Try Render Backend first so Telegram trades & Open Positions sync 100%!
     for base_url in _get_backend_candidates():
         try:
             resp = requests.get(f"{base_url}/vault-data", timeout=5)
@@ -264,7 +273,6 @@ def fetch_vault_payload() -> Dict[str, Any]:
         except Exception:
             continue
 
-    # 2. Fallback to local engine if Render is unreachable
     _CACHED_PAYLOAD = _build_local_payload()
     _LAST_FETCH_TS = now
     return _CACHED_PAYLOAD
@@ -480,7 +488,7 @@ def _render_dashboard_body():
     st.markdown(
         f'<div class="top-bar">'
         f'<div><div class="brand-title">⚡ SR QUANTX — ALGO TERMINAL</div>'
-        f'<div class="brand-sub">{payload.get("session", "ACTIVE")} • {kz_label} • 25x Leverage</div></div>'
+        f'<div class="brand-sub">{payload.get("session", "ACTIVE")} • {kz_label} • 8-Market Scanner • 25x Leverage</div></div>'
         f'<div class="status-pill" style="background:{s_bg};border:1px solid {s_bd};color:{s_bd};">{s_tx}</div>'
         f'</div>',
         unsafe_allow_html=True,
@@ -528,8 +536,8 @@ def _render_dashboard_body():
         unsafe_allow_html=True,
     )
 
-    # 4. 2x2 MULTI-MARKET LIVE SCANNER MATRIX
-    st.markdown('<div class="sec-title">📡 Multi-Asset Institutional Scanner</div>', unsafe_allow_html=True)
+    # 4. 8-MARKET LIVE SCANNER MATRIX (2x4 on Mobile, 4x2 on Desktop)
+    st.markdown('<div class="sec-title">📡 Multi-Asset Institutional Scanner (8 Markets)</div>', unsafe_allow_html=True)
     if markets:
         cards_html = '<div class="market-grid">'
         for sym, m in markets.items():
@@ -557,11 +565,11 @@ def _render_dashboard_body():
             cards_html += (
                 f'<div class="mkt-card">'
                 f'<div class="mkt-head"><span class="mkt-name">{short_name}</span><span class="{t_cls}">{t_txt}</span></div>'
-                f'<div class="mkt-price" style="color:{p_clr};">${p:,.2f}</div>'
+                f'<div class="mkt-price" style="color:{p_clr};">{_fmt_p(p)}</div>'
                 f'<div class="mkt-row"><span>SMC Zone:</span><b style="color:#e2e8f0;">{zone.split()[0]}</b></div>'
                 f'<div class="mkt-row"><span>ADX / RSI:</span><b style="color:#e2e8f0;">{adx:.1f} / {rsi:.1f}</b></div>'
                 f'<div class="mkt-row"><span>CVD Delta:</span><b style="color:{flow_clr};">{flow_txt}</b></div>'
-                f'<div class="mkt-row"><span>PDH / PDL:</span><b>${pdh:,.0f} / ${pdl:,.0f}</b></div>'
+                f'<div class="mkt-row"><span>PDH / PDL:</span><b>{_fmt_p(pdh)} / {_fmt_p(pdl)}</b></div>'
                 f'</div>'
             )
         cards_html += '</div>'
@@ -582,16 +590,16 @@ def _render_dashboard_body():
                 f'<span style="color:{u_clr};font-weight:800;font-size:0.92rem;">${upnl:+.2f} (₹{upnl * USD_INR:+,.0f})</span>'
                 f'</div>'
                 f'<div style="font-size:0.74rem;color:#94a3b8;margin-top:5px;">'
-                f'Entry: <b>${float(tr["entry_price"]):,.2f}</b> &nbsp;|&nbsp; '
-                f'SL: <b style="color:#ef4444;">${float(tr["stop_price"]):,.2f}</b> &nbsp;|&nbsp; '
-                f'TP1: <b style="color:#10b981;">${float(tr["tp1_price"]):,.2f}</b> &nbsp;|&nbsp; '
-                f'TP2: <b style="color:#10b981;">${float(tr["tp2_price"]):,.2f}</b>'
+                f'Entry: <b>{_fmt_p(float(tr["entry_price"]))}</b> &nbsp;|&nbsp; '
+                f'SL: <b style="color:#ef4444;">{_fmt_p(float(tr["stop_price"]))}</b> &nbsp;|&nbsp; '
+                f'TP1: <b style="color:#10b981;">{_fmt_p(float(tr["tp1_price"]))}</b> &nbsp;|&nbsp; '
+                f'TP2: <b style="color:#10b981;">{_fmt_p(float(tr["tp2_price"]))}</b>'
                 f'</div>'
                 f'</div>',
                 unsafe_allow_html=True,
             )
     else:
-        st.caption("No open positions — Scanner monitoring BTC, ETH, SOL & Gold for institutional SMC + CVD confluence.")
+        st.caption("No open positions — Scanner monitoring all 8 markets (BTC, ETH, SOL, Gold, BNB, XRP, DOGE, AVAX) for Sniper confluence.")
 
     tab1, tab2, tab3 = st.tabs(["📜 Execution Log", "📈 Equity Curve", "📊 Strategy & Risk Specs"])
     with tab1:
@@ -602,8 +610,8 @@ def _render_dashboard_body():
                     "Asset": str(t.get("symbol", "")).replace("USDT", ""),
                     "Side": t.get("direction"),
                     "Strategy": t.get("setup_name"),
-                    "Entry": f"${float(t.get('entry_price') or 0):,.2f}",
-                    "SL": f"${float(t.get('stop_price') or 0):,.2f}",
+                    "Entry": _fmt_p(float(t.get('entry_price') or 0)),
+                    "SL": _fmt_p(float(t.get('stop_price') or 0)),
                     "Exit Reason": t.get("close_reason") or "ACTIVE",
                     "PnL ($)": f"${float(t.get('realized_pnl_usd') or 0.0):+.2f}",
                 }
@@ -622,7 +630,7 @@ def _render_dashboard_body():
 
     with tab3:
         st.markdown(
-            f"- **Markets Scanned:** `{', '.join(config.SYMBOLS)}` (4H + 1H + 15m Sniper Confluence)\n"
+            f"- **8 Markets Scanned:** `{', '.join(config.SYMBOLS)}` (4H + 1H + 15m Sniper Confluence)\n"
             f"- **Position Sizing:** `{config.RISK_PCT*100:.1f}%` Equity Risk (`${config.MIN_RISK_USD:.2f}` – `${config.MAX_RISK_USD:.2f}` cap) at `{config.LEVERAGE}x` Leverage\n"
             f"- **Profit Lock Engine:** `+0.8R` slashes risk to `0.25R` | `+1.0R` moves SL to Break-Even | `TP1 (1.4R)` books `50%` | `TP2 (2.4R)` books `30%` | `TP3 (3.5R)` trails `20%` runner"
         )
