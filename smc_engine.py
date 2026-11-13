@@ -91,10 +91,6 @@ def _calc_adx(highs: list, lows: list, closes: list, period: int = 14) -> float:
     return round(float(adx), 1)
 
 def _detect_fvg_and_displacement(closed_15: list, atr: float, min_gap: float) -> tuple:
-    """
-    Detects Institutional Fair Value Gap (3-candle price imbalance) or
-    High-Momentum Displacement Bar over the last 4 closed bars.
-    """
     if len(closed_15) < 6:
         return False, False
     bull_fvg = False
@@ -273,10 +269,6 @@ def get_structure(market_dict: dict, symbol: str = "BTCUSDT") -> dict:
     }
 
 def _btc_leader_allows(symbol: str, direction: str) -> bool:
-    """
-    BTC Market Leader Correlation Guard:
-    Blocks longing ETH/SOL when BTC is dumping hard, or shorting ETH/SOL when BTC is pumping hard.
-    """
     sym = symbol.strip().upper()
     if sym in ("BTCUSDT", "PAXGUSDT", "XAUUSD"):
         return True
@@ -302,28 +294,29 @@ def _build_trade_levels(direction: str, entry: float, raw_sl: float, atr: float,
     sl_buffer = params["sl_buffer"]
     min_stop = params["min_stop"]
     max_stop = params["max_stop"]
+    dec = int(params.get("decimals", 2))
 
     if direction == "LONG":
         structural_dist = (entry - raw_sl) + sl_buffer
         sl_dist = max(min_stop, min(max_stop, max(structural_dist, atr * 1.7)))
-        sl = round(entry - sl_dist, 2)
-        tp1 = round(entry + (sl_dist * 1.4), 2)
-        tp2 = round(entry + (sl_dist * 2.4), 2)
-        tp3 = round(entry + (sl_dist * 3.5), 2)
+        sl = round(entry - sl_dist, dec)
+        tp1 = round(entry + (sl_dist * 1.4), dec)
+        tp2 = round(entry + (sl_dist * 2.4), dec)
+        tp3 = round(entry + (sl_dist * 3.5), dec)
     else:
         structural_dist = (raw_sl - entry) + sl_buffer
         sl_dist = max(min_stop, min(max_stop, max(structural_dist, atr * 1.7)))
-        sl = round(entry + sl_dist, 2)
-        tp1 = round(entry - (sl_dist * 1.4), 2)
-        tp2 = round(entry - (sl_dist * 2.4), 2)
-        tp3 = round(entry - (sl_dist * 3.5), 2)
+        sl = round(entry + sl_dist, dec)
+        tp1 = round(entry - (sl_dist * 1.4), dec)
+        tp2 = round(entry - (sl_dist * 2.4), dec)
+        tp3 = round(entry - (sl_dist * 3.5), dec)
 
     return {
         "symbol": symbol,
         "direction": direction,
         "setup_name": setup_name,
         "score": round(score, 1),
-        "entry": round(entry, 2),
+        "entry": round(entry, dec),
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
@@ -382,7 +375,7 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
     if current_price and abs(current_price - cl) > (atr * 0.85):
         return None
 
-    candle_range = max(0.1 if params["is_gold"] else 1.0, h - l)
+    candle_range = max(1e-6, h - l)
     body_ratio = abs(cl - o) / candle_range
     lower_wick_ratio = (min(o, cl) - l) / candle_range
     upper_wick_ratio = (h - max(o, cl)) / candle_range
