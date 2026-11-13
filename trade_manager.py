@@ -208,9 +208,20 @@ def open_paper_trade(signal: dict, fencing_token: int):
         if act:
             return
 
-        total_act = conn.execute("SELECT COUNT(*) as c FROM trades WHERE stage != 'CLOSED'").fetchone()["c"]
-        if total_act >= getattr(config, "MAX_OPEN_TRADES", 3):
+        active_rows = conn.execute("SELECT symbol, direction FROM trades WHERE stage != 'CLOSED'").fetchall()
+        if len(active_rows) >= getattr(config, "MAX_OPEN_TRADES", 3):
             return
+
+        # Pro Upgrade #4: Directional Crypto Correlation Cap (Max 2 correlated crypto trades in same direction)
+        is_gold_sym = ("PAXG" in sym) or ("XAU" in sym) or ("GOLD" in sym)
+        if not is_gold_sym:
+            same_dir_crypto = sum(
+                1 for r in active_rows
+                if r["direction"] == signal["direction"] and not any(g in str(r["symbol"]).upper() for g in ("PAXG", "XAU", "GOLD"))
+            )
+            if same_dir_crypto >= 2:
+                log.info("Trade skipped [%s %s]: Max 2 correlated crypto trades in same direction already active.", sym, signal["direction"])
+                return
 
         allowed, reason = _check_cooldown_and_circuit_breakers(conn, sym)
         if not allowed:
