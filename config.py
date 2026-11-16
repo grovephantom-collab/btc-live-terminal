@@ -40,12 +40,12 @@ try:
     if MODE not in ("PAPER", "TESTNET", "LIVE"):
         raise RuntimeError("TRADING_MODE must be PAPER, TESTNET, or LIVE.")
 
-    # --- 8-MARKET INSTITUTIONAL SCANNER: BTC, ETH, SOL, GOLD, BNB, XRP, DOGE, AVAX ---
-    DEFAULT_8_SYMBOLS = "BTCUSDT,ETHUSDT,SOLUSDT,PAXGUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,AVAXUSDT"
+    # --- 8 HIGH-VELOCITY MARKETS: BTC, ETH, SOL, GOLD, XRP, DOGE, SUI, LINK ---
+    DEFAULT_8_SYMBOLS = "BTCUSDT,ETHUSDT,SOLUSDT,PAXGUSDT,XRPUSDT,DOGEUSDT,SUIUSDT,LINKUSDT"
     SYMBOLS_STR = os.getenv("SYMBOLS", os.getenv("SYMBOL", DEFAULT_8_SYMBOLS)).strip()
     SYMBOLS = [s.strip().upper() for s in SYMBOLS_STR.split(",") if s.strip()]
     if not SYMBOLS:
-        SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "PAXGUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "AVAXUSDT"]
+        SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "PAXGUSDT", "XRPUSDT", "DOGEUSDT", "SUIUSDT", "LINKUSDT"]
     SYMBOL = SYMBOLS[0]
 
     PORT = ienv("PORT", 10000, 1)
@@ -91,7 +91,7 @@ try:
     ENABLE_CVD_FILTER = os.getenv("ENABLE_CVD_FILTER", "true").strip().lower() == "true"
     ENABLE_DYNAMIC_PROFIT_LOCK = os.getenv("ENABLE_DYNAMIC_PROFIT_LOCK", "true").strip().lower() == "true"
     MIN_HEADROOM_RATIO = fenv("MIN_HEADROOM_RATIO", 1.25, 1.0)
-    MIN_ADX_TREND = fenv("MIN_ADX_TREND", 22.0, 10.0)
+    MIN_ADX_TREND = fenv("MIN_ADX_TREND", 18.0, 10.0)
     MAX_CHOP_BANDWIDTH = fenv("MAX_CHOP_BANDWIDTH", 0.018, 0.005)
 
     MAX_FUNDING_FOR_LONG = fenv("MAX_FUNDING_FOR_LONG", 0.00035, 0.0)
@@ -110,7 +110,7 @@ except Exception as e:
     sys.exit(f"Startup Config Error: {e}")
 
 def get_asset_params(symbol: str) -> dict:
-    """Returns asset-specific volatility, decimals, break-even buffer, and Delta Exchange specs across 8 markets."""
+    """Returns asset-specific volatility, decimals, fee-safe break-even buffer, and Delta specs."""
     sym = symbol.strip().upper()
     if ("XAU" in sym) or ("GOLD" in sym) or ("PAXG" in sym):
         return {
@@ -126,7 +126,7 @@ def get_asset_params(symbol: str) -> dict:
             "sl_buffer": float(os.getenv("GOLD_SL_BUFFER", "0.6")),
             "min_gap": float(os.getenv("GOLD_MIN_GAP", "0.8")),
             "sweep_buffer": float(os.getenv("GOLD_SWEEP_BUFFER", "0.4")),
-            "be_buffer": float(os.getenv("GOLD_BE_BUFFER", "0.25")),
+            "be_buffer": float(os.getenv("GOLD_BE_BUFFER", "4.20")),
             "lot_size": float(os.getenv("GOLD_LOT_SIZE", "0.01")),
             "default_price": 2700.0,
             "default_atr": 4.5
@@ -145,7 +145,7 @@ def get_asset_params(symbol: str) -> dict:
             "sl_buffer": float(os.getenv("ETH_SL_BUFFER", "2.5")),
             "min_gap": float(os.getenv("ETH_MIN_GAP", "2.0")),
             "sweep_buffer": float(os.getenv("ETH_SWEEP_BUFFER", "1.5")),
-            "be_buffer": float(os.getenv("ETH_BE_BUFFER", "0.80")),
+            "be_buffer": float(os.getenv("ETH_BE_BUFFER", "2.60")),
             "lot_size": float(os.getenv("ETH_LOT_SIZE", "0.01")),
             "default_price": 3000.0,
             "default_atr": 14.0
@@ -164,29 +164,48 @@ def get_asset_params(symbol: str) -> dict:
             "sl_buffer": float(os.getenv("SOL_SL_BUFFER", "0.2")),
             "min_gap": float(os.getenv("SOL_MIN_GAP", "0.15")),
             "sweep_buffer": float(os.getenv("SOL_SWEEP_BUFFER", "0.1")),
-            "be_buffer": float(os.getenv("SOL_BE_BUFFER", "0.15")),
+            "be_buffer": float(os.getenv("SOL_BE_BUFFER", "0.22")),
             "lot_size": float(os.getenv("SOL_LOT_SIZE", "0.1")),
             "default_price": 180.0,
             "default_atr": 1.1
         }
-    if "BNB" in sym:
+    if "SUI" in sym:
         return {
             "symbol": sym,
             "is_gold": False,
-            "decimals": 2,
-            "display_name": "BNB (BNB)",
-            "cb_symbol": "BNB-USD",
-            "bin_symbol": "BNBUSDT",
-            "delta_symbol": "BNBUSD",
-            "min_stop": float(os.getenv("BNB_MIN_STOP", "3.5")),
-            "max_stop": float(os.getenv("BNB_MAX_STOP", "8.0")),
-            "sl_buffer": float(os.getenv("BNB_SL_BUFFER", "0.6")),
-            "min_gap": float(os.getenv("BNB_MIN_GAP", "0.5")),
-            "sweep_buffer": float(os.getenv("BNB_SWEEP_BUFFER", "0.3")),
-            "be_buffer": float(os.getenv("BNB_BE_BUFFER", "0.30")),
-            "lot_size": float(os.getenv("BNB_LOT_SIZE", "0.01")),
-            "default_price": 620.0,
-            "default_atr": 3.2
+            "decimals": 4,
+            "display_name": "Sui (SUI)",
+            "cb_symbol": "SUI-USD",
+            "bin_symbol": "SUIUSDT",
+            "delta_symbol": "SUIUSD",
+            "min_stop": float(os.getenv("SUI_MIN_STOP", "0.045")),
+            "max_stop": float(os.getenv("SUI_MAX_STOP", "0.110")),
+            "sl_buffer": float(os.getenv("SUI_SL_BUFFER", "0.008")),
+            "min_gap": float(os.getenv("SUI_MIN_GAP", "0.006")),
+            "sweep_buffer": float(os.getenv("SUI_SWEEP_BUFFER", "0.004")),
+            "be_buffer": float(os.getenv("SUI_BE_BUFFER", "0.0060")),
+            "lot_size": float(os.getenv("SUI_LOT_SIZE", "10.0")),
+            "default_price": 3.10,
+            "default_atr": 0.040
+        }
+    if "LINK" in sym:
+        return {
+            "symbol": sym,
+            "is_gold": False,
+            "decimals": 3,
+            "display_name": "Chainlink (LINK)",
+            "cb_symbol": "LINK-USD",
+            "bin_symbol": "LINKUSDT",
+            "delta_symbol": "LINKUSD",
+            "min_stop": float(os.getenv("LINK_MIN_STOP", "0.25")),
+            "max_stop": float(os.getenv("LINK_MAX_STOP", "0.60")),
+            "sl_buffer": float(os.getenv("LINK_SL_BUFFER", "0.04")),
+            "min_gap": float(os.getenv("LINK_MIN_GAP", "0.03")),
+            "sweep_buffer": float(os.getenv("LINK_SWEEP_BUFFER", "0.02")),
+            "be_buffer": float(os.getenv("LINK_BE_BUFFER", "0.035")),
+            "lot_size": float(os.getenv("LINK_LOT_SIZE", "1.0")),
+            "default_price": 15.0,
+            "default_atr": 0.22
         }
     if "XRP" in sym:
         return {
@@ -202,7 +221,7 @@ def get_asset_params(symbol: str) -> dict:
             "sl_buffer": float(os.getenv("XRP_SL_BUFFER", "0.003")),
             "min_gap": float(os.getenv("XRP_MIN_GAP", "0.002")),
             "sweep_buffer": float(os.getenv("XRP_SWEEP_BUFFER", "0.0015")),
-            "be_buffer": float(os.getenv("XRP_BE_BUFFER", "0.0020")),
+            "be_buffer": float(os.getenv("XRP_BE_BUFFER", "0.0025")),
             "lot_size": float(os.getenv("XRP_LOT_SIZE", "10.0")),
             "default_price": 1.10,
             "default_atr": 0.015
@@ -226,25 +245,6 @@ def get_asset_params(symbol: str) -> dict:
             "default_price": 0.35,
             "default_atr": 0.004
         }
-    if "AVAX" in sym:
-        return {
-            "symbol": sym,
-            "is_gold": False,
-            "decimals": 3,
-            "display_name": "Avalanche (AVAX)",
-            "cb_symbol": "AVAX-USD",
-            "bin_symbol": "AVAXUSDT",
-            "delta_symbol": "AVAXUSD",
-            "min_stop": float(os.getenv("AVAX_MIN_STOP", "0.35")),
-            "max_stop": float(os.getenv("AVAX_MAX_STOP", "0.85")),
-            "sl_buffer": float(os.getenv("AVAX_SL_BUFFER", "0.06")),
-            "min_gap": float(os.getenv("AVAX_MIN_GAP", "0.05")),
-            "sweep_buffer": float(os.getenv("AVAX_SWEEP_BUFFER", "0.03")),
-            "be_buffer": float(os.getenv("AVAX_BE_BUFFER", "0.04")),
-            "lot_size": float(os.getenv("AVAX_LOT_SIZE", "1.0")),
-            "default_price": 32.0,
-            "default_atr": 0.30
-        }
     return {
         "symbol": sym,
         "is_gold": False,
@@ -258,7 +258,7 @@ def get_asset_params(symbol: str) -> dict:
         "sl_buffer": float(os.getenv("STRUCTURAL_SL_BUFFER_USD", "50")),
         "min_gap": float(os.getenv("MIN_FVG_GAP_USD", "35")),
         "sweep_buffer": float(os.getenv("SWEEP_BUFFER_USD", "20")),
-        "be_buffer": float(os.getenv("BTC_BE_BUFFER", "15.0")),
+        "be_buffer": float(os.getenv("BTC_BE_BUFFER", "85.0")),
         "lot_size": float(os.getenv("DELTA_LOT_SIZE_BTC", "0.001")),
         "default_price": 75000.0,
         "default_atr": 220.0
