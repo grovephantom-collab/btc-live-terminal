@@ -451,7 +451,7 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
     touched_bull_ob = bool(bull_ob and (l <= bull_ob[1] + (atr * 0.15)) and (cl >= bull_ob[0]))
     touched_bear_ob = bool(bear_ob and (h >= bear_ob[0] - (atr * 0.15)) and (cl <= bear_ob[1]))
 
-    min_adx = getattr(config, "MIN_ADX_TREND", 22.0)
+    min_adx = getattr(config, "MIN_ADX_TREND", 18.0)
     enable_choch = getattr(config, "ENABLE_CHOCH_STRATEGY", True) and (not is_choppy) and (adx >= min_adx)
 
     if enable_choch and choch_status != "NONE" and choch_level:
@@ -467,7 +467,6 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
                 sl_anchor = min(lowest_recent, choch_level - (atr * 0.20))
                 return _build_trade_levels("LONG", current_price or cl, sl_anchor, atr, "Sniper CHoCH + FVG Breakout", 99.0, c_time, symbol)
 
-    # STRATEGY 1: INSTITUTIONAL DAILY EXPANSION (With ADX >= 22, Fresh-Breakout & Non-Oversold Guard)
     if getattr(config, "ENABLE_DAILY_BREAKOUT", True) and (not is_choppy) and (adx >= min_adx):
         breakout_high = pdh or day_high_24h
         if breakout_high and macro_bias == "BULLISH" and long_htf_ok and vwap_long_ok and funding <= max_long_funding and allow_long_cvd:
@@ -530,5 +529,42 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
                 est_sl_dist = max(params["min_stop"], (pullback_high - entry_candidate) + params["sl_buffer"])
                 if headroom >= (est_sl_dist * 1.20):
                     return _build_trade_levels("SHORT", entry_candidate, pullback_high, atr, "Sniper EMA + OB + VWAP Pullback", 94.0, c_time, symbol)
+
+    # STRATEGY 5: INTRADAY ORDER BLOCK + VWAP MOMENTUM IMPULSE (CATCHES FAST MOVES WHEN ADX IS 15-20)
+    if not is_choppy and adx >= 15.0:
+        entry_candidate = current_price or cl
+        bull_impulse = (
+            (macro_bias in ("BULLISH", "NEUTRAL"))
+            and long_htf_ok
+            and vwap_long_ok
+            and (cl > ema20 > ema50)
+            and (cl > o)
+            and (body_ratio >= 0.50)
+            and (cl > prev_h)
+            and (bull_fvg or touched_bull_ob or vol_spike_ok)
+            and (48.0 <= rsi <= 68.0)
+            and (cvd_ratio >= 0.53)
+            and (funding <= max_long_funding)
+            and (not in_premium)
+        )
+        if bull_impulse:
+            return _build_trade_levels("LONG", entry_candidate, min(l, prev_l, ema20), atr, "Intraday OB + VWAP Momentum", 92.0, c_time, symbol)
+
+        bear_impulse = (
+            (macro_bias in ("BEARISH", "NEUTRAL"))
+            and short_htf_ok
+            and vwap_short_ok
+            and (cl < ema20 < ema50)
+            and (cl < o)
+            and (body_ratio >= 0.50)
+            and (cl < prev_l)
+            and (bear_fvg or touched_bear_ob or vol_spike_ok)
+            and (32.0 <= rsi <= 52.0)
+            and (cvd_ratio <= 0.47)
+            and (funding >= min_short_funding)
+            and (not in_discount)
+        )
+        if bear_impulse:
+            return _build_trade_levels("SHORT", entry_candidate, max(h, prev_h, ema20), atr, "Intraday OB + VWAP Momentum", 92.0, c_time, symbol)
 
     return None
