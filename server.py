@@ -102,6 +102,33 @@ def _enrich_remote_payload(data: Dict[str, Any]) -> Dict[str, Any]:
         data["wallet"] = {"balance_usd": bal, "available_usd": bal, "is_live_synced": False}
     if "auto_trade_enabled" not in data:
         data["auto_trade_enabled"] = True
+    if "compounding" not in data:
+        total_net = float(data.get("realized_pnl_usd") or 0.0)
+        total_fees = round(sum(float(t.get("total_fee_usd") or 0.0) for t in vault if t.get("stage") == "CLOSED"), 2)
+        if total_fees == 0 and vault:
+            total_fees = round(sum(abs(float(t.get("entry_price") or 0.0)) * float(t.get("initial_qty") or 0.0) * 2.0 * float(config.FEE_RATE) for t in vault if t.get("stage") == "CLOSED"), 2)
+        total_gross = round(total_net + total_fees, 2)
+        w_pct = float(getattr(config, "WITHDRAWAL_RESERVE_PCT", 0.30))
+        r_pct = float(getattr(config, "COMPOUND_REINVEST_PCT", 0.70))
+        withdrawable = round(total_net * w_pct, 2) if total_net > 0 else 0.0
+        reinvested = round(total_net * r_pct, 2) if total_net > 0 else round(total_net, 2)
+        act_eq = round(float(config.START_EQUITY) + reinvested, 2)
+        mult = round(max(0.70, min(3.0, act_eq / max(1.0, float(config.START_EQUITY)))), 2)
+        data["compounding"] = {
+            "base_capital_usd": round(float(config.START_EQUITY), 2),
+            "total_gross_pnl_usd": total_gross,
+            "total_brokerage_usd": total_fees,
+            "total_net_pnl_usd": round(total_net, 2),
+            "cycle_days": 15,
+            "cycle_15d_net_pnl_usd": round(total_net, 2),
+            "cycle_15d_fees_usd": total_fees,
+            "withdrawable_usd": withdrawable,
+            "reinvested_usd": reinvested,
+            "active_trading_equity_usd": act_eq,
+            "total_portfolio_equity_usd": round(float(config.START_EQUITY) + total_net, 2),
+            "lot_multiplier": mult,
+            "scaling_status": "SCALING UP (PROFIT)" if total_net > 0 else ("SCALING DOWN (DEFENSIVE)" if total_net < 0 else "BASE LOT SIZE"),
+        }
 
     return data
 
@@ -184,9 +211,10 @@ def _build_local_payload() -> Dict[str, Any]:
                 max_dd = dd
             equity_curve.append({"trade": idx, "equity": round(eq, 2), "drawdown": -dd})
 
+        comp_15d = trade_manager.get_15d_compounding_state(c)
         delta_wallet = trade_manager.fetch_delta_wallet_balance()
-        wallet_bal = delta_wallet["balance"] if delta_wallet["balance"] is not None else round(config.START_EQUITY + pnl, 2)
-        wallet_avail = delta_wallet["available"] if delta_wallet["available"] is not None else round(wallet_bal, 2)
+        wallet_bal = delta_wallet["balance"] if delta_wallet["balance"] is not None else comp_15d["total_portfolio_equity_usd"]
+        wallet_avail = delta_wallet["available"] if delta_wallet["available"] is not None else comp_15d["active_trading_equity_usd"]
         auto_enabled = database.get_setting("auto_trade_enabled", "1") == "1"
 
         markets_info = {}
@@ -235,6 +263,7 @@ def _build_local_payload() -> Dict[str, Any]:
             "is_dead_hour": btc_m.get("is_dead_hour", False),
             "news_blackout": btc_m.get("news_blackout", False),
             "realized_pnl_usd": round(pnl, 2),
+            "compounding": comp_15d,
             "unrealized_pnl_usd": round(unrealized, 2),
             "day_trades": day_trades,
             "day_pnl_usd": round(day_pnl, 2),
@@ -523,20 +552,59 @@ def _render_dashboard_body():
         unsafe_allow_html=True,
     )
 
-    # 3. ALGO RISK & CIRCUIT BREAKER GUARDRAILS
+    # 3. 15-DAY COMPOUNDING, WITHDRAWAL VAULT & BROKERAGE TRANSPARENCY
+    comp = payload.get("compounding", {})
+    c15_pnl = float(comp.get("cycle_15d_net_pnl_usd", realized_pnl))
+    withdrawable_usd = float(comp.get("withdrawable_usd", 0.0))
+    reinvested_usd = float(comp.get("reinvested_usd", 0.0))
+    act_cap_usd = float(comp.get("active_trading_equity_usd", bal_usd))
+    tot_brok_usd = float(comp.get("total_brokerage_usd", 0.0))
+    tot_gross_usd = float(comp.get("total_gross_pnl_usd", realized_pnl))
+    lot_mult = float(comp.get("lot_multiplier", 1.0))
+    scale_label = comp.get("scaling_status", "BASE LOT SIZE")
+    c15_clr = "#10b981" if c15_pnl >= 0 else "#ef4444"
+
+    st.markdown('<div class="sec-title">🏦 15-Day Compounding, Lot Scaling & Withdrawal Vault</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="kpi-grid">'
+        f'<div class="kpi-box">'
+        f'<div class="kpi-title">15-DAY NET PNL (AFTER FEES)</div>'
+        f'<div class="kpi-val" style="color:{c15_clr};">${c15_pnl:+.2f}</div>'
+        f'<div class="kpi-sub">₹{c15_pnl * USD_INR:+,.0f} • Gross: ${tot_gross_usd:+.2f}</div>'
+        f'</div>'
+        f'<div class="kpi-box">'
+        f'<div class="kpi-title">FREE FOR WITHDRAWAL (30%)</div>'
+        f'<div class="kpi-val" style="color:#10b981;">${withdrawable_usd:,.2f}</div>'
+        f'<div class="kpi-sub">₹{withdrawable_usd * USD_INR:,.0f} Safe to Withdraw</div>'
+        f'</div>'
+        f'<div class="kpi-box">'
+        f'<div class="kpi-title">COMPOUNDED TRADING CAP (70%)</div>'
+        f'<div class="kpi-val" style="color:#38bdf8;">${act_cap_usd:,.2f}</div>'
+        f'<div class="kpi-sub">Lot Scale: {lot_mult:.2f}x ({scale_label})</div>'
+        f'</div>'
+        f'<div class="kpi-box">'
+        f'<div class="kpi-title">TOTAL BROKERAGE DEDUCTED</div>'
+        f'<div class="kpi-val" style="color:#fbbf24;">-${tot_brok_usd:,.2f}</div>'
+        f'<div class="kpi-sub">-₹{tot_brok_usd * USD_INR:,.0f} (Delta Fee + GST Deducted)</div>'
+        f'</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # 3.5 ALGO RISK & CIRCUIT BREAKER GUARDRAILS
     dead_ok = "BLOCKED" if payload.get("is_dead_hour") else "ACTIVE"
     news_ok = "BLACKOUT" if payload.get("news_blackout") else "CLEAR"
     st.markdown(
         f'<div class="guard-grid">'
         f'<div class="guard-box"><b>DAILY TRADES:</b> <span style="color:#f8fafc;">{day_trades} / {config.MAX_DAILY_TRADES}</span></div>'
         f'<div class="guard-box"><b>DAILY LOSS LIMIT:</b> <span style="color:#f8fafc;">${day_pnl:+.2f} / -${config.MAX_DAILY_LOSS:.2f}</span></div>'
-        f'<div class="guard-box"><b>RISK PER TRADE:</b> <span style="color:#38bdf8;">{config.RISK_PCT*100:.1f}% (~${bal_usd*config.RISK_PCT:.2f})</span></div>'
+        f'<div class="guard-box"><b>ACTIVE LOT RISK:</b> <span style="color:#38bdf8;">{config.RISK_PCT*100:.1f}% (~${act_cap_usd*config.RISK_PCT:.2f})</span></div>'
         f'<div class="guard-box"><b>LIQUIDITY / NEWS:</b> <span style="color:#10b981;">{dead_ok} / {news_ok}</span></div>'
         f'</div>',
         unsafe_allow_html=True,
     )
 
-    # 4. 8-MARKET LIVE SCANNER MATRIX (2x4 on Mobile, 4x2 on Desktop)
+    # 4. 8-MARKET LIVE SCANNER MATRIX
     st.markdown('<div class="sec-title">📡 Multi-Asset Institutional Scanner (8 Markets)</div>', unsafe_allow_html=True)
     if markets:
         cards_html = '<div class="market-grid">'
@@ -599,21 +667,21 @@ def _render_dashboard_body():
                 unsafe_allow_html=True,
             )
     else:
-        st.caption("No open positions — Scanner monitoring all 8 markets (BTC, ETH, SOL, Gold, BNB, XRP, DOGE, AVAX) for Sniper confluence.")
+        st.caption("No open positions — Scanner monitoring all 8 markets (BTC, ETH, SOL, Gold, XRP, DOGE, SUI, LINK) for Sniper confluence.")
 
-    tab1, tab2, tab3 = st.tabs(["📜 Execution Log", "📈 Equity Curve", "📊 Strategy & Risk Specs"])
+    tab1, tab2, tab3 = st.tabs(["📜 Execution Log (With Brokerage)", "📈 Equity Curve", "📊 Strategy & Risk Specs"])
     with tab1:
         if vault_trades:
             df_log = pd.DataFrame([
                 {
-                    "Time (UTC)": str(t.get("opened_at_utc", ""))[11:19],
+                    "Time": str(t.get("opened_at_utc", ""))[11:19],
                     "Asset": str(t.get("symbol", "")).replace("USDT", ""),
                     "Side": t.get("direction"),
-                    "Strategy": t.get("setup_name"),
-                    "Entry": _fmt_p(float(t.get('entry_price') or 0)),
-                    "SL": _fmt_p(float(t.get('stop_price') or 0)),
+                    "Entry": _fmt_p(float(t.get("entry_price") or 0)),
                     "Exit Reason": t.get("close_reason") or "ACTIVE",
-                    "PnL ($)": f"${float(t.get('realized_pnl_usd') or 0.0):+.2f}",
+                    "Gross ($)": f"${(float(t.get('realized_pnl_usd') or 0.0) + float(t.get('total_fee_usd') or 0.0)):+.2f}",
+                    "Fee ($)": f"-${float(t.get('total_fee_usd') or 0.0):.2f}",
+                    "Net PnL ($)": f"${float(t.get('realized_pnl_usd') or 0.0):+.2f}",
                 }
                 for t in vault_trades
             ])
@@ -630,9 +698,10 @@ def _render_dashboard_body():
 
     with tab3:
         st.markdown(
-            f"- **8 Markets Scanned:** `{', '.join(config.SYMBOLS)}` (4H + 1H + 15m Sniper Confluence)\n"
-            f"- **Position Sizing:** `{config.RISK_PCT*100:.1f}%` Equity Risk (`${config.MIN_RISK_USD:.2f}` – `${config.MAX_RISK_USD:.2f}` cap) at `{config.LEVERAGE}x` Leverage\n"
-            f"- **Profit Lock Engine:** `+0.8R` slashes risk to `0.25R` | `+1.0R` moves SL to Break-Even | `TP1 (1.4R)` books `50%` | `TP2 (2.4R)` books `30%` | `TP3 (3.5R)` trails `20%` runner"
+            f"- **8 High-Velocity Markets:** `{', '.join(config.SYMBOLS)}`\n"
+            f"- **15-Day Compounding & Withdrawal Rule:** `30%` of Net Profit freed for Withdrawal | `70%` Reinvested into Active Capital to scale Lot Sizes automatically\n"
+            f"- **Brokerage & GST Deducted:** `0.059%` per leg (`0.118%` round-trip) automatically deducted from every trade\n"
+            f"- **Profit Lock Engine:** `+0.8R` slashes risk to `0.25R` | `+1.0R` moves SL to Fee-Protected Profit | `TP1 (1.4R)` books `50%` | `TP2 (2.4R)` books `30%` | `TP3 (3.5R)` trails `20%` runner"
         )
 
 def main() -> None:
