@@ -212,7 +212,6 @@ def open_paper_trade(signal: dict, fencing_token: int):
         if len(active_rows) >= getattr(config, "MAX_OPEN_TRADES", 3):
             return
 
-        # Pro Upgrade #4: Directional Crypto Correlation Cap (Max 2 correlated crypto trades in same direction)
         is_gold_sym = ("PAXG" in sym) or ("XAU" in sym) or ("GOLD" in sym)
         if not is_gold_sym:
             same_dir_crypto = sum(
@@ -367,7 +366,8 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
             current_gain = (current_price - entry) if is_long else (entry - current_price)
             r_mult = current_gain / sl_dist
             if r_mult >= 1.0:
-                be_buffer = float(params.get("be_buffer", 0.25 if params["is_gold"] else 15.0))
+                fee_distance = entry * float(config.FEE_RATE) * 2.4
+                be_buffer = max(float(params.get("be_buffer", 0.25)), fee_distance + (sl_dist * 0.12))
                 target_sl = round(entry + be_buffer if is_long else entry - be_buffer, dec)
                 if (is_long and target_sl > sl) or (not is_long and target_sl < sl):
                     conn.execute("UPDATE trades SET stop_price = ?, updated_at_utc = ? WHERE trade_id = ?", (target_sl, now_str, tid))
@@ -393,7 +393,8 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
             gain_pts = (tp1 - entry) if is_long else (entry - tp1)
             fee_usd = round((entry + tp1) * booked_qty * float(config.FEE_RATE), 3)
             booked_pnl = round((gain_pts * booked_qty) - fee_usd, 2)
-            be_offset = float(params.get("be_buffer", 0.3 if params["is_gold"] else 20.0)) * 1.25
+            fee_distance = entry * float(config.FEE_RATE) * 2.4
+            be_offset = max(float(params.get("be_buffer", 0.3)) * 1.25, fee_distance + (abs(entry - sl) * 0.18))
             new_sl = round(entry + be_offset if is_long else entry - be_offset, dec)
 
             conn.execute("""
