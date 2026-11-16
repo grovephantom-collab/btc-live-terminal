@@ -112,9 +112,74 @@ def place_delta_order(symbol: str, side: str, lots: int, stop_loss: float, take_
         log.error("Delta API Exception [%s]: %s", symbol, e)
     return None
 
+def get_15d_compounding_state(conn) -> dict:
+    """
+    Calculates 15-Day Cycle Performance, Compounding Active Capital, Lot Multiplier,
+    and Free Withdrawable Profit Vault (after all brokerage & GST deductions).
+    """
+    now_dt = datetime.now(timezone.utc)
+    rows = conn.execute(
+        "SELECT realized_pnl_usd, total_fee_usd, closed_at_utc FROM trades WHERE stage = 'CLOSED' AND closed_at_utc IS NOT NULL ORDER BY id ASC"
+    ).fetchall()
+
+    total_net_pnl = sum(float(r["realized_pnl_usd"] or 0.0) for r in rows)
+    total_brokerage = sum(float(r["total_fee_usd"] or 0.0) for r in rows)
+    total_gross_pnl = round(total_net_pnl + total_brokerage, 2)
+
+    cycle_days = int(getattr(config, "CYCLE_DAYS", 15))
+    withdraw_pct = float(getattr(config, "WITHDRAWAL_RESERVE_PCT", 0.30))
+    reinvest_pct = float(getattr(config, "COMPOUND_REINVEST_PCT", 0.70))
+
+    cutoff_ts = now_dt.timestamp() - (cycle_days * 86400)
+    cycle_15d_pnl = 0.0
+    cycle_15d_fees = 0.0
+    cycle_15d_trades = 0
+    for r in rows:
+        try:
+            dt = datetime.fromisoformat(str(r["closed_at_utc"]))
+            if dt.timestamp() >= cutoff_ts:
+                cycle_15d_pnl += float(r["realized_pnl_usd"] or 0.0)
+                cycle_15d_fees += float(r["total_fee_usd"] or 0.0)
+                cycle_15d_trades += 1
+        except Exception:
+            pass
+
+    if total_net_pnl > 0:
+        withdrawable_usd = round(total_net_pnl * withdraw_pct, 2)
+        reinvested_usd = round(total_net_pnl * reinvest_pct, 2)
+        active_trading_equity = round(config.START_EQUITY + reinvested_usd, 2)
+    else:
+        withdrawable_usd = 0.0
+        reinvested_usd = round(total_net_pnl, 2)
+        active_trading_equity = round(max(6.0, config.START_EQUITY + total_net_pnl), 2)
+
+    raw_mult = active_trading_equity / max(1.0, float(config.START_EQUITY))
+    if cycle_15d_pnl < 0:
+        dd_ratio = max(0.70, 1.0 + (cycle_15d_pnl / max(10.0, float(config.START_EQUITY))))
+        lot_multiplier = round(min(raw_mult, dd_ratio), 2)
+    else:
+        lot_multiplier = round(max(1.0, min(3.0, raw_mult)), 2)
+
+    return {
+        "base_capital_usd": round(float(config.START_EQUITY), 2),
+        "total_gross_pnl_usd": total_gross_pnl,
+        "total_brokerage_usd": round(total_brokerage, 2),
+        "total_net_pnl_usd": round(total_net_pnl, 2),
+        "cycle_days": cycle_days,
+        "cycle_15d_net_pnl_usd": round(cycle_15d_pnl, 2),
+        "cycle_15d_fees_usd": round(cycle_15d_fees, 2),
+        "cycle_15d_trades": cycle_15d_trades,
+        "withdrawable_usd": withdrawable_usd,
+        "reinvested_usd": reinvested_usd,
+        "active_trading_equity_usd": active_trading_equity,
+        "total_portfolio_equity_usd": round(config.START_EQUITY + total_net_pnl, 2),
+        "lot_multiplier": lot_multiplier,
+        "scaling_status": "SCALING UP (PROFIT)" if cycle_15d_pnl > 0 else ("SCALING DOWN (DEFENSIVE)" if cycle_15d_pnl < 0 else "BASE LOT SIZE"),
+    }
+
 def get_equity(conn) -> float:
-    r = conn.execute("SELECT COALESCE(SUM(realized_pnl_usd), 0.0) as pnl FROM trades").fetchone()
-    return max(4.0, config.START_EQUITY + float(r["pnl"] if r else 0.0))
+    state = get_15d_compounding_state(conn)
+    return state["active_trading_equity_usd"]
 
 def _check_cooldown_and_circuit_breakers(conn, symbol: str = None) -> tuple:
     now_dt = datetime.now(timezone.utc)
@@ -185,7 +250,8 @@ def calculate_small_cap_delta_size(equity_usd: float, entry: float, sl: float, s
     min_risk = getattr(config, "MIN_RISK_USD", 0.50)
     max_risk = getattr(config, "MAX_RISK_USD", 2.20)
 
-    target_risk = max(min_risk, min(max_risk * max(1.0, equity_usd / 58.0), equity_usd * float(config.RISK_PCT)))
+    scale_factor = max(0.65, min(3.0, equity_usd / max(1.0, float(config.START_EQUITY))))
+    target_risk = max(min_risk * min(1.0, scale_factor), min(max_risk * scale_factor, equity_usd * float(config.RISK_PCT)))
     raw_qty = target_risk / risk_per_unit
 
     lots = max(1, min(max_lots, int(round(raw_qty / lot_size))))
@@ -237,7 +303,8 @@ def open_paper_trade(signal: dict, fencing_token: int):
         if existing_sig:
             return
 
-        equity = get_equity(conn)
+        comp = get_15d_compounding_state(conn)
+        equity = comp["active_trading_equity_usd"]
         qty, lots, risk_usd = calculate_small_cap_delta_size(equity, entry, sl, sym)
         if qty <= 0 or lots <= 0:
             return
@@ -267,9 +334,9 @@ def open_paper_trade(signal: dict, fencing_token: int):
                 f"• Setup: {signal['setup_name']}\n"
                 f"• Entry: ${entry:,.{dec}f} | SL: ${sl:,.{dec}f} ({sl_points} pts)\n"
                 f"• TP1: ${signal['tp1']:,.{dec}f} | TP2: ${signal['tp2']:,.{dec}f} | Runner: ${signal['tp3']:,.{dec}f}\n"
-                f"• Size: {lots} Lot ({qty})\n"
+                f"• Size: {lots} Lot ({qty}) [{comp['lot_multiplier']:.2f}x Scale]\n"
                 f"• Max Risk: ${risk_usd:.2f} (~₹{risk_inr:.0f})\n"
-                f"• Account Equity: ${equity:.2f} USD"
+                f"• Active Cap: ${equity:.2f} | Free Vault: ${comp['withdrawable_usd']:.2f}"
             )
 
         if config.MODE in ("TESTNET", "LIVE"):
@@ -315,12 +382,17 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
         conn.commit()
 
         msg_title = "🛡️ BREAK-EVEN SL HIT (PROFIT SECURED)" if (tp1_done or in_profit_sl) else "🛑 STOP LOSS HIT"
+        total_fees_trade = round(float(trade_dict.get("total_fee_usd") or 0.0) + fee_usd, 3)
+        gross_trade = round(total_realized + total_fees_trade, 2)
+        comp = get_15d_compounding_state(conn)
         if hasattr(notifications, "enqueue_telegram"):
             notifications.enqueue_telegram(
                 f"{msg_title} ({params['display_name']} {direction})\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"• Exit Price: ${exec_exit:,.{dec}f}\n"
-                f"• Net PnL: ${total_realized:+.2f} USD\n"
+                f"• Gross PnL: ${gross_trade:+.2f} | Brokerage: -${total_fees_trade:.2f}\n"
+                f"• Net Profit Added: ${total_realized:+.2f} USD (₹{total_realized*config.USD_INR_RATE:+.0f})\n"
+                f"• 15D Withdrawable Vault: ${comp['withdrawable_usd']:.2f} (₹{comp['withdrawable_usd']*config.USD_INR_RATE:.0f})\n"
                 f"• Reason: {close_reason}"
             )
         return
@@ -353,7 +425,7 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
                         f"⚠️ *EARLY STRUCTURAL EXIT ({params['display_name']} {direction})*\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
                         f"• Exit Price: ${exec_exit:,.{dec}f}\n"
-                        f"• Net PnL: ${total_realized:+.2f} USD\n"
+                        f"• Net PnL (After Fee): ${total_realized:+.2f} USD\n"
                         f"• Reason: Momentum stalled for >4 hours; exited early to avoid full SL."
                     )
                 return
@@ -377,7 +449,7 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
                             f"🛡️ *PROFIT LOCK (+1.0R RUN)*\n"
                             f"━━━━━━━━━━━━━━━━━━━━\n"
                             f"• {params['display_name']} is up +1.0R (+${current_gain:.{dec}f})!\n"
-                            f"• SL Trailed to Zero-Risk: ${target_sl:,.{dec}f}"
+                            f"• SL Trailed to Fee-Protected Profit: ${target_sl:,.{dec}f}"
                         )
             elif r_mult >= 0.80:
                 tight_dist = sl_dist * 0.25
@@ -410,8 +482,8 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
                     f"🎯 *TARGET 1 HIT ({params['display_name']})*\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"• TP1: ${tp1:,.{dec}f}\n"
-                    f"• Locked Profit: ${booked_pnl:+.2f} USD\n"
-                    f"• SL Trailed to Zero-Risk BE: ${new_sl:,.{dec}f}"
+                    f"• Net Locked Profit (After Fee): ${booked_pnl:+.2f} USD\n"
+                    f"• SL Trailed to Fee-Protected BE: ${new_sl:,.{dec}f}"
                 )
             return
 
@@ -437,7 +509,7 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
                     f"🎯 *TARGET 2 HIT ({params['display_name']})*\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"• TP2: ${tp2:,.{dec}f}\n"
-                    f"• Locked Profit: ${booked_pnl:+.2f} USD\n"
+                    f"• Net Locked Profit (After Fee): ${booked_pnl:+.2f} USD\n"
                     f"• SL Trailed to TP1: ${new_sl:,.{dec}f}\n"
                     f"• 20% Runner Trailing for Target 3 (${tp3:,.{dec}f})!"
                 )
@@ -459,12 +531,17 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
             """, (total_realized, fee_usd, now_str, now_str, tid))
             conn.commit()
 
+            total_fees_trade = round(float(trade_dict.get("total_fee_usd") or 0.0) + fee_usd, 3)
+            gross_trade = round(total_realized + total_fees_trade, 2)
+            comp = get_15d_compounding_state(conn)
             if hasattr(notifications, "enqueue_telegram"):
                 notifications.enqueue_telegram(
                     f"🏆 *TARGET 3 FULL EXIT ({params['display_name']})*\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"• Final Target: ${tp3:,.{dec}f}\n"
-                    f"• Total Blockbuster PnL: ${total_realized:+.2f} USD"
+                    f"• Gross PnL: ${gross_trade:+.2f} | Brokerage: -${total_fees_trade:.2f}\n"
+                    f"• Net Profit Added: ${total_realized:+.2f} USD (₹{total_realized*config.USD_INR_RATE:+.0f})\n"
+                    f"• 15D Withdrawable Vault: ${comp['withdrawable_usd']:.2f} (₹{comp['withdrawable_usd']*config.USD_INR_RATE:.0f})"
                 )
             return
 
