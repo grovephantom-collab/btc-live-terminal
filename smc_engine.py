@@ -91,7 +91,6 @@ def _calc_adx(highs: list, lows: list, closes: list, period: int = 14) -> float:
     return round(float(adx), 1)
 
 def _calc_vwap(closed_15: list, lookback: int = 48) -> float:
-    """Calculates Institutional Volume-Weighted Average Price (VWAP) over recent session bars."""
     bars = closed_15[-lookback:] if len(closed_15) >= lookback else closed_15
     if not bars:
         return 0.0
@@ -105,11 +104,6 @@ def _calc_vwap(closed_15: list, lookback: int = 48) -> float:
     return pv_sum / max(1e-6, v_sum)
 
 def _detect_order_blocks(closed_15: list, atr: float) -> tuple:
-    """
-    Detects fresh Bullish & Bearish Institutional Order Blocks (OB):
-    - Bullish OB: Last bearish candle before a strong bullish displacement impulse (>0.85x ATR).
-    - Bearish OB: Last bullish candle before a strong bearish displacement impulse (>0.85x ATR).
-    """
     if len(closed_15) < 12:
         return None, None
     bull_ob = None
@@ -442,21 +436,16 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
     allow_long_cvd = (cvd_ratio >= 0.48) if enable_cvd else True
     allow_short_cvd = (cvd_ratio <= 0.52) if enable_cvd else True
 
-    # 4H Super-Trend & BTC Leader Correlation Gates
     long_htf_ok = (htf_4h_bias != "BEARISH") and _btc_leader_allows(symbol, "LONG")
     short_htf_ok = (htf_4h_bias != "BULLISH") and _btc_leader_allows(symbol, "SHORT")
-
-    # Institutional Volume Spike (1.20x average volume or FVG displacement)
     vol_spike_ok = (vol >= vol_sma20 * 1.20)
 
-    # Pro Upgrade #1: Anti-Exhaustion Climax Guard (Never buy top after >2.25x ATR 3-bar pump or RSI > 73; never short bottom after >2.25x ATR dump or RSI < 27)
     three_bar_run = abs(cl - parsed[-4][0]) if len(parsed) >= 5 else 0.0
     long_not_exhausted = (rsi <= 73.0) and not (cl > parsed[-4][0] and three_bar_run > (atr * 2.25))
     short_not_exhausted = (rsi >= 27.0) and not (cl < parsed[-4][0] and three_bar_run > (atr * 2.25))
     long_htf_ok = long_htf_ok and long_not_exhausted
     short_htf_ok = short_htf_ok and short_not_exhausted
 
-    # Pro Upgrade #2: Session VWAP & Order Block (OB) Institutional Confluence
     vwap_long_ok = (cl >= vwap * 0.9985) if vwap > 0 else True
     vwap_short_ok = (cl <= vwap * 1.0015) if vwap > 0 else True
     touched_bull_ob = bool(bull_ob and (l <= bull_ob[1] + (atr * 0.15)) and (cl >= bull_ob[0]))
@@ -478,15 +467,18 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
                 sl_anchor = min(lowest_recent, choch_level - (atr * 0.20))
                 return _build_trade_levels("LONG", current_price or cl, sl_anchor, atr, "Sniper CHoCH + FVG Breakout", 99.0, c_time, symbol)
 
-    if getattr(config, "ENABLE_DAILY_BREAKOUT", True) and not is_choppy:
+    # STRATEGY 1: INSTITUTIONAL DAILY EXPANSION (With ADX >= 22, Fresh-Breakout & Non-Oversold Guard)
+    if getattr(config, "ENABLE_DAILY_BREAKOUT", True) and (not is_choppy) and (adx >= min_adx):
         breakout_high = pdh or day_high_24h
-        if breakout_high and macro_bias == "BULLISH" and long_htf_ok and funding <= max_long_funding and allow_long_cvd:
-            if (highest_recent >= breakout_high + (atr * 0.08)) and (cl > breakout_high) and (cl > o) and (body_ratio >= 0.48) and (upper_wick_ratio <= 0.28) and (vol_spike_ok or bull_fvg) and (rsi >= 50.0):
+        if breakout_high and macro_bias == "BULLISH" and long_htf_ok and vwap_long_ok and funding <= max_long_funding and allow_long_cvd:
+            fresh_breakout = (cl > breakout_high) and ((cl - breakout_high) <= (atr * 0.40)) and (prev_cl <= breakout_high + (atr * 0.15))
+            if fresh_breakout and (highest_recent >= breakout_high + (atr * 0.06)) and (cl > o) and (body_ratio >= 0.50) and (upper_wick_ratio <= 0.25) and (vol_spike_ok and bull_fvg) and (52.0 <= rsi <= 68.0):
                 return _build_trade_levels("LONG", current_price or cl, min(l, prev_l, ema20), atr, "Sniper Daily High Expansion", 98.0, c_time, symbol)
 
         breakdown_low = pdl or day_low_24h
-        if breakdown_low and macro_bias == "BEARISH" and short_htf_ok and funding >= min_short_funding and allow_short_cvd:
-            if (lowest_recent <= breakdown_low - (atr * 0.08)) and (cl < breakdown_low) and (cl < o) and (body_ratio >= 0.48) and (lower_wick_ratio <= 0.28) and (vol_spike_ok or bear_fvg) and (rsi <= 50.0):
+        if breakdown_low and macro_bias == "BEARISH" and short_htf_ok and vwap_short_ok and funding >= min_short_funding and allow_short_cvd:
+            fresh_breakdown = (cl < breakdown_low) and ((breakdown_low - cl) <= (atr * 0.40)) and (prev_cl >= breakdown_low - (atr * 0.15))
+            if fresh_breakdown and (lowest_recent <= breakdown_low - (atr * 0.06)) and (cl < o) and (body_ratio >= 0.50) and (lower_wick_ratio <= 0.25) and (vol_spike_ok and bear_fvg) and (32.0 <= rsi <= 48.0):
                 return _build_trade_levels("SHORT", current_price or cl, max(h, prev_h, ema20), atr, "Sniper Daily Low Breakdown", 98.0, c_time, symbol)
 
     daily_low_target = pdl or day_low_24h or structure.get("asian_low")
