@@ -78,7 +78,14 @@ try:
     STRICT_KILLZONE_ONLY = os.getenv("STRICT_KILLZONE_ONLY", "false").strip().lower() == "true"
     FILTER_DEAD_HOURS = os.getenv("FILTER_DEAD_HOURS", "true").strip().lower() == "true"
 
-    FEE_RATE = fenv("PAPER_FEE_RATE", 0.0005, 0)
+    # Delta Exchange India Taker Fee (0.05%) + 18% GST = 0.00059 per leg (0.118% round-trip)
+    FEE_RATE = fenv("PAPER_FEE_RATE", 0.00059, 0)
+
+    # --- 15-DAY COMPOUNDING, LOT SCALING & WITHDRAWAL VAULT ---
+    CYCLE_DAYS = ienv("CYCLE_DAYS", 15, 1)
+    WITHDRAWAL_RESERVE_PCT = fenv("WITHDRAWAL_RESERVE_PCT", 0.30, 0.0)   # 30% of 15-day profit freed for withdrawal
+    COMPOUND_REINVEST_PCT = fenv("COMPOUND_REINVEST_PCT", 0.70, 0.1)     # 70% reinvested to grow lot sizes
+
     SLIPPAGE = fenv("PAPER_SLIPPAGE_RATE", 0.0002, 0)
     MIN_SCORE = fenv("MIN_SIGNAL_SCORE", 88, 0)
 
