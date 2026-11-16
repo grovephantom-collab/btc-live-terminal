@@ -111,9 +111,10 @@ def vault_data():
                 max_dd = dd
             equity_curve.append({"trade": idx, "equity": round(eq, 2), "drawdown": -dd})
 
+        comp_15d = trade_manager.get_15d_compounding_state(c)
         delta_wallet = trade_manager.fetch_delta_wallet_balance()
-        wallet_bal = delta_wallet["balance"] if delta_wallet["balance"] is not None else round(config.START_EQUITY + pnl, 2)
-        wallet_avail = delta_wallet["available"] if delta_wallet["available"] is not None else round(wallet_bal, 2)
+        wallet_bal = delta_wallet["balance"] if delta_wallet["balance"] is not None else comp_15d["total_portfolio_equity_usd"]
+        wallet_avail = delta_wallet["available"] if delta_wallet["available"] is not None else comp_15d["active_trading_equity_usd"]
         auto_enabled = database.get_setting("auto_trade_enabled", "1") == "1"
 
         markets_info = {}
@@ -159,6 +160,7 @@ def vault_data():
             "pdh": btc_m.get("pdh"),
             "pdl": btc_m.get("pdl"),
             "realized_pnl_usd": round(pnl, 2),
+            "compounding": comp_15d,
             "unrealized_pnl_usd": round(unrealized, 2),
             "open_trades": len(active_rows),
             "stats": {
