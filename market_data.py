@@ -1,6 +1,7 @@
 import time, math, logging, requests
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import config
 
 log = logging.getLogger("DataEngine")
@@ -8,6 +9,12 @@ HTTP = requests.Session()
 HTTP.headers.update({"User-Agent": "Mozilla/5.0 QuantTerminal/4.0"})
 
 MARKET_STORE: Dict[str, Dict[str, Any]] = {}
+_LAST_RADAR_TS = 0.0
+_PREV_TICKER_PRICES: Dict[str, float] = {}
+_CORE_ANCHORS = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "PAXGUSDT", "XRPUSDT", "DOGEUSDT", "SUIUSDT", "LINKUSDT",
+    "ADAUSDT", "AVAXUSDT", "NEARUSDT", "DOTUSDT", "LTCUSDT", "TRXUSDT", "APTUSDT", "ARBUSDT",
+]
 
 def get_market(symbol: str = "BTCUSDT") -> Dict[str, Any]:
     sym = symbol.strip().upper()
@@ -15,12 +22,9 @@ def get_market(symbol: str = "BTCUSDT") -> Dict[str, Any]:
         MARKET_STORE[sym] = {
             "symbol": sym, "price": None, "price_ts": 0, "klines": {}, "klines_ts": 0,
             "session": "INITIALIZING", "in_killzone": False, "killzone_name": "OFF_HOURS",
-            "is_dead_hour": False, "cvd_ratio": 0.50,
-            "poc": None, "funding_rate": 0.0001,
-            "pdh": None, "pdl": None, "daily_open": None,
-            "day_high_24h": None, "day_low_24h": None,
-            "asian_high": None, "asian_low": None,
-            "news_blackout": False, "error": None
+            "is_dead_hour": False, "cvd_ratio": 0.50, "poc": None, "funding_rate": 0.0001,
+            "pdh": None, "pdl": None, "daily_open": None, "day_high_24h": None, "day_low_24h": None,
+            "asian_high": None, "asian_low": None, "news_blackout": False, "error": None,
         }
     return MARKET_STORE[sym]
 
@@ -28,77 +32,52 @@ MARKET = get_market("BTCUSDT")
 
 def session_and_killzone() -> tuple:
     now_utc = datetime.now(timezone.utc)
-    h = now_utc.hour
-    m = now_utc.minute
+    h, m = now_utc.hour, now_utc.minute
     total_m = h * 60 + m
-
-    session_name = "SESSION CLOSE"
-    in_kz = False
-    kz_name = "OFF_HOURS"
-    is_dead_hour = False
-
+    session_name, in_kz, kz_name, is_dead_hour = "SESSION CLOSE", False, "OFF_HOURS", False
     if total_m >= 1170:
-        is_dead_hour = True
-        session_name = "DEAD ZONE (OFF-PEAK)"
+        is_dead_hour, session_name = True, "DEAD ZONE (OFF-PEAK)"
     elif h < 7:
         session_name = "ASIAN RANGE"
     elif h < 13:
         session_name = "LONDON EXPANSION"
     elif h < 21:
         session_name = "NEW YORK TREND"
-
     if 420 <= total_m <= 660:
-        in_kz = True
-        kz_name = "LONDON KILLZONE"
+        in_kz, kz_name = True, "LONDON KILLZONE"
     elif 750 <= total_m <= 1050:
-        in_kz = True
-        kz_name = "NEW YORK KILLZONE"
-
+        in_kz, kz_name = True, "NEW YORK KILLZONE"
     return session_name, in_kz, kz_name, is_dead_hour
 
 def check_economic_news_blackout() -> bool:
     now_utc = datetime.now(timezone.utc)
     minute_of_day = now_utc.hour * 60 + now_utc.minute
     if now_utc.weekday() in [2, 3]:
-        cpi_m = 12 * 60 + 30
-        fomc_m = 18 * 60
-        if abs(minute_of_day - cpi_m) <= 25 or abs(minute_of_day - fomc_m) <= 25:
+        if abs(minute_of_day - 750) <= 25 or abs(minute_of_day - 1080) <= 25:
             return True
     return False
 
 def calc_volume_delta(candles_15m: list) -> float:
     if len(candles_15m) < 3:
         return 0.50
-    buyer_vols, seller_vols = [], []
+    total_b, total_s = 0.0, 0.0
     for c in candles_15m[-10:]:
-        h = float(c.get("high", 0.0))
-        l = float(c.get("low", 0.0))
-        cl = float(c.get("close", 0.0))
-        v = float(c.get("vol", 1.0))
-        rng = max(0.1, h - l)
-        b_ratio = (cl - l) / rng
-        s_ratio = (h - cl) / rng
-        buyer_vols.append(v * b_ratio)
-        seller_vols.append(v * s_ratio)
-    total_b = sum(buyer_vols)
-    total_s = sum(seller_vols)
-    tot = total_b + total_s + 1e-9
-    return round(total_b / tot, 3)
+        h, l, cl, v = float(c.get("high", 0.0)), float(c.get("low", 0.0)), float(c.get("close", 0.0)), float(c.get("vol", 1.0))
+        rng = max(1e-6, h - l)
+        total_b += v * ((cl - l) / rng)
+        total_s += v * ((h - cl) / rng)
+    return round(total_b / (total_b + total_s + 1e-9), 3)
 
 def fetch_funding_rate(symbol: str) -> float:
-    params = config.get_asset_params(symbol)
-    bin_sym = params["bin_symbol"]
-    delta_sym = params["delta_symbol"]
+    params = config.get_asset_params(symbol, get_market(symbol).get("price"))
     try:
-        url = f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={bin_sym}"
-        r = HTTP.get(url, timeout=3.5)
+        r = HTTP.get(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={params['bin_symbol']}", timeout=3.5)
         if r.status_code == 200:
             return float(r.json().get("lastFundingRate", 0.0001))
     except Exception:
         pass
     try:
-        url = f"https://api.delta.exchange/v2/tickers/{delta_sym}"
-        r = HTTP.get(url, timeout=3.5)
+        r = HTTP.get(f"https://api.delta.exchange/v2/tickers/{params['delta_symbol']}", timeout=3.5)
         if r.status_code == 200:
             return float(r.json().get("result", {}).get("funding_rate", 0.0001))
     except Exception:
@@ -106,136 +85,80 @@ def fetch_funding_rate(symbol: str) -> float:
     return 0.0001
 
 def fetch_price(symbol: str) -> Optional[float]:
-    params = config.get_asset_params(symbol)
-    cb_sym = params["cb_symbol"]
-    bin_sym = params["bin_symbol"]
-    delta_sym = params["delta_symbol"]
-
+    params = config.get_asset_params(symbol, get_market(symbol).get("price"))
     try:
-        r = HTTP.get(f"https://api.coinbase.com/v2/prices/{cb_sym}/spot", timeout=config.HTTP_TIMEOUT)
+        r = HTTP.get(f"https://api.coinbase.com/v2/prices/{params['cb_symbol']}/spot", timeout=config.HTTP_TIMEOUT)
         if r.status_code == 200:
             p = float(r.json()["data"]["amount"])
             if math.isfinite(p) and p > 0:
                 return p
     except Exception:
         pass
-
     for b_base in ("https://data-api.binance.vision", "https://api.binance.com"):
         try:
-            r = HTTP.get(f"{b_base}/api/v3/ticker/price", params={"symbol": bin_sym}, timeout=config.HTTP_TIMEOUT)
+            r = HTTP.get(f"{b_base}/api/v3/ticker/price", params={"symbol": params["bin_symbol"]}, timeout=config.HTTP_TIMEOUT)
             if r.status_code == 200:
                 p = float(r.json()["price"])
                 if math.isfinite(p) and p > 0:
                     return p
         except Exception:
             pass
-
     try:
-        url = f"https://api.delta.exchange/v2/tickers/{delta_sym}"
-        r = HTTP.get(url, timeout=config.HTTP_TIMEOUT)
+        r = HTTP.get(f"https://api.delta.exchange/v2/tickers/{params['delta_symbol']}", timeout=config.HTTP_TIMEOUT)
         if r.status_code == 200:
             p = float(r.json().get("result", {}).get("mark_price", 0))
             if math.isfinite(p) and p > 0:
                 return p
     except Exception:
         pass
-
     return None
 
 def fetch_klines(symbol: str, interval: str, limit: int = 120) -> List[Dict[str, float]]:
-    gran_map = {"15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
-    gran = gran_map.get(interval, 900)
-    params = config.get_asset_params(symbol)
-    cb_sym = params["cb_symbol"]
-    bin_sym = params["bin_symbol"]
-
+    gran = {"15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}.get(interval, 900)
+    m_dict = get_market(symbol)
+    params = config.get_asset_params(symbol, m_dict.get("price"))
     try:
-        url = f"https://api.exchange.coinbase.com/products/{cb_sym}/candles?granularity={gran}"
-        r = HTTP.get(url, timeout=config.HTTP_TIMEOUT)
+        r = HTTP.get(f"https://api.exchange.coinbase.com/products/{params['cb_symbol']}/candles?granularity={gran}", timeout=config.HTTP_TIMEOUT)
         if r.status_code == 200:
             raw = r.json()
             if isinstance(raw, list) and len(raw) >= 5:
-                out = []
-                for k in raw:
-                    t = int(k[0])
-                    out.append({
-                        "time": t, "close_time": t + gran,
-                        "open": float(k[3]), "high": float(k[2]),
-                        "low": float(k[1]), "close": float(k[4]),
-                        "vol": float(k[5])
-                    })
+                out = [{"time": int(k[0]), "close_time": int(k[0]) + gran, "open": float(k[3]), "high": float(k[2]), "low": float(k[1]), "close": float(k[4]), "vol": float(k[5])} for k in raw]
                 out.sort(key=lambda z: z["time"])
                 return out[-limit:]
     except Exception:
         pass
-
-    binance_intervals = {"15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
-    b_interval = binance_intervals.get(interval, "15m")
     for b_base in ("https://data-api.binance.vision", "https://api.binance.com"):
         try:
-            url = f"{b_base}/api/v3/klines?symbol={bin_sym}&interval={b_interval}&limit={limit}"
-            r = HTTP.get(url, timeout=config.HTTP_TIMEOUT)
+            r = HTTP.get(f"{b_base}/api/v3/klines?symbol={params['bin_symbol']}&interval={interval}&limit={limit}", timeout=config.HTTP_TIMEOUT)
             if r.status_code == 200:
                 raw = r.json()
                 if isinstance(raw, list) and len(raw) >= 5:
-                    out = []
-                    for k in raw:
-                        t = int(k[0]) // 1000
-                        out.append({
-                            "time": t, "close_time": t + gran,
-                            "open": float(k[1]), "high": float(k[2]),
-                            "low": float(k[3]), "close": float(k[4]),
-                            "vol": float(k[5])
-                        })
+                    out = [{"time": int(k[0]) // 1000, "close_time": (int(k[0]) // 1000) + gran, "open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4]), "vol": float(k[5])} for k in raw]
                     out.sort(key=lambda z: z["time"])
                     return out[-limit:]
         except Exception:
             pass
-
     try:
-        delta_sym = params["delta_symbol"]
         end_ts = int(time.time())
         start_ts = end_ts - (limit * gran)
-        url = f"https://api.delta.exchange/v2/history/candles?resolution={interval}&symbol={delta_sym}&start={start_ts}&end={end_ts}"
-        r = HTTP.get(url, timeout=config.HTTP_TIMEOUT)
+        r = HTTP.get(f"https://api.delta.exchange/v2/history/candles?resolution={interval}&symbol={params['delta_symbol']}&start={start_ts}&end={end_ts}", timeout=config.HTTP_TIMEOUT)
         if r.status_code == 200:
             raw = r.json().get("result", [])
             if isinstance(raw, list) and len(raw) >= 5:
-                out = []
-                for k in raw:
-                    t = int(k["time"])
-                    out.append({
-                        "time": t, "close_time": t + gran,
-                        "open": float(k["open"]), "high": float(k["high"]),
-                        "low": float(k["low"]), "close": float(k["close"]),
-                        "vol": float(k.get("volume", 1.0))
-                    })
+                out = [{"time": int(k["time"]), "close_time": int(k["time"]) + gran, "open": float(k["open"]), "high": float(k["high"]), "low": float(k["low"]), "close": float(k["close"]), "vol": float(k.get("volume", 1.0))} for k in raw]
                 out.sort(key=lambda z: z["time"])
                 return out[-limit:]
     except Exception:
         pass
-
     now_s = int(time.time())
-    default_p = params["default_price"]
-    m_dict = get_market(symbol)
-    last_p = m_dict.get("price") or default_p
-    synth_bars = []
-    spread = 3.0 if params["is_gold"] else 35.0
-    for idx in range(limit):
-        bar_t = now_s - (limit - idx) * gran
-        synth_bars.append({
-            "time": bar_t, "close_time": bar_t + gran,
-            "open": last_p - (spread * 0.3), "high": last_p + spread,
-            "low": last_p - spread, "close": last_p + (spread * 0.1),
-            "vol": 150.0
-        })
-    return synth_bars
+    last_p = m_dict.get("price") or params["default_price"]
+    spread = last_p * 0.004
+    return [{"time": now_s - (limit - idx) * gran, "close_time": now_s - (limit - idx - 1) * gran, "open": last_p - spread * 0.3, "high": last_p + spread, "low": last_p - spread, "close": last_p + spread * 0.1, "vol": 150.0} for idx in range(limit)]
 
 def extract_pdh_pdl(daily_candles: list) -> tuple:
     if len(daily_candles) >= 2:
         prev_day = daily_candles[-2]
-        today_open = float(daily_candles[-1].get("open", daily_candles[-2]["close"]))
-        return float(prev_day["high"]), float(prev_day["low"]), today_open
+        return float(prev_day["high"]), float(prev_day["low"]), float(daily_candles[-1].get("open", prev_day["close"]))
     elif len(daily_candles) == 1:
         return float(daily_candles[0]["high"]), float(daily_candles[0]["low"]), float(daily_candles[0]["open"])
     return None, None, None
@@ -243,101 +166,134 @@ def extract_pdh_pdl(daily_candles: list) -> tuple:
 def extract_24h_levels(candles_15m: list) -> tuple:
     bars_24h = candles_15m[-96:] if len(candles_15m) >= 96 else candles_15m
     if bars_24h:
-        h24 = max(c["high"] for c in bars_24h)
-        l24 = min(c["low"] for c in bars_24h)
-        vol24 = sum(c.get("vol", 0.0) for c in bars_24h)
-        open24 = float(bars_24h[0]["open"])
-        return h24, l24, vol24, open24
+        return max(c["high"] for c in bars_24h), min(c["low"] for c in bars_24h), sum(c.get("vol", 0.0) for c in bars_24h), float(bars_24h[0]["open"])
     return None, None, 0.0, None
 
 def extract_asian_range(candles_15m: list) -> tuple:
     now_dt = datetime.now(timezone.utc)
-    today_start_epoch = int(datetime(now_dt.year, now_dt.month, now_dt.day, 0, 0, tzinfo=timezone.utc).timestamp())
-    asian_end_epoch = today_start_epoch + (7 * 3600)
-    asian_bars = [c for c in candles_15m if today_start_epoch <= c.get("time", 0) <= asian_end_epoch]
+    t0 = int(datetime(now_dt.year, now_dt.month, now_dt.day, 0, 0, tzinfo=timezone.utc).timestamp())
+    asian_bars = [c for c in candles_15m if t0 <= c.get("time", 0) <= t0 + 25200]
     if asian_bars:
-        arh = max(c["high"] for c in asian_bars)
-        arl = min(c["low"] for c in asian_bars)
-        return arh, arl
+        return max(c["high"] for c in asian_bars), min(c["low"] for c in asian_bars)
     return None, None
 
 def approx_poc(cs: List[Dict[str, float]], bins: int = 30) -> Optional[float]:
     if not cs:
         return None
-    lo = min(c["low"] for c in cs)
-    hi = max(c["high"] for c in cs)
+    lo, hi = min(c["low"] for c in cs), max(c["high"] for c in cs)
     if hi <= lo:
         return lo
     width = (hi - lo) / bins
     vol = [0.0] * bins
     for c in cs:
-        typical = (c["high"] + c["low"] + c["close"]) / 3
-        idx = min(bins - 1, max(0, int((typical - lo) / width)))
+        idx = min(bins - 1, max(0, int((((c["high"] + c["low"] + c["close"]) / 3) - lo) / width)))
         vol[idx] += c["vol"]
-    max_idx = max(range(bins), key=lambda n: vol[n])
-    return lo + (max_idx + 0.5) * width
+    return lo + (max(range(bins), key=lambda n: vol[n]) + 0.5) * width
 
 def refresh_symbol_market_data(symbol: str, lock) -> bool:
     try:
         p = fetch_price(symbol)
-        params = config.get_asset_params(symbol)
-        if p is None:
-            with lock:
-                p = get_market(symbol).get("price") or params["default_price"]
-
+        with lock:
+            if p is None:
+                p = get_market(symbol).get("price") or config.get_asset_params(symbol)["default_price"]
         sess, in_kz, kz_name, is_dead = session_and_killzone()
         news_block = check_economic_news_blackout()
         funding = fetch_funding_rate(symbol)
-
         with lock:
             m = get_market(symbol)
-            m["price"] = p
-            m["price_ts"] = time.time()
-            m["session"] = sess
-            m["in_killzone"] = in_kz
-            m["killzone_name"] = kz_name
-            m["is_dead_hour"] = is_dead
-            m["news_blackout"] = news_block
-            m["funding_rate"] = funding
-
+            m.update(price=p, price_ts=time.time(), session=sess, in_killzone=in_kz, killzone_name=kz_name, is_dead_hour=is_dead, news_blackout=news_block, funding_rate=funding)
         ks = {}
         for k in ("15m", "1h", "4h", "1d"):
             bars = fetch_klines(symbol, k, 120)
-            if len(bars) < 5:
-                if "15m" in ks and len(ks["15m"]) >= 10:
-                    bars = ks["15m"]
-                else:
-                    bars = fetch_klines(symbol, k, 120)
-            ks[k] = bars
-            time.sleep(0.02)
-
+            ks[k] = bars if len(bars) >= 5 else ks.get("15m", bars)
+            time.sleep(0.01)
         pdh, pdl, d_open = extract_pdh_pdl(ks.get("1d", []))
-        h24, l24, vol24, open24 = extract_24h_levels(ks.get("15m", []))
-        if d_open is None:
-            d_open = open24
+        h24, l24, _, open24 = extract_24h_levels(ks.get("15m", []))
         arh, arl = extract_asian_range(ks.get("15m", []))
         poc = approx_poc(ks.get("15m", [])[-96:])
         cvd = calc_volume_delta(ks.get("15m", []))
-
         with lock:
-            m = get_market(symbol)
-            m.update(
-                klines=ks, klines_ts=time.time(), poc=poc, pdh=pdh, pdl=pdl,
-                daily_open=d_open, day_high_24h=h24, day_low_24h=l24,
-                asian_high=arh, asian_low=arl, cvd_ratio=cvd, error=None
-            )
+            get_market(symbol).update(klines=ks, klines_ts=time.time(), poc=poc, pdh=pdh, pdl=pdl, daily_open=d_open or open24, day_high_24h=h24, day_low_24h=l24, asian_high=arh, asian_low=arl, cvd_ratio=cvd, error=None)
         return True
     except Exception as e:
         with lock:
             get_market(symbol)["error"] = str(e)[:250]
-        log.warning("Market refresh failed for %s: %s", symbol, e)
         return False
 
-def refresh_all_market_data(lock) -> bool:
-    success = True
-    for sym in config.SYMBOLS:
-        if not refresh_symbol_market_data(sym, lock):
-            success = False
+def discover_top_delta_movers(active_trade_symbols: list = None) -> List[str]:
+    global _LAST_RADAR_TS
+    now = time.time()
+    if not getattr(config, "ENABLE_ALL_DELTA_RADAR", True):
+        return config.SYMBOLS
+    if (now - _LAST_RADAR_TS) < 30.0 and len(config.SYMBOLS) >= 16:
+        for s in (active_trade_symbols or []):
+            if s and s not in config.SYMBOLS:
+                config.SYMBOLS.insert(0, s)
+        return config.SYMBOLS
+
+    selected = []
+    for s in (active_trade_symbols or []) + _CORE_ANCHORS:
+        if s and s not in selected:
+            selected.append(s)
+    try:
+        r = HTTP.get("https://api.delta.exchange/v2/tickers", timeout=5.0)
+        if r.status_code == 200:
+            instant_spikers, movers = [], []
+            min_turn = float(getattr(config, "MIN_RADAR_TURNOVER_USD", 100000.0))
+            for it in r.json().get("result", []):
+                ctype = str(it.get("contract_type", "")).lower()
+                sym_raw = str(it.get("symbol", "")).upper()
+                if (ctype and "perpetual" not in ctype) or (not sym_raw.endswith("USD") and not sym_raw.endswith("USDT")):
+                    continue
+                base = sym_raw[:-4] if sym_raw.endswith("USDT") else sym_raw[:-3]
+                if not base.isalpha() or len(base) > 8 or base in ("USDT", "USDC", "DAI"):
+                    continue
+                std_sym = f"{base}USDT"
+                mark_p = float(it.get("mark_price") or it.get("close") or 0.0)
+                open_p = float(it.get("open") or mark_p)
+                turnover = float(it.get("turnover_usd") or it.get("turnover") or 0.0)
+                if mark_p <= 0 or open_p <= 0:
+                    continue
+                prev_p = _PREV_TICKER_PRICES.get(std_sym)
+                _PREV_TICKER_PRICES[std_sym] = mark_p
+                jump_pct = abs((mark_p - prev_p) / prev_p) * 100.0 if (prev_p and prev_p > 0) else 0.0
+                m_entry = get_market(std_sym)
+                m_entry["price"] = mark_p
+                m_entry["price_ts"] = now
+                if turnover >= min_turn:
+                    day_move = abs((mark_p - open_p) / open_p) * 100.0
+                    if jump_pct >= 0.35:
+                        instant_spikers.append((jump_pct, day_move, std_sym))
+                    elif std_sym not in selected:
+                        movers.append((day_move, turnover, std_sym))
+            instant_spikers.sort(key=lambda x: x[0], reverse=True)
+            for _, _, sp_sym in instant_spikers:
+                if sp_sym not in selected:
+                    selected.insert(0, sp_sym)
+            movers.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            max_tot = int(getattr(config, "MAX_RADAR_SYMBOLS", 40))
+            for _, _, m_sym in movers:
+                if len(selected) >= max_tot:
+                    break
+                if m_sym not in selected:
+                    selected.append(m_sym)
+            config.SYMBOLS = selected[:max_tot]
+            _LAST_RADAR_TS = now
+    except Exception as e:
+        log.warning("Delta Radar fallback: %s", e)
+    return config.SYMBOLS
+
+def refresh_all_market_data(lock, active_trade_symbols: list = None) -> bool:
+    discover_top_delta_movers(active_trade_symbols)
+    success = False
+    with ThreadPoolExecutor(max_workers=min(12, max(4, len(config.SYMBOLS)))) as pool:
+        futures = {pool.submit(refresh_symbol_market_data, sym, lock): sym for sym in list(config.SYMBOLS)}
+        for fut in as_completed(futures):
+            try:
+                if fut.result():
+                    success = True
+            except Exception:
+                pass
     return success
 
 def refresh_market_data(lock) -> bool:
