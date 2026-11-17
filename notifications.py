@@ -20,23 +20,14 @@ def telegram_worker_loop():
                 conn.close()
                 time.sleep(3)
                 continue
-
-            nid = row["id"]
-            msg = row["message"]
-
+            nid, msg = row["id"], row["message"]
             if config.TG_TOKEN and config.TG_CHAT:
                 url = f"https://api.telegram.org/bot{config.TG_TOKEN}/sendMessage"
                 try:
-                    safe_msg = (
-                        msg.replace("STOP_LOSS_HIT", "STOP\\_LOSS\\_HIT")
-                        .replace("BREAK_EVEN_EXIT", "BREAK\\_EVEN\\_EXIT")
-                        .replace("TP3_RUNNER_HIT", "TP3\\_RUNNER\\_HIT")
-                        .replace("STRUCTURAL_INVALIDATION_EXIT", "STRUCTURAL\\_INVALIDATION\\_EXIT")
-                    )
+                    safe_msg = msg.replace("STOP_LOSS_HIT", "STOP\\_LOSS\\_HIT").replace("BREAK_EVEN_EXIT", "BREAK\\_EVEN\\_EXIT").replace("TP3_RUNNER_HIT", "TP3\\_RUNNER\\_HIT").replace("STRUCTURAL_INVALIDATION_EXIT", "STRUCTURAL\\_INVALIDATION\\_EXIT")
                     requests.post(url, json={"chat_id": config.TG_CHAT, "text": safe_msg, "parse_mode": "Markdown"}, timeout=5)
                 except Exception as ex:
                     log.warning("Telegram send failed: %s", ex)
-
             conn.execute("UPDATE notifications SET status = 'SENT' WHERE id = ?", (nid,))
             conn.commit()
             conn.close()
