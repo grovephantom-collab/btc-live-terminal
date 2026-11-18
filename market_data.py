@@ -11,6 +11,7 @@ HTTP.headers.update({"User-Agent": "Mozilla/5.0 QuantTerminal/4.0"})
 MARKET_STORE: Dict[str, Dict[str, Any]] = {}
 _LAST_RADAR_TS = 0.0
 _PREV_TICKER_PRICES: Dict[str, float] = {}
+_DELTA_NATIVE_MAP: Dict[str, str] = {}
 _CORE_ANCHORS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "PAXGUSDT", "XRPUSDT", "DOGEUSDT", "SUIUSDT", "LINKUSDT",
     "ADAUSDT", "AVAXUSDT", "NEARUSDT", "DOTUSDT", "LTCUSDT", "TRXUSDT", "APTUSDT", "ARBUSDT",
@@ -70,6 +71,7 @@ def calc_volume_delta(candles_15m: list) -> float:
 
 def fetch_funding_rate(symbol: str) -> float:
     params = config.get_asset_params(symbol, get_market(symbol).get("price"))
+    delta_sym = _DELTA_NATIVE_MAP.get(symbol, params["delta_symbol"])
     try:
         r = HTTP.get(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={params['bin_symbol']}", timeout=3.5)
         if r.status_code == 200:
@@ -77,7 +79,7 @@ def fetch_funding_rate(symbol: str) -> float:
     except Exception:
         pass
     try:
-        r = HTTP.get(f"https://api.delta.exchange/v2/tickers/{params['delta_symbol']}", timeout=3.5)
+        r = HTTP.get(f"https://api.delta.exchange/v2/tickers/{delta_sym}", timeout=3.5)
         if r.status_code == 200:
             return float(r.json().get("result", {}).get("funding_rate", 0.0001))
     except Exception:
@@ -86,6 +88,15 @@ def fetch_funding_rate(symbol: str) -> float:
 
 def fetch_price(symbol: str) -> Optional[float]:
     params = config.get_asset_params(symbol, get_market(symbol).get("price"))
+    delta_sym = _DELTA_NATIVE_MAP.get(symbol, params["delta_symbol"])
+    try:
+        r = HTTP.get(f"https://api.delta.exchange/v2/tickers/{delta_sym}", timeout=config.HTTP_TIMEOUT)
+        if r.status_code == 200:
+            p = float(r.json().get("result", {}).get("mark_price", 0))
+            if math.isfinite(p) and p > 0:
+                return p
+    except Exception:
+        pass
     try:
         r = HTTP.get(f"https://api.coinbase.com/v2/prices/{params['cb_symbol']}/spot", timeout=config.HTTP_TIMEOUT)
         if r.status_code == 200:
@@ -103,30 +114,27 @@ def fetch_price(symbol: str) -> Optional[float]:
                     return p
         except Exception:
             pass
-    try:
-        r = HTTP.get(f"https://api.delta.exchange/v2/tickers/{params['delta_symbol']}", timeout=config.HTTP_TIMEOUT)
-        if r.status_code == 200:
-            p = float(r.json().get("result", {}).get("mark_price", 0))
-            if math.isfinite(p) and p > 0:
-                return p
-    except Exception:
-        pass
     return None
 
 def fetch_klines(symbol: str, interval: str, limit: int = 120) -> List[Dict[str, float]]:
     gran = {"15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}.get(interval, 900)
     m_dict = get_market(symbol)
     params = config.get_asset_params(symbol, m_dict.get("price"))
+    delta_sym = _DELTA_NATIVE_MAP.get(symbol, params["delta_symbol"])
+
     try:
-        r = HTTP.get(f"https://api.exchange.coinbase.com/products/{params['cb_symbol']}/candles?granularity={gran}", timeout=config.HTTP_TIMEOUT)
+        end_ts = int(time.time())
+        start_ts = end_ts - (limit * gran)
+        r = HTTP.get(f"https://api.delta.exchange/v2/history/candles?resolution={interval}&symbol={delta_sym}&start={start_ts}&end={end_ts}", timeout=config.HTTP_TIMEOUT)
         if r.status_code == 200:
-            raw = r.json()
-            if isinstance(raw, list) and len(raw) >= 5:
-                out = [{"time": int(k[0]), "close_time": int(k[0]) + gran, "open": float(k[3]), "high": float(k[2]), "low": float(k[1]), "close": float(k[4]), "vol": float(k[5])} for k in raw]
+            raw = r.json().get("result", [])
+            if isinstance(raw, list) and len(raw) >= 15:
+                out = [{"time": int(k["time"]), "close_time": int(k["time"]) + gran, "open": float(k["open"]), "high": float(k["high"]), "low": float(k["low"]), "close": float(k["close"]), "vol": float(k.get("volume", 1.0))} for k in raw]
                 out.sort(key=lambda z: z["time"])
                 return out[-limit:]
     except Exception:
         pass
+
     for b_base in ("https://data-api.binance.vision", "https://api.binance.com"):
         try:
             r = HTTP.get(f"{b_base}/api/v3/klines?symbol={params['bin_symbol']}&interval={interval}&limit={limit}", timeout=config.HTTP_TIMEOUT)
@@ -138,18 +146,18 @@ def fetch_klines(symbol: str, interval: str, limit: int = 120) -> List[Dict[str,
                     return out[-limit:]
         except Exception:
             pass
+
     try:
-        end_ts = int(time.time())
-        start_ts = end_ts - (limit * gran)
-        r = HTTP.get(f"https://api.delta.exchange/v2/history/candles?resolution={interval}&symbol={params['delta_symbol']}&start={start_ts}&end={end_ts}", timeout=config.HTTP_TIMEOUT)
+        r = HTTP.get(f"https://api.exchange.coinbase.com/products/{params['cb_symbol']}/candles?granularity={gran}", timeout=config.HTTP_TIMEOUT)
         if r.status_code == 200:
-            raw = r.json().get("result", [])
+            raw = r.json()
             if isinstance(raw, list) and len(raw) >= 5:
-                out = [{"time": int(k["time"]), "close_time": int(k["time"]) + gran, "open": float(k["open"]), "high": float(k["high"]), "low": float(k["low"]), "close": float(k["close"]), "vol": float(k.get("volume", 1.0))} for k in raw]
+                out = [{"time": int(k[0]), "close_time": int(k[0]) + gran, "open": float(k[3]), "high": float(k[2]), "low": float(k[1]), "close": float(k[4]), "vol": float(k[5])} for k in raw]
                 out.sort(key=lambda z: z["time"])
                 return out[-limit:]
     except Exception:
         pass
+
     now_s = int(time.time())
     last_p = m_dict.get("price") or params["default_price"]
     spread = last_p * 0.004
@@ -246,9 +254,10 @@ def discover_top_delta_movers(active_trade_symbols: list = None) -> List[str]:
                 if (ctype and "perpetual" not in ctype) or (not sym_raw.endswith("USD") and not sym_raw.endswith("USDT")):
                     continue
                 base = sym_raw[:-4] if sym_raw.endswith("USDT") else sym_raw[:-3]
-                if not base.isalpha() or len(base) > 8 or base in ("USDT", "USDC", "DAI"):
+                if not base.isalnum() or len(base) > 12 or base in ("USDT", "USDC", "DAI"):
                     continue
                 std_sym = f"{base}USDT"
+                _DELTA_NATIVE_MAP[std_sym] = sym_raw
                 mark_p = float(it.get("mark_price") or it.get("close") or 0.0)
                 open_p = float(it.get("open") or mark_p)
                 vol_raw = float(it.get("volume") or 0.0)
@@ -267,7 +276,7 @@ def discover_top_delta_movers(active_trade_symbols: list = None) -> List[str]:
                 m_entry["price"] = mark_p
                 m_entry["price_ts"] = now
                 day_move = abs((mark_p - open_p) / open_p) * 100.0
-                if turnover >= min_turn or day_move >= 1.2:
+                if turnover >= min_turn or day_move >= 1.0:
                     if jump_pct >= 0.35:
                         instant_spikers.append((jump_pct, day_move, std_sym))
                     elif std_sym not in selected:
