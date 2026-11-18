@@ -59,10 +59,11 @@ def _enrich_remote_payload(data: Dict[str, Any]) -> Dict[str, Any]:
         r_usd = round(net_pnl * 0.70 if net_pnl > 0 else net_pnl, 2)
         act_eq = round(max(6.0, float(config.START_EQUITY) + r_usd), 2)
         data["compounding"] = {
+            "base_capital_usd": float(config.START_EQUITY),
             "cycle_15d_net_pnl_usd": round(net_pnl, 2), "total_gross_pnl_usd": round(net_pnl + tot_fee, 2),
             "total_brokerage_usd": tot_fee, "withdrawable_usd": w_usd, "active_trading_equity_usd": act_eq,
-            "lot_multiplier": round(max(0.70, min(3.0, act_eq / float(config.START_EQUITY))), 2),
-            "scaling_status": "SCALING UP (PROFIT)" if net_pnl > 0 else ("SCALING DOWN (DEFENSIVE)" if net_pnl < 0 else "BASE LOT SIZE"),
+            "lot_multiplier": round(max(0.75, min(10.0, act_eq / 58.0)), 2),
+            "scaling_status": "SCALING UP (PROFIT)" if net_pnl > 0 else ("RECOVERY MODE (TIGHT SL)" if net_pnl < 0 else "BASE LOT SIZE"),
         }
     return data
 
@@ -108,17 +109,18 @@ def _build_local_payload() -> Dict[str, Any]:
         pnl = float(c.execute("SELECT COALESCE(SUM(realized_pnl_usd),0) p FROM trades").fetchone()["p"] or 0.0)
         unrealized = float(c.execute("SELECT COALESCE(SUM(unrealized_pnl_usd),0) u FROM trades WHERE stage != 'CLOSED'").fetchone()["u"] or 0.0)
         compounding = trade_manager.get_15d_compounding_state(c)
+        base_cap = compounding["base_capital_usd"]
         today_start = datetime.now(timezone.utc).strftime("%Y-%m-%d 00:00:00")
         day_trades = int(c.execute("SELECT COUNT(*) as c FROM trades WHERE opened_at_utc >= ?", (today_start,)).fetchone()["c"] or 0)
         day_pnl = float(c.execute("SELECT COALESCE(SUM(realized_pnl_usd), 0.0) as s FROM trades WHERE closed_at_utc >= ?", (today_start,)).fetchone()["s"] or 0.0)
-        closed_asc = c.execute("SELECT symbol, realized_pnl_usd, closed_at_utc FROM trades WHERE stage = 'CLOSED' ORDER BY id ASC").fetchall()
+        closed_asc = c.execute("SELECT symbol, realized_pnl_usd, closed_at_utc FROM trades WHERE stage = 'CLOSED' OR realized_pnl_usd != 0 ORDER BY id ASC").fetchall()
         wins = [float(r["realized_pnl_usd"] or 0.0) for r in closed_asc if float(r["realized_pnl_usd"] or 0.0) > 0]
-        losses = [float(r["realized_pnl_usd"] or 0.0) for r in closed_asc if float(r["realized_pnl_usd"] or 0.0) <= 0]
+        losses = [float(r["realized_pnl_usd"] or 0.0) for r in closed_asc if float(r["realized_pnl_usd"] or 0.0) < 0]
         tot = len(wins) + len(losses)
         win_rate = round((len(wins) / tot) * 100.0, 1) if tot > 0 else 0.0
         gw, gl = sum(wins), abs(sum(losses))
         pf = round(gw / gl, 2) if gl > 0 else (round(gw, 2) if gw > 0 else 0.0)
-        eq, peak, max_dd = float(config.START_EQUITY), float(config.START_EQUITY), 0.0
+        eq, peak, max_dd = float(base_cap), float(base_cap), 0.0
         equity_curve = [{"trade": 0, "equity": round(eq, 2), "drawdown": 0.0}]
         for idx, r in enumerate(closed_asc, start=1):
             eq += float(r["realized_pnl_usd"] or 0.0)
@@ -142,7 +144,7 @@ def _build_local_payload() -> Dict[str, Any]:
                 "zone_name": "DISCOUNT" if rel_pos < 0.45 else ("PREMIUM" if rel_pos > 0.55 else "EQUILIBRIUM"),
             }
         btc_m = market_data.get_market("BTCUSDT")
-        bal = round(config.START_EQUITY + pnl, 2)
+        bal = round(base_cap + pnl, 2)
         return {
             "mode": config.MODE, "auto_trade_enabled": database.get_setting("auto_trade_enabled", "1") == "1",
             "symbols": config.SYMBOLS, "markets": markets_info, "compounding": compounding,
@@ -186,6 +188,18 @@ def toggle_bot_state() -> None:
             continue
     cur = database.get_setting("auto_trade_enabled", "1")
     database.set_setting("auto_trade_enabled", "0" if cur == "1" else "1")
+
+def add_capital_step(amount_usd: float = 58.0) -> None:
+    global _LAST_FETCH_TS
+    _LAST_FETCH_TS = 0.0
+    for base_url in _get_backend_candidates():
+        try:
+            if requests.post(f"{base_url}/add-capital", json={"amount_usd": amount_usd}, timeout=4).status_code == 200:
+                return
+        except Exception:
+            continue
+    cur_added = float(database.get_setting("added_capital_usd", "0.0") or 0.0)
+    database.set_setting("added_capital_usd", str(max(0.0, round(cur_added + amount_usd, 2))))
 
 st.markdown("""<style>
 [data-stale="true"], .stApp [data-stale="true"], div[data-testid="stAppViewBlockContainer"] * { opacity: 1 !important; transition: none !important; filter: none !important; }
@@ -249,7 +263,7 @@ def _render_dashboard_body():
 
     dead_ok = "BLOCKED" if payload.get("is_dead_hour") else "ACTIVE"
     news_ok = "BLACKOUT" if payload.get("news_blackout") else "CLEAR"
-    st.markdown(f'<div class="guard-grid"><div class="guard-box"><b>DAILY TRADES:</b> <span style="color:#f8fafc;">{day_trades} / {config.MAX_DAILY_TRADES}</span></div><div class="guard-box"><b>DAILY LOSS LIMIT:</b> <span style="color:#f8fafc;">${day_pnl:+.2f} / -${config.MAX_DAILY_LOSS:.2f}</span></div><div class="guard-box"><b>ACTIVE LOT RISK:</b> <span style="color:#38bdf8;">{config.RISK_PCT*100:.1f}% (~${c_act_eq*config.RISK_PCT:.2f})</span></div><div class="guard-box"><b>LIQUIDITY / NEWS:</b> <span style="color:#10b981;">{dead_ok} / {news_ok}</span></div></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="guard-grid"><div class="guard-box"><b>DAILY TRADES:</b> <span style="color:#f8fafc;">{day_trades} / {config.MAX_DAILY_TRADES}</span></div><div class="guard-box"><b>DAILY LOSS LIMIT:</b> <span style="color:#f8fafc;">${day_pnl:+.2f} / -${config.MAX_DAILY_LOSS * max(1.0, c_mult):.2f}</span></div><div class="guard-box"><b>ACTIVE LOT RISK:</b> <span style="color:#38bdf8;">{config.RISK_PCT*100:.1f}% (~${c_act_eq*config.RISK_PCT:.2f})</span></div><div class="guard-box"><b>LIQUIDITY / NEWS:</b> <span style="color:#10b981;">{dead_ok} / {news_ok}</span></div></div>', unsafe_allow_html=True)
 
     disp_n = int(getattr(config, "DISPLAY_SCANNER_CARDS", 16))
     st.markdown(f'<div class="sec-title">📡 Multi-Asset Institutional Scanner ({len(markets)} Delta Markets Active • Top {min(disp_n, len(markets))})</div>', unsafe_allow_html=True)
@@ -273,9 +287,11 @@ def _render_dashboard_body():
     if active_list:
         for tr in active_list:
             upnl = float(tr.get("unrealized_pnl_usd") or 0.0)
+            rpnl = float(tr.get("realized_pnl_usd") or 0.0)
             u_clr, side = ("#10b981" if upnl >= 0 else "#ef4444"), tr.get("direction", "LONG")
             b_clr = "#10b981" if side == "LONG" else "#ef4444"
-            st.markdown(f'<div class="pos-card" style="border-left-color:{b_clr};"><div style="display:flex;justify-content:space-between;align-items:center;"><b style="font-size:0.88rem;">{tr.get("symbol")} • {side} ({tr.get("setup_name")})</b><span style="color:{u_clr};font-weight:800;font-size:0.92rem;">${upnl:+.2f} (₹{upnl*USD_INR:+,.0f})</span></div><div style="font-size:0.74rem;color:#94a3b8;margin-top:5px;">Entry: <b>{_fmt_p(float(tr["entry_price"]))}</b> | SL: <b style="color:#ef4444;">{_fmt_p(float(tr["stop_price"]))}</b> | TP1: <b style="color:#10b981;">{_fmt_p(float(tr["tp1_price"]))}</b> | TP2: <b style="color:#10b981;">{_fmt_p(float(tr["tp2_price"]))}</b></div></div>', unsafe_allow_html=True)
+            booked_tag = f" • Booked TP1: ${rpnl:+.2f}" if rpnl != 0 else ""
+            st.markdown(f'<div class="pos-card" style="border-left-color:{b_clr};"><div style="display:flex;justify-content:space-between;align-items:center;"><b style="font-size:0.88rem;">{tr.get("symbol")} • {side} ({tr.get("setup_name")}){booked_tag}</b><span style="color:{u_clr};font-weight:800;font-size:0.92rem;">${upnl:+.2f} (₹{upnl*USD_INR:+,.0f})</span></div><div style="font-size:0.74rem;color:#94a3b8;margin-top:5px;">Entry: <b>{_fmt_p(float(tr["entry_price"]))}</b> | SL: <b style="color:#ef4444;">{_fmt_p(float(tr["stop_price"]))}</b> | TP1 (0.9R): <b style="color:#10b981;">{_fmt_p(float(tr["tp1_price"]))}</b> | TP2 (1.75R): <b style="color:#10b981;">{_fmt_p(float(tr["tp2_price"]))}</b></div></div>', unsafe_allow_html=True)
     else:
         st.caption(f"No open positions — All-Delta Radar scanning {len(markets)} active markets (100+ perpetuals swept every 30s) for Sniper & Live Intra-Candle confluence.")
 
@@ -285,7 +301,7 @@ def _render_dashboard_body():
             df_log = pd.DataFrame([{
                 "Time (UTC)": str(t.get("opened_at_utc", ""))[11:19], "Asset": str(t.get("symbol", "")).replace("USDT", ""),
                 "Side": t.get("direction"), "Strategy": t.get("setup_name"), "Entry": _fmt_p(float(t.get("entry_price") or 0)),
-                "SL": _fmt_p(float(t.get("stop_price") or 0)), "Exit Reason": t.get("close_reason") or "ACTIVE",
+                "SL": _fmt_p(float(t.get("stop_price") or 0)), "Exit Reason": t.get("close_reason") or ("TP1_BOOKED_RUNNING" if t.get("tp1_done") else "ACTIVE"),
                 "Gross ($)": f"${(float(t.get('realized_pnl_usd') or 0.0) + float(t.get('total_fee_usd') or 0.0)):+.2f}",
                 "Fee ($)": f"-${float(t.get('total_fee_usd') or 0.0):.2f}", "Net PnL ($)": f"${float(t.get('realized_pnl_usd') or 0.0):+.2f}",
             } for t in vault_trades])
@@ -298,19 +314,23 @@ def _render_dashboard_body():
         else:
             st.caption("Equity curve will render automatically after the first closed trade.")
     with tab3:
-        st.markdown(f"- **All-Delta Spike Radar:** Sweeps 100+ Delta perpetuals every 30s (`>=0.35%` instant spike + Top 40 active scanner)\n- **Position Sizing:** `{config.RISK_PCT*100:.1f}%` Equity Risk (`${config.MIN_RISK_USD:.2f}` – `${config.MAX_RISK_USD:.2f}` cap) at `{config.LEVERAGE}x` Leverage\n- **Fee-Protected Profit Lock:** `+0.8R` slashes risk to `0.25R` | `+1.0R` locks SL above round-trip brokerage (`0.118%`) | `TP1 (1.4R)` books `50%` | `TP2 (2.4R)` books `30%` | `TP3 (3.5R)` trails `20%` runner")
+        st.markdown(f"- **All-Delta Spike Radar:** Sweeps 100+ Delta perpetuals every 30s (`>=0.35%` instant spike + Top 40 active scanner)\n- **Proportional Capital Scaling:** Base `₹5,000 ($58)` scales lot sizes & profit targets automatically whenever you add `₹5,000 (+$58)` (`{c_mult:.2f}x` active multiplier)\n- **Fast Realized Profit Lock:** `+0.55R` slashes risk in half | `TP1 (+0.85R/0.90R)` immediately books `50%` cash profit & locks SL above fees | `TP2 (+1.75R)` books `30%` | `TP3 (+2.80R)` trails `20%` runner")
 
 def main() -> None:
     if hasattr(st, "fragment"):
         @st.fragment(run_every="15s")
         def _live_fragment():
             _render_dashboard_body()
-            c1, c2 = st.columns(2)
+            c1, c2, c3 = st.columns(3)
             with c1:
                 if st.button("⏯ Pause / Resume Engine", use_container_width=True):
                     toggle_bot_state()
                     st.rerun()
             with c2:
+                if st.button("➕ Add ₹5,000 ($58) Capital", use_container_width=True):
+                    add_capital_step(58.0)
+                    st.rerun()
+            with c3:
                 if st.button("🔄 Force Sync Now", use_container_width=True):
                     global _LAST_FETCH_TS
                     _LAST_FETCH_TS = 0.0
