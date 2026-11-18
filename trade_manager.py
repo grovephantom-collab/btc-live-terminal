@@ -134,8 +134,8 @@ def _check_cooldown_and_circuit_breakers(conn, symbol: str = None) -> tuple:
             reason = recent[0]["close_reason"] or ""
             if "STOP_LOSS" in reason and elapsed < getattr(config, "SL_COOLDOWN_SECONDS", 3600):
                 return False, "SL cooldown"
-            if elapsed < getattr(config, "TRADE_COOLDOWN_SECONDS", 900):
-                return False, "Trade cooldown"
+            if elapsed < getattr(config, "TRADE_COOLDOWN_SECONDS", 2700):
+                return False, "Rotation cooldown"
         except Exception:
             pass
     return True, "OK"
@@ -282,6 +282,12 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
 
     if getattr(config, "ENABLE_DYNAMIC_PROFIT_LOCK", True) and not tp1_done and r_mult >= 0.55:
         t_sl = round(entry - orig_sl_dist * 0.40 if is_long else entry + orig_sl_dist * 0.40, dec)
+        if (is_long and t_sl > sl) or (not is_long and t_sl < sl):
+            conn.execute("UPDATE trades SET stop_price=?, updated_at_utc=? WHERE trade_id=?", (t_sl, now_str, tid))
+            conn.commit()
+
+    if tp1_done and not tp2_done and r_mult >= 1.30:
+        t_sl = round(entry + orig_sl_dist * 0.55 if is_long else entry - orig_sl_dist * 0.55, dec)
         if (is_long and t_sl > sl) or (not is_long and t_sl < sl):
             conn.execute("UPDATE trades SET stop_price=?, updated_at_utc=? WHERE trade_id=?", (t_sl, now_str, tid))
             conn.commit()
