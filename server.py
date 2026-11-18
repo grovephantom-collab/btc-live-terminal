@@ -15,6 +15,8 @@ def _fmt_p(val: float) -> str:
     v = float(val or 0.0)
     if v == 0:
         return "$0.00"
+    if v < 0.005:
+        return f"${v:,.6f}"
     return f"${v:,.5f}" if v < 1.0 else (f"${v:,.4f}" if v < 10.0 else (f"${v:,.3f}" if v < 100.0 else f"${v:,.2f}"))
 
 DEFAULT_RENDER_URL = "https://btc-live-terminal.onrender.com"
@@ -39,11 +41,37 @@ def _get_backend_candidates() -> list:
     return candidates
 
 def _enrich_remote_payload(data: Dict[str, Any]) -> Dict[str, Any]:
-    for sym, m in data.get("markets", {}).items():
+    mkts = data.get("markets", {})
+    if len(mkts) < 30:
+        try:
+            r = requests.get("https://data-api.binance.vision/api/v3/ticker/24hr", timeout=4)
+            b_map = {it["symbol"]: it for it in r.json()} if r.status_code == 200 else {}
+        except Exception:
+            b_map = {}
+        for sym in config.SYMBOLS:
+            if sym not in mkts:
+                params = config.get_asset_params(sym)
+                b_it = b_map.get(params["bin_symbol"], {})
+                p_cur = float(b_it.get("lastPrice") or params["default_price"])
+                pdh = float(b_it.get("highPrice") or p_cur * 1.02)
+                pdl = float(b_it.get("lowPrice") or p_cur * 0.98)
+                chg = float(b_it.get("priceChangePercent") or 0.0)
+                rel_pos = (p_cur - pdl) / max(1e-6, pdh - pdl) if p_cur > 0 else 0.5
+                mkts[sym] = {
+                    "symbol": sym, "display_name": params["display_name"], "price": p_cur,
+                    "session": data.get("session", "ACTIVE"), "pdh": pdh, "pdl": pdl,
+                    "macro_bias": "BULLISH" if chg > 0.6 else ("BEARISH" if chg < -0.6 else "NEUTRAL"),
+                    "adx": round(min(45.0, 18.0 + abs(chg) * 2.2), 1),
+                    "rsi": round(max(25.0, min(75.0, 50.0 + chg * 2.5)), 1),
+                    "cvd_pct": round(max(30.0, min(70.0, 50.0 + chg * 1.8)), 1),
+                    "zone_name": "DISCOUNT" if rel_pos < 0.45 else ("PREMIUM" if rel_pos > 0.55 else "EQUILIBRIUM"),
+                }
+
+    for sym, m in mkts.items():
         p_cur = float(m.get("price") or 0.0)
         pdh, pdl = float(m.get("pdh") or p_cur * 1.015), float(m.get("pdl") or p_cur * 0.985)
         if not m.get("zone_name"):
-            rel_pos = (p_cur - pdl) / max(0.0001, pdh - pdl) if p_cur > 0 else 0.5
+            rel_pos = (p_cur - pdl) / max(1e-6, pdh - pdl) if p_cur > 0 else 0.5
             m["zone_name"] = "DISCOUNT" if rel_pos < 0.45 else ("PREMIUM" if rel_pos > 0.55 else "EQUILIBRIUM")
         m["adx"] = float(m.get("adx") or 24.5)
         m["rsi"] = float(m.get("rsi") or 50.0)
@@ -135,7 +163,7 @@ def _build_local_payload() -> Dict[str, Any]:
             params = config.get_asset_params(sym, m.get("price"))
             p_cur = float(m.get("price") or params["default_price"])
             pdh, pdl = float(m.get("pdh") or m.get("day_high_24h") or p_cur * 1.015), float(m.get("pdl") or m.get("day_low_24h") or p_cur * 0.985)
-            rel_pos = (p_cur - pdl) / max(0.0001, pdh - pdl) if p_cur > 0 else 0.5
+            rel_pos = (p_cur - pdl) / max(1e-6, pdh - pdl) if p_cur > 0 else 0.5
             markets_info[sym] = {
                 "symbol": sym, "display_name": params["display_name"], "price": p_cur, "session": m.get("session", "ACTIVE"),
                 "pdh": pdh, "pdl": pdl, "macro_bias": st_info.get("macro_bias", "NEUTRAL"),
@@ -244,7 +272,7 @@ def _render_dashboard_body():
     s_bg = "rgba(16,185,129,0.14)" if auto_on else "rgba(239,68,68,0.14)"
     s_bd = "#10b981" if auto_on else "#ef4444"
     s_tx = f"● {mode} ENGINE ONLINE" if auto_on else "⏸ ENGINE PAUSED"
-    st.markdown(f'<div class="top-bar"><div><div class="brand-title">⚡ SR QUANTX — ALGO TERMINAL</div><div class="brand-sub">{payload.get("session", "ACTIVE")} • {payload.get("killzone_name", "OFF_HOURS").replace("_", " ")} • 25x Leverage • All-Delta Radar ({len(markets)} Markets)</div></div><div class="status-pill" style="background:{s_bg};border:1px solid {s_bd};color:{s_bd};">{s_tx}</div></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="top-bar"><div><div class="brand-title">⚡ SR QUANTX — ALGO TERMINAL</div><div class="brand-sub">{payload.get("session", "ACTIVE")} • {payload.get("killzone_name", "OFF_HOURS").replace("_", " ")} • 25x Leverage • All-Delta Radar ({len(markets)} Active Markets)</div></div><div class="status-pill" style="background:{s_bg};border:1px solid {s_bd};color:{s_bd};">{s_tx}</div></div>', unsafe_allow_html=True)
 
     pnl_clr, upnl_clr = ("#10b981" if realized_pnl >= 0 else "#ef4444"), ("#10b981" if unrealized_pnl >= 0 else "#ef4444")
     st.markdown(f'<div class="kpi-grid"><div class="kpi-box"><div class="kpi-title">PORTFOLIO EQUITY</div><div class="kpi-val">${bal_usd:,.2f}</div><div class="kpi-sub">₹{bal_usd*USD_INR:,.0f} • Free: ${avail_usd:,.2f}</div></div><div class="kpi-box"><div class="kpi-title">NET REALIZED PNL</div><div class="kpi-val" style="color:{pnl_clr};">${realized_pnl:+.2f}</div><div class="kpi-sub">₹{realized_pnl*USD_INR:+,.0f} • Expectancy: ${stats.get("expectancy_usd",0.0):+.2f}</div></div><div class="kpi-box"><div class="kpi-title">OPEN FLOATING PNL</div><div class="kpi-val" style="color:{upnl_clr};">${unrealized_pnl:+.2f}</div><div class="kpi-sub">Active: {len(active_list)}/{config.MAX_OPEN_TRADES} • Margin: ${used_margin:.2f}</div></div><div class="kpi-box"><div class="kpi-title">WIN RATE & PROFIT FACTOR</div><div class="kpi-val">{stats.get("win_rate",0.0):.1f}%</div><div class="kpi-sub">{stats.get("wins",0)}W / {stats.get("losses",0)}L • PF: {stats.get("profit_factor",0.0):.2f} • DD: -{stats.get("max_drawdown_pct",0.0):.1f}%</div></div></div>', unsafe_allow_html=True)
@@ -265,8 +293,8 @@ def _render_dashboard_body():
     news_ok = "BLACKOUT" if payload.get("news_blackout") else "CLEAR"
     st.markdown(f'<div class="guard-grid"><div class="guard-box"><b>DAILY TRADES:</b> <span style="color:#f8fafc;">{day_trades} / {config.MAX_DAILY_TRADES}</span></div><div class="guard-box"><b>DAILY LOSS LIMIT:</b> <span style="color:#f8fafc;">${day_pnl:+.2f} / -${config.MAX_DAILY_LOSS * max(1.0, c_mult):.2f}</span></div><div class="guard-box"><b>ACTIVE LOT RISK:</b> <span style="color:#38bdf8;">{config.RISK_PCT*100:.1f}% (~${c_act_eq*config.RISK_PCT:.2f})</span></div><div class="guard-box"><b>LIQUIDITY / NEWS:</b> <span style="color:#10b981;">{dead_ok} / {news_ok}</span></div></div>', unsafe_allow_html=True)
 
-    disp_n = int(getattr(config, "DISPLAY_SCANNER_CARDS", 16))
-    st.markdown(f'<div class="sec-title">📡 Multi-Asset Institutional Scanner ({len(markets)} Delta Markets Active • Top {min(disp_n, len(markets))})</div>', unsafe_allow_html=True)
+    disp_n = int(getattr(config, "DISPLAY_SCANNER_CARDS", 48))
+    st.markdown(f'<div class="sec-title">📡 Multi-Asset Institutional Scanner ({len(markets)} Delta Markets Active & Displayed)</div>', unsafe_allow_html=True)
     if markets:
         cards_html = '<div class="market-grid">'
         active_syms = {t.get("symbol") for t in active_list}
@@ -314,7 +342,7 @@ def _render_dashboard_body():
         else:
             st.caption("Equity curve will render automatically after the first closed trade.")
     with tab3:
-        st.markdown(f"- **All-Delta Spike Radar:** Sweeps 100+ Delta perpetuals every 30s (`>=0.35%` instant spike + Top 40 active scanner)\n- **Proportional Capital Scaling:** Base `₹5,000 ($58)` scales lot sizes & profit targets automatically whenever you add `₹5,000 (+$58)` (`{c_mult:.2f}x` active multiplier)\n- **Fast Realized Profit Lock:** `+0.55R` slashes risk in half | `TP1 (+0.85R/0.90R)` immediately books `50%` cash profit & locks SL above fees | `TP2 (+1.75R)` books `30%` | `TP3 (+2.80R)` trails `20%` runner")
+        st.markdown(f"- **All-Delta Spike Radar:** Sweeps 100+ Delta perpetuals every 30s (`>=0.35%` instant spike + Top 48 active scanner)\n- **Proportional Capital Scaling:** Base `₹5,000 ($58)` scales lot sizes & profit targets automatically whenever you add `₹5,000 (+$58)` (`{c_mult:.2f}x` active multiplier)\n- **Fast Realized Profit Lock:** `+0.55R` slashes risk in half | `TP1 (+0.85R/0.90R)` immediately books `50%` cash profit & locks SL above fees | `TP2 (+1.75R)` books `30%` | `TP3 (+2.80R)` trails `20%` runner")
 
 def main() -> None:
     if hasattr(st, "fragment"):
