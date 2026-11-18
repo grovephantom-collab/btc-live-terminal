@@ -225,7 +225,7 @@ def discover_top_delta_movers(active_trade_symbols: list = None) -> List[str]:
     now = time.time()
     if not getattr(config, "ENABLE_ALL_DELTA_RADAR", True):
         return config.SYMBOLS
-    if (now - _LAST_RADAR_TS) < 30.0 and len(config.SYMBOLS) >= 16:
+    if (now - _LAST_RADAR_TS) < 30.0 and len(config.SYMBOLS) > 16:
         for s in (active_trade_symbols or []):
             if s and s not in config.SYMBOLS:
                 config.SYMBOLS.insert(0, s)
@@ -239,7 +239,7 @@ def discover_top_delta_movers(active_trade_symbols: list = None) -> List[str]:
         r = HTTP.get("https://api.delta.exchange/v2/tickers", timeout=5.0)
         if r.status_code == 200:
             instant_spikers, movers = [], []
-            min_turn = float(getattr(config, "MIN_RADAR_TURNOVER_USD", 100000.0))
+            min_turn = float(getattr(config, "MIN_RADAR_TURNOVER_USD", 25000.0))
             for it in r.json().get("result", []):
                 ctype = str(it.get("contract_type", "")).lower()
                 sym_raw = str(it.get("symbol", "")).upper()
@@ -251,7 +251,13 @@ def discover_top_delta_movers(active_trade_symbols: list = None) -> List[str]:
                 std_sym = f"{base}USDT"
                 mark_p = float(it.get("mark_price") or it.get("close") or 0.0)
                 open_p = float(it.get("open") or mark_p)
-                turnover = float(it.get("turnover_usd") or it.get("turnover") or 0.0)
+                vol_raw = float(it.get("volume") or 0.0)
+                turnover = max(
+                    float(it.get("turnover_usd") or 0.0),
+                    float(it.get("turnover") or 0.0),
+                    vol_raw * mark_p,
+                    float(it.get("oi_value_usd") or 0.0),
+                )
                 if mark_p <= 0 or open_p <= 0:
                     continue
                 prev_p = _PREV_TICKER_PRICES.get(std_sym)
@@ -260,8 +266,8 @@ def discover_top_delta_movers(active_trade_symbols: list = None) -> List[str]:
                 m_entry = get_market(std_sym)
                 m_entry["price"] = mark_p
                 m_entry["price_ts"] = now
-                if turnover >= min_turn:
-                    day_move = abs((mark_p - open_p) / open_p) * 100.0
+                day_move = abs((mark_p - open_p) / open_p) * 100.0
+                if turnover >= min_turn or day_move >= 1.2:
                     if jump_pct >= 0.35:
                         instant_spikers.append((jump_pct, day_move, std_sym))
                     elif std_sym not in selected:
