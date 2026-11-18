@@ -1,5 +1,5 @@
 import time, threading, logging
-from flask import Flask, jsonify
+from flask import Flask, request, jsonify
 import config, database, market_data, smc_engine, trade_manager, notifications
 
 log = logging.getLogger("Supervisor")
@@ -71,6 +71,15 @@ def toggle_bot():
     database.set_setting("auto_trade_enabled", new_val)
     return jsonify({"auto_trade_enabled": new_val == "1"}), 200
 
+@app.post("/add-capital")
+def add_capital():
+    data = request.get_json(silent=True) or {}
+    add_usd = float(data.get("amount_usd", 58.0))
+    cur_added = float(database.get_setting("added_capital_usd", "0.0") or 0.0)
+    new_added = max(0.0, round(cur_added + add_usd, 2))
+    database.set_setting("added_capital_usd", str(new_added))
+    return jsonify({"added_capital_usd": new_added, "base_capital_usd": round(float(config.START_EQUITY) + new_added, 2)}), 200
+
 @app.get("/vault-data")
 def vault_data():
     c = database.db()
@@ -80,19 +89,20 @@ def vault_data():
         pnl = float(c.execute("SELECT COALESCE(SUM(realized_pnl_usd),0) p FROM trades").fetchone()["p"] or 0.0)
         unrealized = float(c.execute("SELECT COALESCE(SUM(unrealized_pnl_usd),0) u FROM trades WHERE stage != 'CLOSED'").fetchone()["u"] or 0.0)
         compounding = trade_manager.get_15d_compounding_state(c)
+        base_cap = compounding["base_capital_usd"]
 
-        closed_asc = c.execute("SELECT symbol, realized_pnl_usd, closed_at_utc FROM trades WHERE stage = 'CLOSED' ORDER BY id ASC").fetchall()
-        wins = [float(r["realized_pnl_usd"] or 0.0) for r in closed_asc if float(r["realized_pnl_usd"] or 0.0) > 0]
-        losses = [float(r["realized_pnl_usd"] or 0.0) for r in closed_asc if float(r["realized_pnl_usd"] or 0.0) <= 0]
+        all_realized_rows = c.execute("SELECT symbol, realized_pnl_usd, stage, closed_at_utc FROM trades WHERE stage = 'CLOSED' OR realized_pnl_usd != 0 ORDER BY id ASC").fetchall()
+        wins = [float(r["realized_pnl_usd"] or 0.0) for r in all_realized_rows if float(r["realized_pnl_usd"] or 0.0) > 0]
+        losses = [float(r["realized_pnl_usd"] or 0.0) for r in all_realized_rows if float(r["realized_pnl_usd"] or 0.0) < 0]
         total_closed = len(wins) + len(losses)
         win_rate = round((len(wins) / total_closed) * 100.0, 1) if total_closed > 0 else 0.0
         gross_win, gross_loss = sum(wins), abs(sum(losses))
         profit_factor = round(gross_win / gross_loss, 2) if gross_loss > 0 else (round(gross_win, 2) if gross_win > 0 else 0.0)
 
-        eq = float(config.START_EQUITY)
+        eq = float(base_cap)
         peak, max_dd = eq, 0.0
         equity_curve = [{"trade": 0, "equity": round(eq, 2), "drawdown": 0.0}]
-        for idx, r in enumerate(closed_asc, start=1):
+        for idx, r in enumerate(all_realized_rows, start=1):
             eq += float(r["realized_pnl_usd"] or 0.0)
             peak = max(peak, eq)
             dd = round(((peak - eq) / peak) * 100.0, 2) if peak > 0 else 0.0
@@ -100,7 +110,7 @@ def vault_data():
             equity_curve.append({"trade": idx, "equity": round(eq, 2), "drawdown": -dd})
 
         delta_wallet = trade_manager.fetch_delta_wallet_balance()
-        wallet_bal = delta_wallet["balance"] if delta_wallet["balance"] is not None else round(config.START_EQUITY + pnl, 2)
+        wallet_bal = delta_wallet["balance"] if delta_wallet["balance"] is not None else round(base_cap + pnl, 2)
         wallet_avail = delta_wallet["available"] if delta_wallet["available"] is not None else round(wallet_bal, 2)
         auto_enabled = database.get_setting("auto_trade_enabled", "1") == "1"
 
@@ -134,6 +144,7 @@ def vault_data():
                 "profit_factor": profit_factor, "max_drawdown_pct": round(max_dd, 2),
                 "avg_win_usd": round(gross_win / len(wins), 2) if wins else 0.0,
                 "avg_loss_usd": round(-gross_loss / len(losses), 2) if losses else 0.0,
+                "expectancy_usd": round(pnl / total_closed, 2) if total_closed > 0 else 0.0,
             },
             "equity_curve": equity_curve, "vault": ts, "active": active_rows,
         })
