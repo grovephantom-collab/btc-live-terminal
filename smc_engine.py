@@ -198,9 +198,9 @@ def _btc_leader_allows(symbol: str, direction: str) -> bool:
         if not btc_m or not btc_m.get("klines"):
             return True
         btc_cvd, btc_p, btc_open = float(btc_m.get("cvd_ratio") or 0.50), float(btc_m.get("price") or 0.0), float(btc_m.get("daily_open") or 0.0)
-        if direction == "LONG" and btc_cvd < 0.42 and btc_open > 0 and btc_p < btc_open:
+        if direction == "LONG" and btc_cvd < 0.45 and btc_open > 0 and btc_p < btc_open:
             return False
-        if direction == "SHORT" and btc_cvd > 0.58 and btc_open > 0 and btc_p > btc_open:
+        if direction == "SHORT" and btc_cvd > 0.55 and btc_open > 0 and btc_p > btc_open:
             return False
     except Exception:
         pass
@@ -210,11 +210,11 @@ def _build_trade_levels(direction: str, entry: float, raw_sl: float, atr: float,
     params = config.get_asset_params(symbol, entry)
     dec = int(params.get("decimals", 2))
     if direction == "LONG":
-        sl_dist = max(params["min_stop"], min(params["max_stop"], max((entry - raw_sl) + params["sl_buffer"], atr * 1.7)))
-        sl, tp1, tp2, tp3 = round(entry - sl_dist, dec), round(entry + sl_dist * 1.4, dec), round(entry + sl_dist * 2.4, dec), round(entry + sl_dist * 3.5, dec)
+        sl_dist = max(params["min_stop"], min(params["max_stop"], max((entry - raw_sl) + params["sl_buffer"], atr * 1.35)))
+        sl, tp1, tp2, tp3 = round(entry - sl_dist, dec), round(entry + sl_dist * 0.90, dec), round(entry + sl_dist * 1.75, dec), round(entry + sl_dist * 2.80, dec)
     else:
-        sl_dist = max(params["min_stop"], min(params["max_stop"], max((raw_sl - entry) + params["sl_buffer"], atr * 1.7)))
-        sl, tp1, tp2, tp3 = round(entry + sl_dist, dec), round(entry - sl_dist * 1.4, dec), round(entry - sl_dist * 2.4, dec), round(entry - sl_dist * 3.5, dec)
+        sl_dist = max(params["min_stop"], min(params["max_stop"], max((raw_sl - entry) + params["sl_buffer"], atr * 1.35)))
+        sl, tp1, tp2, tp3 = round(entry + sl_dist, dec), round(entry - sl_dist * 0.90, dec), round(entry - sl_dist * 1.75, dec), round(entry - sl_dist * 2.80, dec)
     return {"symbol": symbol, "direction": direction, "setup_name": setup_name, "score": round(score, 1), "entry": round(entry, dec), "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3, "candle_time": candle_time}
 
 def evaluate_signal(structure: dict, candles_15m: list, current_price: float, session: str, poc: float, symbol: str = "BTCUSDT") -> dict:
@@ -260,85 +260,85 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
     range_floor = min([x for x in [pdl, day_low_24h, sl] if x and x > 0] or [cl - atr * 3.0])
     rel_pos = (cl - range_floor) / max(atr * 2.0, range_ceil - range_floor)
     in_discount, in_premium = rel_pos < 0.50, rel_pos > 0.50
-    allow_long_cvd = (cvd_ratio >= 0.48) if getattr(config, "ENABLE_CVD_FILTER", True) else True
-    allow_short_cvd = (cvd_ratio <= 0.52) if getattr(config, "ENABLE_CVD_FILTER", True) else True
+    allow_long_cvd = (cvd_ratio >= 0.51) if getattr(config, "ENABLE_CVD_FILTER", True) else True
+    allow_short_cvd = (cvd_ratio <= 0.49) if getattr(config, "ENABLE_CVD_FILTER", True) else True
 
     three_bar_run = abs(cl - parsed[-4][0]) if len(parsed) >= 5 else 0.0
-    long_htf_ok = (htf_4h_bias != "BEARISH") and _btc_leader_allows(symbol, "LONG") and (rsi <= 73.0) and not (cl > parsed[-4][0] and three_bar_run > atr * 2.25)
-    short_htf_ok = (htf_4h_bias != "BULLISH") and _btc_leader_allows(symbol, "SHORT") and (rsi >= 27.0) and not (cl < parsed[-4][0] and three_bar_run > atr * 2.25)
+    long_htf_ok = (htf_4h_bias != "BEARISH") and _btc_leader_allows(symbol, "LONG") and (rsi <= 70.0) and not (cl > parsed[-4][0] and three_bar_run > atr * 2.1)
+    short_htf_ok = (htf_4h_bias != "BULLISH") and _btc_leader_allows(symbol, "SHORT") and (rsi >= 30.0) and not (cl < parsed[-4][0] and three_bar_run > atr * 2.1)
     vol_spike_ok = vol >= vol_sma20 * 1.20
-    vwap_long_ok = (cl >= vwap * 0.9985) if vwap > 0 else True
-    vwap_short_ok = (cl <= vwap * 1.0015) if vwap > 0 else True
+    vwap_long_ok = (cl >= vwap * 0.999) if vwap > 0 else True
+    vwap_short_ok = (cl <= vwap * 1.001) if vwap > 0 else True
     touched_bull_ob = bool(bull_ob and (l <= bull_ob[1] + atr * 0.15) and (cl >= bull_ob[0]))
     touched_bear_ob = bool(bear_ob and (h >= bear_ob[0] - atr * 0.15) and (cl <= bear_ob[1]))
-    min_adx = getattr(config, "MIN_ADX_TREND", 18.0)
+    min_adx = getattr(config, "MIN_ADX_TREND", 20.0)
 
-    # STRATEGY 0: CHoCH + FVG BREAKOUT / BREAKDOWN
+    # STRATEGY 0: CHoCH + FVG BREAKOUT / BREAKDOWN (A+ Score 99)
     if getattr(config, "ENABLE_CHOCH_STRATEGY", True) and (not is_choppy) and (adx >= min_adx) and choch_status != "NONE" and choch_level:
         if choch_status == "BEARISH_CHOCH" and macro_bias != "BULLISH" and short_htf_ok and (not in_discount) and (cl - range_floor >= atr * 1.25) and allow_short_cvd and funding >= min_short_f:
-            if (cl < o) and (cl < choch_level) and (vol_spike_ok or bear_fvg) and (rsi <= 55.0):
-                return _build_trade_levels("SHORT", current_price or cl, max(highest_recent, choch_level + atr * 0.20), atr, "Sniper CHoCH + FVG Breakdown", 99.0, c_time, symbol)
+            if (cl < o) and (cl < choch_level) and (vol_spike_ok or bear_fvg) and (rsi <= 54.0):
+                return _build_trade_levels("SHORT", current_price or cl, max(highest_recent, choch_level + atr * 0.15), atr, "Sniper CHoCH + FVG Breakdown", 99.0, c_time, symbol)
         if choch_status == "BULLISH_CHOCH" and macro_bias != "BEARISH" and long_htf_ok and (not in_premium) and (range_ceil - cl >= atr * 1.25) and allow_long_cvd and funding <= max_long_f:
-            if (cl > o) and (cl > choch_level) and (vol_spike_ok or bull_fvg) and (rsi >= 45.0):
-                return _build_trade_levels("LONG", current_price or cl, min(lowest_recent, choch_level - atr * 0.20), atr, "Sniper CHoCH + FVG Breakout", 99.0, c_time, symbol)
+            if (cl > o) and (cl > choch_level) and (vol_spike_ok or bull_fvg) and (rsi >= 46.0):
+                return _build_trade_levels("LONG", current_price or cl, min(lowest_recent, choch_level - atr * 0.15), atr, "Sniper CHoCH + FVG Breakout", 99.0, c_time, symbol)
 
-    # STRATEGY 1: DAILY EXPANSION BREAKOUT
+    # STRATEGY 1: DAILY EXPANSION BREAKOUT (A+ Score 98)
     if getattr(config, "ENABLE_DAILY_BREAKOUT", True) and (not is_choppy) and (adx >= min_adx):
         bh = pdh or day_high_24h
         if bh and macro_bias == "BULLISH" and long_htf_ok and vwap_long_ok and funding <= max_long_f and allow_long_cvd:
-            if (cl > bh) and ((cl - bh) <= atr * 0.40) and (prev_cl <= bh + atr * 0.15) and (highest_recent >= bh + atr * 0.06) and (cl > o) and (body_ratio >= 0.50) and (upper_wick_ratio <= 0.25) and (vol_spike_ok and bull_fvg) and (52.0 <= rsi <= 68.0):
+            if (cl > bh) and ((cl - bh) <= atr * 0.35) and (prev_cl <= bh + atr * 0.12) and (highest_recent >= bh + atr * 0.05) and (cl > o) and (body_ratio >= 0.52) and (upper_wick_ratio <= 0.24) and (vol_spike_ok and bull_fvg) and (52.0 <= rsi <= 67.0):
                 return _build_trade_levels("LONG", current_price or cl, min(l, prev_l, ema20), atr, "Sniper Daily High Expansion", 98.0, c_time, symbol)
         bl = pdl or day_low_24h
         if bl and macro_bias == "BEARISH" and short_htf_ok and vwap_short_ok and funding >= min_short_f and allow_short_cvd:
-            if (cl < bl) and ((bl - cl) <= atr * 0.40) and (prev_cl >= bl - atr * 0.15) and (lowest_recent <= bl - atr * 0.06) and (cl < o) and (body_ratio >= 0.50) and (lower_wick_ratio <= 0.25) and (vol_spike_ok and bear_fvg) and (32.0 <= rsi <= 48.0):
+            if (cl < bl) and ((bl - cl) <= atr * 0.35) and (prev_cl >= bl - atr * 0.12) and (lowest_recent <= bl - atr * 0.05) and (cl < o) and (body_ratio >= 0.52) and (lower_wick_ratio <= 0.24) and (vol_spike_ok and bear_fvg) and (33.0 <= rsi <= 48.0):
                 return _build_trade_levels("SHORT", current_price or cl, max(h, prev_h, ema20), atr, "Sniper Daily Low Breakdown", 98.0, c_time, symbol)
 
-    # STRATEGY 2: PDH/PDL LIQUIDITY SWEEP
+    # STRATEGY 2: PDH/PDL LIQUIDITY SWEEP (Highest Live Win-Rate — Score 97)
     d_low = pdl or day_low_24h or structure.get("asian_low")
     if d_low and (macro_bias != "BEARISH") and long_htf_ok and funding <= max_long_f and allow_long_cvd:
-        if (lowest_recent <= d_low + atr * 0.08) and (cl > d_low) and (cl > o) and (lower_wick_ratio >= 0.32 or body_ratio >= 0.42) and (rsi <= 56.0):
+        if (lowest_recent <= d_low + atr * 0.08) and (cl > d_low) and (cl > o) and (lower_wick_ratio >= 0.34 or body_ratio >= 0.45) and (rsi <= 55.0):
             return _build_trade_levels("LONG", current_price or cl, lowest_recent, atr, "Sniper PDH/PDL Liquidity Sweep", 97.0, c_time, symbol)
     d_high = pdh or day_high_24h or structure.get("asian_high")
     if d_high and (macro_bias != "BULLISH") and short_htf_ok and funding >= min_short_f and allow_short_cvd:
-        if (highest_recent >= d_high - atr * 0.08) and (cl < d_high) and (cl < o) and (upper_wick_ratio >= 0.32 or body_ratio >= 0.42) and (rsi >= 44.0):
+        if (highest_recent >= d_high - atr * 0.08) and (cl < d_high) and (cl < o) and (upper_wick_ratio >= 0.34 or body_ratio >= 0.45) and (rsi >= 45.0):
             return _build_trade_levels("SHORT", current_price or cl, highest_recent, atr, "Sniper PDH/PDL Liquidity Sweep", 97.0, c_time, symbol)
 
-    # STRATEGY 3: 24H MACRO SWING LIQUIDITY TRAP
+    # STRATEGY 3: 24H MACRO SWING LIQUIDITY TRAP (Score 95)
     if (macro_bias != "BEARISH") and long_htf_ok and funding <= max_long_f and in_discount and allow_long_cvd:
-        if (lowest_recent <= sl - atr * 0.06) and (cl > sl) and (cl > o) and (lower_wick_ratio >= 0.38 or body_ratio >= 0.48) and (cl > prev_h or cl > ema9) and (rsi <= 48.0) and (vol_spike_ok or bull_fvg):
+        if (lowest_recent <= sl - atr * 0.05) and (cl > sl) and (cl > o) and (lower_wick_ratio >= 0.38 or body_ratio >= 0.48) and (cl > prev_h or cl > ema9) and (rsi <= 48.0) and (vol_spike_ok or bull_fvg):
             return _build_trade_levels("LONG", current_price or cl, lowest_recent, atr, "24H Macro Swing Liquidity Trap", 95.0, c_time, symbol)
     if (macro_bias != "BULLISH") and short_htf_ok and funding >= min_short_f and in_premium and allow_short_cvd:
-        if (highest_recent >= sh + atr * 0.06) and (cl < sh) and (cl < o) and (upper_wick_ratio >= 0.38 or body_ratio >= 0.48) and (cl < prev_l or cl < ema9) and (rsi >= 52.0) and (vol_spike_ok or bear_fvg):
+        if (highest_recent >= sh + atr * 0.05) and (cl < sh) and (cl < o) and (upper_wick_ratio >= 0.38 or body_ratio >= 0.48) and (cl < prev_l or cl < ema9) and (rsi >= 52.0) and (vol_spike_ok or bear_fvg):
             return _build_trade_levels("SHORT", current_price or cl, highest_recent, atr, "24H Macro Swing Liquidity Trap", 95.0, c_time, symbol)
 
-    # STRATEGY 4: EMA + OB + FVG TREND PULLBACK
+    # STRATEGY 4: EMA + OB + FVG TREND PULLBACK (Score 94)
     if not is_choppy and adx >= min_adx:
         ec = current_price or cl
         if macro_bias == "BULLISH" and long_htf_ok and vwap_long_ok and (cl > ema200) and (ema9 > ema20 > ema50) and (((l <= ema20 * 1.0015) and (cl >= ema20 * 0.999)) or touched_bull_ob):
-            if (cl > o) and (body_ratio >= 0.50) and (upper_wick_ratio <= 0.25) and (cl > prev_h) and (bull_fvg or vol >= vol_sma20 * 1.15) and (48.0 <= rsi <= 68.0) and funding <= max_long_f and allow_long_cvd and (not in_premium):
+            if (cl > o) and (body_ratio >= 0.50) and (upper_wick_ratio <= 0.25) and (cl > prev_h) and (bull_fvg or vol >= vol_sma20 * 1.15) and (48.0 <= rsi <= 66.0) and funding <= max_long_f and allow_long_cvd and (not in_premium):
                 return _build_trade_levels("LONG", ec, min(l, prev_l), atr, "Sniper EMA + FVG Trend Pullback", 94.0, c_time, symbol)
         if macro_bias == "BEARISH" and short_htf_ok and vwap_short_ok and (cl < ema200) and (ema9 < ema20 < ema50) and (((h >= ema20 * 0.9985) and (cl <= ema20 * 1.001)) or touched_bear_ob):
-            if (cl < o) and (body_ratio >= 0.50) and (lower_wick_ratio <= 0.25) and (cl < prev_l) and (bear_fvg or vol >= vol_sma20 * 1.15) and (32.0 <= rsi <= 52.0) and funding >= min_short_f and allow_short_cvd and (not in_discount):
+            if (cl < o) and (body_ratio >= 0.50) and (lower_wick_ratio <= 0.25) and (cl < prev_l) and (bear_fvg or vol >= vol_sma20 * 1.15) and (34.0 <= rsi <= 52.0) and funding >= min_short_f and allow_short_cvd and (not in_discount):
                 return _build_trade_levels("SHORT", ec, max(h, prev_h), atr, "Sniper EMA + FVG Trend Pullback", 94.0, c_time, symbol)
 
-    # STRATEGY 5: DISCOUNT/PREMIUM ORDERFLOW IMPULSE
-    if not is_choppy and adx >= 14.0:
+    # STRATEGY 5: STRICT INSTITUTIONAL OB + FVG ORDERFLOW REJECTION (Requires ADX >= 21, Strict Macro Bias, Strong CVD >= 56% / <= 44%)
+    if not is_choppy and adx >= 21.0:
         ec = current_price or cl
-        if (macro_bias in ("BULLISH", "NEUTRAL")) and long_htf_ok and (cl > o) and (body_ratio >= 0.42 or lower_wick_ratio >= 0.35) and (cl > ema9 or cl > prev_h) and (bull_fvg or touched_bull_ob or vol >= vol_sma20 * 1.05 or vwap_long_ok) and (35.0 <= rsi <= 68.0) and (cvd_ratio >= 0.51) and funding <= max_long_f and (not in_premium):
-            return _build_trade_levels("LONG", ec, min(l, prev_l, lowest_recent), atr, "Sniper Discount Orderflow Impulse", 92.0, c_time, symbol)
-        if (macro_bias in ("BEARISH", "NEUTRAL")) and short_htf_ok and (cl < o) and (body_ratio >= 0.42 or upper_wick_ratio >= 0.35) and (cl < ema9 or cl < prev_l) and (bear_fvg or touched_bear_ob or vol >= vol_sma20 * 1.05 or vwap_short_ok) and (32.0 <= rsi <= 66.0) and (cvd_ratio <= 0.49) and funding >= min_short_f and (not in_discount):
-            return _build_trade_levels("SHORT", ec, max(h, prev_h, highest_recent), atr, "Sniper Premium Orderflow Rejection", 92.0, c_time, symbol)
+        if macro_bias == "BULLISH" and long_htf_ok and vwap_long_ok and (cl > o) and (body_ratio >= 0.48 or lower_wick_ratio >= 0.38) and (cl > ema9 and cl > prev_h) and (bull_fvg or touched_bull_ob) and (42.0 <= rsi <= 64.0) and (cvd_ratio >= 0.56) and funding <= max_long_f and in_discount:
+            return _build_trade_levels("LONG", ec, min(l, prev_l, lowest_recent), atr, "Sniper Discount Orderflow Impulse", 93.0, c_time, symbol)
+        if macro_bias == "BEARISH" and short_htf_ok and vwap_short_ok and (cl < o) and (body_ratio >= 0.48 or upper_wick_ratio >= 0.38) and (cl < ema9 and cl < prev_l) and (bear_fvg or touched_bear_ob) and (36.0 <= rsi <= 58.0) and (cvd_ratio <= 0.44) and funding >= min_short_f and in_premium:
+            return _build_trade_levels("SHORT", ec, max(h, prev_h, highest_recent), atr, "Sniper Premium Orderflow Rejection", 93.0, c_time, symbol)
 
     # STRATEGY 6: LIVE INTRA-CANDLE MOMENTUM BREAKOUT / BREAKDOWN
-    if getattr(config, "ENABLE_LIVE_IMPULSE", True) and (not is_choppy) and len(parsed) >= 5:
+    if getattr(config, "ENABLE_LIVE_IMPULSE", True) and (not is_choppy) and adx >= 20.0 and len(parsed) >= 5:
         lc = parsed[-1]
         lo_o, lo_h, lo_l, lo_c, lo_t = lc[0], lc[1], lc[2], (current_price or lc[3]), lc[5]
         l_rng = max(1e-6, max(lo_h, lo_c) - min(lo_l, lo_c))
         l_body = abs(lo_c - lo_o)
         r3h_hi, r3h_lo = max(x[1] for x in parsed[-13:-1]), min(x[2] for x in parsed[-13:-1])
-        if (macro_bias in ("BULLISH", "NEUTRAL")) and long_htf_ok and vwap_long_ok and (lo_c > lo_o) and (lo_c > r3h_hi) and (atr * 0.55 <= l_body <= atr * 1.65) and (l_body / l_rng >= 0.58) and (cvd_ratio >= 0.55) and (48.0 <= rsi <= 70.0) and funding <= max_long_f and (not in_premium):
+        if macro_bias == "BULLISH" and long_htf_ok and vwap_long_ok and (lo_c > lo_o) and (lo_c > r3h_hi) and (atr * 0.60 <= l_body <= atr * 1.50) and (l_body / l_rng >= 0.60) and (cvd_ratio >= 0.57) and (50.0 <= rsi <= 68.0) and funding <= max_long_f and (not in_premium):
             return _build_trade_levels("LONG", lo_c, min(lo_l, l, ema20), atr, "Live Intra-Candle Momentum Breakout", 96.0, lo_t, symbol)
-        if (macro_bias in ("BEARISH", "NEUTRAL")) and short_htf_ok and vwap_short_ok and (lo_c < lo_o) and (lo_c < r3h_lo) and (atr * 0.55 <= l_body <= atr * 1.65) and (l_body / l_rng >= 0.58) and (cvd_ratio <= 0.45) and (30.0 <= rsi <= 52.0) and funding >= min_short_f and (not in_discount):
+        if macro_bias == "BEARISH" and short_htf_ok and vwap_short_ok and (lo_c < lo_o) and (lo_c < r3h_lo) and (atr * 0.60 <= l_body <= atr * 1.50) and (l_body / l_rng >= 0.60) and (cvd_ratio <= 0.43) and (32.0 <= rsi <= 50.0) and funding >= min_short_f and (not in_discount):
             return _build_trade_levels("SHORT", lo_c, max(lo_h, h, ema20), atr, "Live Intra-Candle Momentum Breakdown", 96.0, lo_t, symbol)
 
     return None
