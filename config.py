@@ -39,15 +39,20 @@ try:
     if MODE not in ("PAPER", "TESTNET", "LIVE"):
         raise RuntimeError("TRADING_MODE must be PAPER, TESTNET, or LIVE.")
 
-    DEFAULT_16_SYMBOLS = "BTCUSDT,ETHUSDT,SOLUSDT,PAXGUSDT,XRPUSDT,DOGEUSDT,SUIUSDT,LINKUSDT,ADAUSDT,AVAXUSDT,NEARUSDT,DOTUSDT,LTCUSDT,TRXUSDT,APTUSDT,ARBUSDT"
-    SYMBOLS_STR = os.getenv("SYMBOLS", os.getenv("SYMBOL", DEFAULT_16_SYMBOLS)).strip()
-    SYMBOLS = [s.strip().upper() for s in SYMBOLS_STR.split(",") if s.strip()] or DEFAULT_16_SYMBOLS.split(",")
+    DEFAULT_40_SYMBOLS = (
+        "BTCUSDT,ETHUSDT,SOLUSDT,PAXGUSDT,XRPUSDT,DOGEUSDT,SUIUSDT,LINKUSDT,"
+        "ADAUSDT,AVAXUSDT,NEARUSDT,DOTUSDT,LTCUSDT,TRXUSDT,APTUSDT,ARBUSDT,"
+        "OPUSDT,INJUSDT,TONUSDT,TIAUSDT,SEIUSDT,FETUSDT,RENDERUSDT,WIFUSDT,"
+        "PEPEUSDT,SHIBUSDT,BONKUSDT,FLOKIUSDT,ONDOUSDT,ENAUSDT,JUPUSDT,STXUSDT,"
+        "FILUSDT,ATOMUSDT,HBARUSDT,ICPUSDT,UNIUSDT,AAVEUSDT,PENDLEUSDT,BCHUSDT"
+    )
+    SYMBOLS = [s.strip().upper() for s in DEFAULT_40_SYMBOLS.split(",") if s.strip()]
     SYMBOL = SYMBOLS[0]
 
     ENABLE_ALL_DELTA_RADAR = os.getenv("ENABLE_ALL_DELTA_RADAR", "true").strip().lower() == "true"
-    MIN_RADAR_TURNOVER_USD = fenv("MIN_RADAR_TURNOVER_USD", 25000.0, 1000.0)
-    MAX_RADAR_SYMBOLS = ienv("MAX_RADAR_SYMBOLS", 40, 8)
-    DISPLAY_SCANNER_CARDS = ienv("DISPLAY_SCANNER_CARDS", 16, 4)
+    MIN_RADAR_TURNOVER_USD = fenv("MIN_RADAR_TURNOVER_USD", 15000.0, 1000.0)
+    MAX_RADAR_SYMBOLS = ienv("MAX_RADAR_SYMBOLS", 48, 16)
+    DISPLAY_SCANNER_CARDS = ienv("DISPLAY_SCANNER_CARDS", 48, 16)
     ENABLE_LIVE_IMPULSE = os.getenv("ENABLE_LIVE_IMPULSE", "true").strip().lower() == "true"
 
     PORT = ienv("PORT", 10000, 1)
@@ -145,8 +150,8 @@ def get_asset_params(symbol: str, current_price: float = None) -> dict:
             "lot_size": c["lot"], "default_price": p, "default_atr": round(c["atr"] * scale, dec),
         }
     p = float(current_price or 1.0)
-    dec = 5 if p < 0.2 else (4 if p < 5.0 else (3 if p < 50.0 else 2))
-    lot = 100.0 if p < 0.2 else (10.0 if p < 2.0 else (1.0 if p < 50.0 else 0.1))
+    dec = 6 if p < 0.005 else (5 if p < 0.2 else (4 if p < 5.0 else (3 if p < 50.0 else 2)))
+    lot = 1000.0 if p < 0.005 else (100.0 if p < 0.2 else (10.0 if p < 2.0 else (1.0 if p < 50.0 else 0.1)))
     return {
         "symbol": sym, "is_gold": False, "decimals": dec, "display_name": f"{base} ({base})",
         "cb_symbol": f"{base}-USD", "bin_symbol": f"{base}USDT", "delta_symbol": f"{base}USD",
