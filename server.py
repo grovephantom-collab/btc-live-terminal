@@ -40,6 +40,32 @@ def _get_backend_candidates() -> list:
         pass
     return candidates
 
+def _calc_mover_heat_score(sym: str, m: Dict[str, Any], active_syms: set, recent_closed_syms: set) -> tuple:
+    is_open = sym in active_syms
+    was_just_closed = (sym in recent_closed_syms) and (not is_open)
+    adx = float(m.get("adx") or 20.0)
+    cvd = float(m.get("cvd_pct") or 50.0)
+    bias = str(m.get("macro_bias") or "NEUTRAL")
+    choch = str(m.get("choch_status") or "NONE")
+    p = float(m.get("price") or 0.0)
+    pdh, pdl = float(m.get("pdh") or 0.0), float(m.get("pdl") or 0.0)
+
+    cvd_strength = abs(cvd - 50.0) * 1.5
+    trend_bonus = 18.0 if bias in ("BULLISH", "BEARISH") else 0.0
+    choch_bonus = 25.0 if choch != "NONE" else 0.0
+    sweep_bonus = 0.0
+    if p > 0 and pdh > pdl > 0:
+        if min(abs(p - pdh) / p, abs(p - pdl) / p) <= 0.008:
+            sweep_bonus = 22.0
+
+    heat = adx + cvd_strength + trend_bonus + choch_bonus + sweep_bonus
+    if is_open:
+        return (2, round(min(99.0, max(92.0, heat)), 0), "⚡ IN-TRADE")
+    if was_just_closed:
+        return (0, round(min(75.0, heat * 0.5), 0), "⏳ COOLDOWN")
+    badge = "🔥 BREAKOUT" if (choch != "NONE" or sweep_bonus > 0) else ("🎯 HOT MOVE" if heat >= 52 else "📡 ACTIVE MOVE")
+    return (1, round(min(98.0, max(65.0, heat)), 0), badge)
+
 def _enrich_remote_payload(data: Dict[str, Any]) -> Dict[str, Any]:
     mkts = data.get("markets", {})
     if len(mkts) < 30:
@@ -169,6 +195,7 @@ def _build_local_payload() -> Dict[str, Any]:
                 "pdh": pdh, "pdl": pdl, "macro_bias": st_info.get("macro_bias", "NEUTRAL"),
                 "adx": round(float(st_info.get("adx") or 24.0), 1), "rsi": round(float(st_info.get("rsi") or 50.0), 1),
                 "cvd_pct": round(float(m.get("cvd_ratio") or 0.5) * 100.0, 1),
+                "choch_status": st_info.get("choch_status", "NONE"),
                 "zone_name": "DISCOUNT" if rel_pos < 0.45 else ("PREMIUM" if rel_pos > 0.55 else "EQUILIBRIUM"),
             }
         btc_m = market_data.get_market("BTCUSDT")
@@ -272,7 +299,7 @@ def _render_dashboard_body():
     s_bg = "rgba(16,185,129,0.14)" if auto_on else "rgba(239,68,68,0.14)"
     s_bd = "#10b981" if auto_on else "#ef4444"
     s_tx = f"● {mode} ENGINE ONLINE" if auto_on else "⏸ ENGINE PAUSED"
-    st.markdown(f'<div class="top-bar"><div><div class="brand-title">⚡ SR QUANTX — ALGO TERMINAL</div><div class="brand-sub">{payload.get("session", "ACTIVE")} • {payload.get("killzone_name", "OFF_HOURS").replace("_", " ")} • 25x Leverage • All-Delta Radar ({len(markets)} Active Markets)</div></div><div class="status-pill" style="background:{s_bg};border:1px solid {s_bd};color:{s_bd};">{s_tx}</div></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="top-bar"><div><div class="brand-title">⚡ SR QUANTX — ALGO TERMINAL</div><div class="brand-sub">{payload.get("session", "ACTIVE")} • {payload.get("killzone_name", "OFF_HOURS").replace("_", " ")} • 25x Leverage • Background Radar: 120+ Delta Assets ({len(markets)} Deep-Scanned)</div></div><div class="status-pill" style="background:{s_bg};border:1px solid {s_bd};color:{s_bd};">{s_tx}</div></div>', unsafe_allow_html=True)
 
     pnl_clr, upnl_clr = ("#10b981" if realized_pnl >= 0 else "#ef4444"), ("#10b981" if unrealized_pnl >= 0 else "#ef4444")
     st.markdown(f'<div class="kpi-grid"><div class="kpi-box"><div class="kpi-title">PORTFOLIO EQUITY</div><div class="kpi-val">${bal_usd:,.2f}</div><div class="kpi-sub">₹{bal_usd*USD_INR:,.0f} • Free: ${avail_usd:,.2f}</div></div><div class="kpi-box"><div class="kpi-title">NET REALIZED PNL</div><div class="kpi-val" style="color:{pnl_clr};">${realized_pnl:+.2f}</div><div class="kpi-sub">₹{realized_pnl*USD_INR:+,.0f} • Expectancy: ${stats.get("expectancy_usd",0.0):+.2f}</div></div><div class="kpi-box"><div class="kpi-title">OPEN FLOATING PNL</div><div class="kpi-val" style="color:{upnl_clr};">${unrealized_pnl:+.2f}</div><div class="kpi-sub">Active: {len(active_list)}/{config.MAX_OPEN_TRADES} • Margin: ${used_margin:.2f}</div></div><div class="kpi-box"><div class="kpi-title">WIN RATE & PROFIT FACTOR</div><div class="kpi-val">{stats.get("win_rate",0.0):.1f}%</div><div class="kpi-sub">{stats.get("wins",0)}W / {stats.get("losses",0)}L • PF: {stats.get("profit_factor",0.0):.2f} • DD: -{stats.get("max_drawdown_pct",0.0):.1f}%</div></div></div>', unsafe_allow_html=True)
@@ -293,21 +320,29 @@ def _render_dashboard_body():
     news_ok = "BLACKOUT" if payload.get("news_blackout") else "CLEAR"
     st.markdown(f'<div class="guard-grid"><div class="guard-box"><b>DAILY TRADES:</b> <span style="color:#f8fafc;">{day_trades} / {config.MAX_DAILY_TRADES}</span></div><div class="guard-box"><b>DAILY LOSS LIMIT:</b> <span style="color:#f8fafc;">${day_pnl:+.2f} / -${config.MAX_DAILY_LOSS * max(1.0, c_mult):.2f}</span></div><div class="guard-box"><b>ACTIVE LOT RISK:</b> <span style="color:#38bdf8;">{config.RISK_PCT*100:.1f}% (~${c_act_eq*config.RISK_PCT:.2f})</span></div><div class="guard-box"><b>LIQUIDITY / NEWS:</b> <span style="color:#10b981;">{dead_ok} / {news_ok}</span></div></div>', unsafe_allow_html=True)
 
-    disp_n = int(getattr(config, "DISPLAY_SCANNER_CARDS", 48))
-    st.markdown(f'<div class="sec-title">📡 Multi-Asset Institutional Scanner ({len(markets)} Delta Markets Active & Displayed)</div>', unsafe_allow_html=True)
+    disp_n = int(getattr(config, "DISPLAY_SCANNER_CARDS", 8))
+    st.markdown(f'<div class="sec-title">🔥 Live Spotlight Radar (Top {disp_n} Active Movers & Open Trades — Auto-Rotating from {len(markets)}+ Scanned Assets)</div>', unsafe_allow_html=True)
     if markets:
         cards_html = '<div class="market-grid">'
-        active_syms = {t.get("symbol") for t in active_list}
-        sorted_mkts = sorted(markets.items(), key=lambda kv: (kv[0] in active_syms, kv[0] in ("BTCUSDT", "ETHUSDT", "SOLUSDT", "PAXGUSDT"), float(kv[1].get("adx") or 0.0)), reverse=True)[:disp_n]
-        for sym, m in sorted_mkts:
+        active_syms = {t.get("symbol") for t in active_list if t.get("symbol")}
+        recent_closed_syms = {t.get("symbol") for t in vault_trades[:6] if t.get("stage") == "CLOSED" and t.get("symbol")}
+
+        scored_mkts = []
+        for sym, m in markets.items():
+            tier, heat, badge = _calc_mover_heat_score(sym, m, active_syms, recent_closed_syms)
+            scored_mkts.append((tier, heat, badge, sym, m))
+        scored_mkts.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+        for tier, heat, badge, sym, m in scored_mkts[:disp_n]:
             p, bias, adx, cvd, rsi = float(m.get("price") or 0.0), m.get("macro_bias", "NEUTRAL"), float(m.get("adx") or 22.0), float(m.get("cvd_pct") or 50.0), float(m.get("rsi") or 50.0)
             pdh, pdl, zone = float(m.get("pdh") or 0.0), float(m.get("pdl") or 0.0), m.get("zone_name", "EQUILIBRIUM")
             t_cls, t_txt = ("tag-bull", "▲ BULLISH") if bias == "BULLISH" else (("tag-bear", "▼ BEARISH") if bias == "BEARISH" else ("tag-neut", "• NEUTRAL"))
-            p_clr = "#fbbf24" if "PAXG" in sym else "#f8fafc"
+            p_clr = "#fbbf24" if "PAXG" in sym else ("#38bdf8" if tier == 2 else "#f8fafc")
+            card_border = "border: 1px solid #38bdf8;" if tier == 2 else ""
             short_name = m.get("display_name", sym).split("(")[0].strip()
             flow_txt = f"Buy {cvd:.0f}%" if cvd >= 50 else f"Sell {100-cvd:.0f}%"
             flow_clr = "#10b981" if cvd >= 52 else ("#ef4444" if cvd <= 48 else "#94a3b8")
-            cards_html += f'<div class="mkt-card"><div class="mkt-head"><span class="mkt-name">{short_name}</span><span class="{t_cls}">{t_txt}</span></div><div class="mkt-price" style="color:{p_clr};">{_fmt_p(p)}</div><div class="mkt-row"><span>SMC Zone:</span><b style="color:#e2e8f0;">{zone.split()[0]}</b></div><div class="mkt-row"><span>ADX / RSI:</span><b style="color:#e2e8f0;">{adx:.1f} / {rsi:.1f}</b></div><div class="mkt-row"><span>CVD Delta:</span><b style="color:{flow_clr};">{flow_txt}</b></div><div class="mkt-row"><span>PDH / PDL:</span><b>{_fmt_p(pdh)} / {_fmt_p(pdl)}</b></div></div>'
+            cards_html += f'<div class="mkt-card" style="{card_border}"><div class="mkt-head"><span class="mkt-name">{short_name}</span><span class="{t_cls}">{t_txt}</span></div><div class="mkt-price" style="color:{p_clr};">{_fmt_p(p)}</div><div class="mkt-row"><span>Radar Status:</span><b style="color:#38bdf8;">{badge} ({heat:.0f}%)</b></div><div class="mkt-row"><span>SMC / ADX / RSI:</span><b style="color:#e2e8f0;">{zone[:4]} • {adx:.0f} / {rsi:.0f}</b></div><div class="mkt-row"><span>CVD Delta:</span><b style="color:{flow_clr};">{flow_txt}</b></div><div class="mkt-row"><span>PDH / PDL:</span><b>{_fmt_p(pdh)} / {_fmt_p(pdl)}</b></div></div>'
         cards_html += '</div>'
         st.markdown(cards_html, unsafe_allow_html=True)
 
@@ -321,7 +356,7 @@ def _render_dashboard_body():
             booked_tag = f" • Booked TP1: ${rpnl:+.2f}" if rpnl != 0 else ""
             st.markdown(f'<div class="pos-card" style="border-left-color:{b_clr};"><div style="display:flex;justify-content:space-between;align-items:center;"><b style="font-size:0.88rem;">{tr.get("symbol")} • {side} ({tr.get("setup_name")}){booked_tag}</b><span style="color:{u_clr};font-weight:800;font-size:0.92rem;">${upnl:+.2f} (₹{upnl*USD_INR:+,.0f})</span></div><div style="font-size:0.74rem;color:#94a3b8;margin-top:5px;">Entry: <b>{_fmt_p(float(tr["entry_price"]))}</b> | SL: <b style="color:#ef4444;">{_fmt_p(float(tr["stop_price"]))}</b> | TP1 (0.9R): <b style="color:#10b981;">{_fmt_p(float(tr["tp1_price"]))}</b> | TP2 (1.75R): <b style="color:#10b981;">{_fmt_p(float(tr["tp2_price"]))}</b></div></div>', unsafe_allow_html=True)
     else:
-        st.caption(f"No open positions — All-Delta Radar scanning {len(markets)} active markets (100+ perpetuals swept every 30s) for Sniper & Live Intra-Candle confluence.")
+        st.caption(f"No open positions — Background Radar sweeping 120+ Delta assets ({len(markets)} deep-scanned) & auto-promoting top movers above.")
 
     tab1, tab2, tab3 = st.tabs(["📜 Execution Log (With Brokerage)", "📈 Equity Curve", "📊 Strategy & Risk Specs"])
     with tab1:
@@ -342,7 +377,7 @@ def _render_dashboard_body():
         else:
             st.caption("Equity curve will render automatically after the first closed trade.")
     with tab3:
-        st.markdown(f"- **All-Delta Spike Radar:** Sweeps 100+ Delta perpetuals every 30s (`>=0.35%` instant spike + Top 48 active scanner)\n- **Proportional Capital Scaling:** Base `₹5,000 ($58)` scales lot sizes & profit targets automatically whenever you add `₹5,000 (+$58)` (`{c_mult:.2f}x` active multiplier)\n- **Fast Realized Profit Lock:** `+0.55R` slashes risk in half | `TP1 (+0.85R/0.90R)` immediately books `50%` cash profit & locks SL above fees | `TP2 (+1.75R)` books `30%` | `TP3 (+2.80R)` trails `20%` runner")
+        st.markdown(f"- **Dynamic Spotlight Radar:** Sweeps 120+ Delta perpetuals in background, displays only the **Top 8 Active Movers & Open Trades**, and automatically rotates out closed trades for fresh movers\n- **Proportional Capital Scaling:** Base `₹5,000 ($58)` scales lot sizes & profit targets automatically whenever you add `₹5,000 (+$58)` (`{c_mult:.2f}x` active multiplier)\n- **Fast Realized Profit Lock:** `+0.55R` slashes risk in half | `TP1 (+0.85R/0.90R)` immediately books `50%` cash profit & locks SL above fees | `+1.30R` trails SL to `+0.55R` | `TP2 (+1.75R)` books `30%` | `TP3 (+2.80R)` trails `20%` runner")
 
 def main() -> None:
     if hasattr(st, "fragment"):
