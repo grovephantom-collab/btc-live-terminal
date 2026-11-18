@@ -51,8 +51,8 @@ try:
 
     ENABLE_ALL_DELTA_RADAR = os.getenv("ENABLE_ALL_DELTA_RADAR", "true").strip().lower() == "true"
     MIN_RADAR_TURNOVER_USD = fenv("MIN_RADAR_TURNOVER_USD", 15000.0, 1000.0)
-    MAX_RADAR_SYMBOLS = ienv("MAX_RADAR_SYMBOLS", 48, 16)
-    DISPLAY_SCANNER_CARDS = ienv("DISPLAY_SCANNER_CARDS", 48, 16)
+    MAX_RADAR_SYMBOLS = ienv("MAX_RADAR_SYMBOLS", 48, 16)          # 48 markets deep-scanned in background
+    DISPLAY_SCANNER_CARDS = ienv("DISPLAY_SCANNER_CARDS", 8, 4)    # Dynamic Spotlight: Only Top 8 Active Movers & Open Trades on UI!
     ENABLE_LIVE_IMPULSE = os.getenv("ENABLE_LIVE_IMPULSE", "true").strip().lower() == "true"
 
     PORT = ienv("PORT", 10000, 1)
@@ -78,7 +78,7 @@ try:
 
     SL_COOLDOWN_SECONDS = ienv("SL_COOLDOWN_SECONDS", 3600, 300)
     CONSECUTIVE_SL_PAUSE_SEC = ienv("CONSECUTIVE_SL_PAUSE_SEC", 7200, 600)
-    TRADE_COOLDOWN_SECONDS = ienv("TRADE_COOLDOWN_SECONDS", 900, 60)
+    TRADE_COOLDOWN_SECONDS = ienv("TRADE_COOLDOWN_SECONDS", 2700, 60)  # 45-min rotation cooldown after trade exit
 
     STRICT_KILLZONE_ONLY = os.getenv("STRICT_KILLZONE_ONLY", "false").strip().lower() == "true"
     FILTER_DEAD_HOURS = os.getenv("FILTER_DEAD_HOURS", "true").strip().lower() == "true"
