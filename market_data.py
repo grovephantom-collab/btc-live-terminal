@@ -19,6 +19,7 @@ _CORE_ANCHORS = [
     "PEPEUSDT", "SHIBUSDT", "BONKUSDT", "FLOKIUSDT", "ONDOUSDT", "ENAUSDT", "JUPUSDT", "STXUSDT",
     "FILUSDT", "ATOMUSDT", "HBARUSDT", "ICPUSDT", "UNIUSDT", "AAVEUSDT", "PENDLEUSDT", "BCHUSDT",
 ]
+_BLOCKED_STOCK_TOKENS = {"AMDB", "TQQQB", "TSLAB", "NVDAB", "AAPLB", "MSFTB", "GOOGB", "METAB", "AMZNB", "COINB", "SPY", "QQQ"}
 
 def get_market(symbol: str = "BTCUSDT") -> Dict[str, Any]:
     sym = symbol.strip().upper()
@@ -157,17 +158,14 @@ def fetch_klines(symbol: str, interval: str, limit: int = 120) -> List[Dict[str,
         r = HTTP.get(f"https://api.exchange.coinbase.com/products/{params['cb_symbol']}/candles?granularity={gran}", timeout=config.HTTP_TIMEOUT)
         if r.status_code == 200:
             raw = r.json()
-            if isinstance(raw, list) and len(raw) >= 5:
+            if isinstance(raw, list) and len(raw) >= 15:
                 out = [{"time": int(k[0]), "close_time": int(k[0]) + gran, "open": float(k[3]), "high": float(k[2]), "low": float(k[1]), "close": float(k[4]), "vol": float(k[5])} for k in raw]
                 out.sort(key=lambda z: z["time"])
                 return out[-limit:]
     except Exception:
         pass
 
-    now_s = int(time.time())
-    last_p = m_dict.get("price") or params["default_price"]
-    spread = last_p * 0.004
-    return [{"time": now_s - (limit - idx) * gran, "close_time": now_s - (limit - idx - 1) * gran, "open": last_p - spread * 0.3, "high": last_p + spread, "low": last_p - spread, "close": last_p + spread * 0.1, "vol": 150.0} for idx in range(limit)]
+    return []
 
 def extract_pdh_pdl(daily_candles: list) -> tuple:
     if len(daily_candles) >= 2:
@@ -207,9 +205,8 @@ def approx_poc(cs: List[Dict[str, float]], bins: int = 30) -> Optional[float]:
 def refresh_symbol_market_data(symbol: str, lock) -> bool:
     try:
         p = fetch_price(symbol)
-        with lock:
-            if p is None:
-                p = get_market(symbol).get("price") or config.get_asset_params(symbol)["default_price"]
+        if not p or p <= 0:
+            return False
         sess, in_kz, kz_name, is_dead = session_and_killzone()
         news_block = check_economic_news_blackout()
         funding = fetch_funding_rate(symbol)
@@ -219,7 +216,9 @@ def refresh_symbol_market_data(symbol: str, lock) -> bool:
         ks = {}
         for k in ("15m", "1h", "4h", "1d"):
             bars = fetch_klines(symbol, k, 120)
-            ks[k] = bars if len(bars) >= 5 else ks.get("15m", bars)
+            if not bars and k == "15m":
+                return False
+            ks[k] = bars
             time.sleep(0.01)
         pdh, pdl, d_open = extract_pdh_pdl(ks.get("1d", []))
         h24, l24, _, open24 = extract_24h_levels(ks.get("15m", []))
@@ -251,7 +250,7 @@ def discover_top_delta_movers(active_trade_symbols: list = None) -> List[str]:
             selected.append(s)
 
     instant_spikers, movers = [], []
-    min_turn = float(getattr(config, "MIN_RADAR_TURNOVER_USD", 15000.0))
+    min_turn = float(getattr(config, "MIN_RADAR_TURNOVER_USD", 1000000.0))
 
     for d_url in ("https://api.india.delta.exchange/v2/tickers", "https://api.delta.exchange/v2/tickers"):
         try:
@@ -267,13 +266,15 @@ def discover_top_delta_movers(active_trade_symbols: list = None) -> List[str]:
                         base = sym_raw[:-4] if sym_raw.endswith("USDT") else sym_raw[:-3]
                         if not base.isalnum() or len(base) > 12 or base in ("USDT", "USDC", "DAI"):
                             continue
+                        if base in _BLOCKED_STOCK_TOKENS or (len(base) >= 4 and base.endswith("B") and base not in ("SHIB", "BNB", "ARB", "KAVA", "HBAR")):
+                            continue
                         std_sym = f"{base}USDT"
                         _DELTA_NATIVE_MAP[std_sym] = sym_raw
                         mark_p = float(it.get("mark_price") or it.get("close") or 0.0)
                         open_p = float(it.get("open") or mark_p)
                         vol_raw = float(it.get("volume") or 0.0)
                         turnover = max(float(it.get("turnover_usd") or 0.0), float(it.get("turnover") or 0.0), vol_raw * mark_p)
-                        if mark_p <= 0 or open_p <= 0:
+                        if mark_p <= 0 or open_p <= 0 or turnover < min_turn:
                             continue
                         prev_p = _PREV_TICKER_PRICES.get(std_sym)
                         _PREV_TICKER_PRICES[std_sym] = mark_p
@@ -282,11 +283,10 @@ def discover_top_delta_movers(active_trade_symbols: list = None) -> List[str]:
                         m_entry["price"] = mark_p
                         m_entry["price_ts"] = now
                         day_move = abs((mark_p - open_p) / open_p) * 100.0
-                        if turnover >= min_turn or day_move >= 1.0:
-                            if jump_pct >= 0.35:
-                                instant_spikers.append((jump_pct, day_move, std_sym))
-                            elif std_sym not in selected:
-                                movers.append((day_move, turnover, std_sym))
+                        if jump_pct >= 0.35:
+                            instant_spikers.append((jump_pct, day_move, std_sym))
+                        elif std_sym not in selected:
+                            movers.append((day_move, turnover, std_sym))
                     break
         except Exception:
             continue
@@ -296,7 +296,7 @@ def discover_top_delta_movers(active_trade_symbols: list = None) -> List[str]:
         if sp_sym not in selected:
             selected.insert(0, sp_sym)
     movers.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    max_tot = int(getattr(config, "MAX_RADAR_SYMBOLS", 48))
+    max_tot = int(getattr(config, "MAX_RADAR_SYMBOLS", 40))
     for _, _, m_sym in movers:
         if len(selected) >= max_tot:
             break
