@@ -147,7 +147,7 @@ def calculate_small_cap_delta_size(equity_usd: float, entry: float, sl: float, s
     params = config.get_asset_params(symbol, entry)
     lot_size = params["lot_size"]
     capital_mult = max(0.75, equity_usd / 58.0)
-    risk_pct = float(getattr(config, "A_PLUS_RISK_PCT", 0.024)) if score >= 97.0 else float(getattr(config, "RISK_PCT", 0.018))
+    risk_pct = float(getattr(config, "A_PLUS_RISK_PCT", 0.025)) if score >= 97.0 else float(getattr(config, "RISK_PCT", 0.020))
     min_r = float(config.MIN_RISK_USD) * capital_mult
     max_r = float(config.MAX_RISK_USD) * capital_mult
     target_risk = max(min_r, min(max_r, equity_usd * risk_pct))
@@ -169,6 +169,7 @@ def open_paper_trade(signal: dict, fencing_token: int):
             return
 
         if not any(g in sym.upper() for g in ("PAXG", "XAU", "GOLD")):
+            unlocked_same_dir = 0
             for r in active_rows:
                 r_sym = str(r["symbol"]).upper()
                 if any(g in r_sym for g in ("PAXG", "XAU", "GOLD")):
@@ -177,8 +178,9 @@ def open_paper_trade(signal: dict, fencing_token: int):
                     r_entry, r_sl = float(r["entry_price"] or 0), float(r["stop_price"] or 0)
                     r_locked = bool(r["tp1_done"]) or (r["direction"] == "LONG" and r_sl >= r_entry) or (r["direction"] == "SHORT" and r_sl <= r_entry)
                     if not r_locked:
-                        log.info("Blocked correlated %s %s until existing %s locks profit.", sym, signal["direction"], r_sym)
-                        return
+                        unlocked_same_dir += 1
+            if unlocked_same_dir >= 2:
+                return
 
         allowed, _ = _check_cooldown_and_circuit_breakers(conn, sym)
         if not allowed:
@@ -208,7 +210,7 @@ def open_paper_trade(signal: dict, fencing_token: int):
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"• Setup: {signal['setup_name']}\n"
                 f"• Entry: ${entry:,.{dec}f} | SL: ${sl:,.{dec}f} ({round(abs(entry-sl), dec)} pts)\n"
-                f"• TP1 (0.85R): ${signal['tp1']:,.{dec}f} | TP2 (1.70R): ${signal['tp2']:,.{dec}f} | Runner: ${signal['tp3']:,.{dec}f}\n"
+                f"• TP1 (1.0R): ${signal['tp1']:,.{dec}f} | TP2 (1.85R): ${signal['tp2']:,.{dec}f} | Runner: ${signal['tp3']:,.{dec}f}\n"
                 f"• Size: {lots} Lot ({qty})\n"
                 f"• Max Risk: ${risk_usd:.2f} (~₹{risk_usd*config.USD_INR_RATE:.0f})\n"
                 f"• Active Equity: ${equity:.2f} USD"
@@ -227,7 +229,7 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
     is_long = direction == "LONG"
     params = config.get_asset_params(sym, entry)
     dec = int(params.get("decimals", 2))
-    orig_sl_dist = max(abs(tp1 - entry) / 0.85, params["min_stop"])
+    orig_sl_dist = max(abs(tp1 - entry), params["min_stop"])
 
     if (is_long and current_price <= sl) or (not is_long and current_price >= sl):
         exec_exit = sl if config.MODE == "PAPER" else current_price
@@ -247,14 +249,14 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
         try:
             elapsed_sec = (datetime.fromisoformat(now_str) - datetime.fromisoformat(trade_dict["opened_at_utc"])).total_seconds()
             adverse_dist = (entry - current_price) if is_long else (current_price - entry)
-            if elapsed_sec >= 5400 and adverse_dist >= (orig_sl_dist * 0.55):
+            if elapsed_sec >= 10800 and adverse_dist >= (orig_sl_dist * 0.65):
                 fee_usd = round((entry + current_price) * rem_qty * float(config.FEE_RATE), 3)
                 leg_pnl = round((-adverse_dist * rem_qty) - fee_usd, 2)
                 tot_real = round(float(trade_dict["realized_pnl_usd"]) + leg_pnl, 2)
                 conn.execute("UPDATE trades SET stage='CLOSED', remaining_qty=0, realized_pnl_usd=?, unrealized_pnl_usd=0, total_fee_usd=total_fee_usd+?, close_reason='STRUCTURAL_INVALIDATION_EXIT', closed_at_utc=?, updated_at_utc=? WHERE trade_id=?", (tot_real, fee_usd, now_str, now_str, tid))
                 conn.commit()
                 if hasattr(notifications, "enqueue_telegram"):
-                    notifications.enqueue_telegram(f"⚠️ *SMART LOSS CUT ({params['display_name']} {direction})*\n━━━━━━━━━━━━━━━━━━━━\n• Exit Price: ${current_price:,.{dec}f}\n• Saved Half SL: ${tot_real:+.2f} USD")
+                    notifications.enqueue_telegram(f"⚠️ *STALLED LOSER EXIT ({params['display_name']} {direction})*\n━━━━━━━━━━━━━━━━━━━━\n• Exit Price: ${current_price:,.{dec}f}\n• Saved Remaining SL: ${tot_real:+.2f} USD")
                 return
         except Exception:
             pass
@@ -262,60 +264,44 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
     current_gain = (current_price - entry) if is_long else (entry - current_price)
     r_mult = current_gain / max(1e-9, orig_sl_dist)
 
-    tp1_reached = (is_long and current_price >= tp1) or (not is_long and current_price <= tp1) or (r_mult >= 0.85)
+    tp1_reached = (is_long and current_price >= tp1) or (not is_long and current_price <= tp1) or (r_mult >= 1.00)
     if not tp1_done and tp1_reached:
-        exec_tp1 = current_price if r_mult >= 0.85 else tp1
-        b_qty = round(init_qty * 0.50, 6)
+        exec_tp1 = current_price if r_mult >= 1.00 else tp1
+        b_qty = round(init_qty * 0.60, 6)
         n_rem = max(0.0, round(rem_qty - b_qty, 6))
         fee_usd = round((entry + exec_tp1) * b_qty * float(config.FEE_RATE), 3)
         gain_pts = (exec_tp1 - entry) if is_long else (entry - exec_tp1)
         b_pnl = round((gain_pts * b_qty) - fee_usd, 2)
         fee_dist = entry * float(config.FEE_RATE) * 2.5
-        be_off = max(float(params.get("be_buffer", 0.01)), fee_dist + (orig_sl_dist * 0.22))
+        be_off = max(float(params.get("be_buffer", 0.01)), fee_dist + (orig_sl_dist * 0.15))
         n_sl = round(entry + be_off if is_long else entry - be_off, dec)
         rem_unreal = round(gain_pts * n_rem, 2)
         conn.execute("UPDATE trades SET tp1_done=1, remaining_qty=?, stop_price=?, realized_pnl_usd=realized_pnl_usd+?, unrealized_pnl_usd=?, total_fee_usd=total_fee_usd+?, updated_at_utc=? WHERE trade_id=?", (n_rem, n_sl, b_pnl, rem_unreal, fee_usd, now_str, tid))
         conn.commit()
         if hasattr(notifications, "enqueue_telegram"):
-            notifications.enqueue_telegram(f"🎯 *TARGET 1 CASH BOOKED ({params['display_name']})*\n━━━━━━━━━━━━━━━━━━━━\n• Booked 50% at: ${exec_tp1:,.{dec}f}\n• Realized Profit Added: ${b_pnl:+.2f} USD (~₹{b_pnl*config.USD_INR_RATE:+.0f})\n• SL Trailed to Profit Lock: ${n_sl:,.{dec}f}")
+            notifications.enqueue_telegram(f"🎯 *TARGET 1 CASH BOOKED 60% ({params['display_name']})*\n━━━━━━━━━━━━━━━━━━━━\n• Booked 60% at: ${exec_tp1:,.{dec}f}\n• Realized Profit Added: ${b_pnl:+.2f} USD (~₹{b_pnl*config.USD_INR_RATE:+.0f})\n• Remaining 40% Risk-Free SL: ${n_sl:,.{dec}f}")
         return
 
-    if getattr(config, "ENABLE_DYNAMIC_PROFIT_LOCK", True) and not tp1_done:
-        if r_mult >= 0.68:
-            fee_dist = entry * float(config.FEE_RATE) * 2.5
-            be_buf = max(float(params.get("be_buffer", 0.01)), fee_dist + (orig_sl_dist * 0.14))
-            t_sl = round(entry + be_buf if is_long else entry - be_buf, dec)
-            if (is_long and t_sl > sl) or (not is_long and t_sl < sl):
-                conn.execute("UPDATE trades SET stop_price=?, updated_at_utc=? WHERE trade_id=?", (t_sl, now_str, tid))
-                conn.commit()
-                if hasattr(notifications, "enqueue_telegram"):
-                    notifications.enqueue_telegram(f"🛡️ *ZERO-LOSS SHIELD ACTIVATED (+0.68R)*\n━━━━━━━━━━━━━━━━━━━━\n• {params['display_name']} SL locked in profit: ${t_sl:,.{dec}f} (SL Hit Impossible!)")
-        elif r_mult >= 0.45:
-            t_sl = round(entry - orig_sl_dist * 0.45 if is_long else entry + orig_sl_dist * 0.45, dec)
-            if (is_long and t_sl > sl) or (not is_long and t_sl < sl):
-                conn.execute("UPDATE trades SET stop_price=?, updated_at_utc=? WHERE trade_id=?", (t_sl, now_str, tid))
-                conn.commit()
-
-    if tp1_done and not tp2_done and r_mult >= 1.25:
-        t_sl = round(entry + orig_sl_dist * 0.55 if is_long else entry - orig_sl_dist * 0.55, dec)
+    if getattr(config, "ENABLE_DYNAMIC_PROFIT_LOCK", True) and not tp1_done and r_mult >= 0.75:
+        t_sl = round(entry - orig_sl_dist * 0.50 if is_long else entry + orig_sl_dist * 0.50, dec)
         if (is_long and t_sl > sl) or (not is_long and t_sl < sl):
             conn.execute("UPDATE trades SET stop_price=?, updated_at_utc=? WHERE trade_id=?", (t_sl, now_str, tid))
             conn.commit()
 
-    tp2_reached = (is_long and current_price >= tp2) or (not is_long and current_price <= tp2) or (r_mult >= 1.65)
+    tp2_reached = (is_long and current_price >= tp2) or (not is_long and current_price <= tp2) or (r_mult >= 1.85)
     if tp1_done and not tp2_done and tp2_reached:
-        exec_tp2 = current_price if r_mult >= 1.65 else tp2
-        b_qty = round(init_qty * 0.30, 6)
+        exec_tp2 = current_price if r_mult >= 1.85 else tp2
+        b_qty = round(init_qty * 0.25, 6)
         n_rem = max(0.0, round(rem_qty - b_qty, 6))
         fee_usd = round((entry + exec_tp2) * b_qty * float(config.FEE_RATE), 3)
         gain_pts = (exec_tp2 - entry) if is_long else (entry - exec_tp2)
         b_pnl = round((gain_pts * b_qty) - fee_usd, 2)
-        n_sl = round(entry + (orig_sl_dist * 0.80) if is_long else entry - (orig_sl_dist * 0.80), dec)
+        n_sl = round(entry + (orig_sl_dist * 0.90) if is_long else entry - (orig_sl_dist * 0.90), dec)
         rem_unreal = round(gain_pts * n_rem, 2)
         conn.execute("UPDATE trades SET tp2_done=1, remaining_qty=?, stop_price=?, realized_pnl_usd=realized_pnl_usd+?, unrealized_pnl_usd=?, total_fee_usd=total_fee_usd+?, updated_at_utc=? WHERE trade_id=?", (n_rem, n_sl, b_pnl, rem_unreal, fee_usd, now_str, tid))
         conn.commit()
         if hasattr(notifications, "enqueue_telegram"):
-            notifications.enqueue_telegram(f"🎯 *TARGET 2 CASH BOOKED ({params['display_name']})*\n━━━━━━━━━━━━━━━━━━━━\n• Booked 30% at: ${exec_tp2:,.{dec}f}\n• Realized Profit Added: ${b_pnl:+.2f} USD\n• SL Trailed to +0.80R: ${n_sl:,.{dec}f}")
+            notifications.enqueue_telegram(f"🎯 *TARGET 2 CASH BOOKED ({params['display_name']})*\n━━━━━━━━━━━━━━━━━━━━\n• Booked 25% at: ${exec_tp2:,.{dec}f}\n• Realized Profit Added: ${b_pnl:+.2f} USD\n• SL Trailed to +0.90R: ${n_sl:,.{dec}f}")
         return
 
     if tp1_done and tp2_done and ((is_long and current_price >= tp3) or (not is_long and current_price <= tp3)):
