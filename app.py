@@ -1,4 +1,5 @@
 import time, threading, logging
+from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 import config, database, market_data, smc_engine, trade_manager, notifications
 
@@ -31,6 +32,7 @@ def engine_supervision_loop():
             trade_manager.manage_all_positions(token, LOCK)
             auto_enabled = database.get_setting("auto_trade_enabled", "1") == "1"
 
+            candidates = []
             for sym in list(config.SYMBOLS):
                 with LOCK:
                     m = dict(market_data.get_market(sym))
@@ -49,8 +51,14 @@ def engine_supervision_loop():
                     continue
                 sig = smc_engine.evaluate_signal(st, m.get("klines", {}).get("15m", []), m.get("price"), m.get("session"), m.get("poc"), sym)
                 if sig:
-                    STATE["last_signal"] = {"symbol": sym, "direction": sig["direction"], "score": sig["score"], "setup": sig["setup_name"], "time": database.now_iso()}
-                    trade_manager.open_paper_trade(sig, token)
+                    adx_v = float(st.get("adx", 0.0)) if st else 0.0
+                    cvd_edge = abs(float(st.get("cvd_ratio", 0.5)) - 0.5) if st else 0.0
+                    candidates.append((float(sig.get("score", 90.0)), adx_v, cvd_edge, sym, sig))
+
+            candidates.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+            for _, _, _, sym, sig in candidates:
+                STATE["last_signal"] = {"symbol": sym, "direction": sig["direction"], "score": sig["score"], "setup": sig["setup_name"], "time": database.now_iso()}
+                trade_manager.open_paper_trade(sig, token)
 
             STATE.update(last_scan_epoch=time.time(), last_error=None)
             time.sleep(config.SCAN_SECONDS)
@@ -88,6 +96,9 @@ def vault_data():
         active_rows = [dict(r) for r in c.execute("SELECT * FROM trades WHERE stage != 'CLOSED' ORDER BY id DESC LIMIT 10").fetchall()]
         pnl = float(c.execute("SELECT COALESCE(SUM(realized_pnl_usd),0) p FROM trades").fetchone()["p"] or 0.0)
         unrealized = float(c.execute("SELECT COALESCE(SUM(unrealized_pnl_usd),0) u FROM trades WHERE stage != 'CLOSED'").fetchone()["u"] or 0.0)
+        today_start = datetime.now(timezone.utc).strftime("%Y-%m-%d 00:00:00")
+        day_trades = int(c.execute("SELECT COUNT(*) as cnt FROM trades WHERE opened_at_utc >= ?", (today_start,)).fetchone()["cnt"] or 0)
+        day_pnl = float(c.execute("SELECT COALESCE(SUM(realized_pnl_usd),0) s FROM trades WHERE closed_at_utc >= ?", (today_start,)).fetchone()["s"] or 0.0)
         compounding = trade_manager.get_15d_compounding_state(c)
         base_cap = compounding["base_capital_usd"]
 
@@ -134,9 +145,11 @@ def vault_data():
         return jsonify({
             "mode": config.MODE, "auto_trade_enabled": auto_enabled, "uptime_seconds": int(time.time() - STARTED),
             "symbols": config.SYMBOLS, "markets": markets_info, "compounding": compounding,
+            "day_trades": day_trades, "day_pnl_usd": round(day_pnl, 2),
             "wallet": {"balance_usd": wallet_bal, "available_usd": wallet_avail, "is_live_synced": delta_wallet["balance"] is not None},
             "price": btc_m.get("price"), "session": btc_m.get("session", "ACTIVE"),
             "in_killzone": btc_m.get("in_killzone", False), "killzone_name": btc_m.get("killzone_name", "OFF_HOURS"),
+            "is_dead_hour": btc_m.get("is_dead_hour", False), "news_blackout": btc_m.get("news_blackout", False),
             "funding_rate": btc_m.get("funding_rate", 0.0001), "pdh": btc_m.get("pdh"), "pdl": btc_m.get("pdl"),
             "realized_pnl_usd": round(pnl, 2), "unrealized_pnl_usd": round(unrealized, 2), "open_trades": len(active_rows),
             "stats": {
