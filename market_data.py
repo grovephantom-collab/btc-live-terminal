@@ -19,6 +19,7 @@ _CORE_ANCHORS = [
     "PEPEUSDT", "SHIBUSDT", "BONKUSDT", "FLOKIUSDT", "ONDOUSDT", "ENAUSDT", "JUPUSDT", "STXUSDT",
     "FILUSDT", "ATOMUSDT", "HBARUSDT", "ICPUSDT", "UNIUSDT", "AAVEUSDT", "PENDLEUSDT", "BCHUSDT",
 ]
+
 _BLOCKED_STOCK_TOKENS = {"AMDB", "TQQQB", "TSLAB", "NVDAB", "AAPLB", "MSFTB", "GOOGB", "METAB", "AMZNB", "COINB", "SPY", "QQQ"}
 
 def get_market(symbol: str = "BTCUSDT") -> Dict[str, Any]:
@@ -250,7 +251,7 @@ def discover_top_delta_movers(active_trade_symbols: list = None) -> List[str]:
             selected.append(s)
 
     instant_spikers, movers = [], []
-    min_turn = float(getattr(config, "MIN_RADAR_TURNOVER_USD", 1000000.0))
+    min_turn = float(getattr(config, "MIN_RADAR_TURNOVER_USD", 250000.0))
 
     for d_url in ("https://api.india.delta.exchange/v2/tickers", "https://api.delta.exchange/v2/tickers"):
         try:
@@ -296,7 +297,7 @@ def discover_top_delta_movers(active_trade_symbols: list = None) -> List[str]:
         if sp_sym not in selected:
             selected.insert(0, sp_sym)
     movers.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    max_tot = int(getattr(config, "MAX_RADAR_SYMBOLS", 40))
+    max_tot = int(getattr(config, "MAX_RADAR_SYMBOLS", 48))
     for _, _, m_sym in movers:
         if len(selected) >= max_tot:
             break
@@ -309,7 +310,7 @@ def discover_top_delta_movers(active_trade_symbols: list = None) -> List[str]:
 def refresh_all_market_data(lock, active_trade_symbols: list = None) -> bool:
     discover_top_delta_movers(active_trade_symbols)
     success = False
-    with ThreadPoolExecutor(max_workers=min(16, max(4, len(config.SYMBOLS)))) as pool:
+    with ThreadPoolExecutor(max_workers=min(24, max(4, len(config.SYMBOLS)))) as pool:
         futures = {pool.submit(refresh_symbol_market_data, sym, lock): sym for sym in list(config.SYMBOLS)}
         for fut in as_completed(futures):
             try:
