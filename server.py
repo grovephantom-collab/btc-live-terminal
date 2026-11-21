@@ -356,7 +356,7 @@ def _render_dashboard_body():
             u_clr, side = ("#10b981" if upnl >= 0 else "#ef4444"), tr.get("direction", "LONG")
             b_clr = "#10b981" if side == "LONG" else "#ef4444"
             booked_tag = f" • Booked TP1: ${rpnl:+.2f}" if rpnl != 0 else ""
-            st.markdown(f'<div class="pos-card" style="border-left-color:{b_clr};"><div style="display:flex;justify-content:space-between;align-items:center;"><b style="font-size:0.88rem;">{tr.get("symbol")} • {side} ({tr.get("setup_name")}){booked_tag}</b><span style="color:{u_clr};font-weight:800;font-size:0.92rem;">${upnl:+.2f} (₹{upnl*USD_INR:+,.0f})</span></div><div style="font-size:0.74rem;color:#94a3b8;margin-top:5px;">Entry: <b>{_fmt_p(float(tr["entry_price"]))}</b> | SL: <b style="color:#ef4444;">{_fmt_p(float(tr["stop_price"]))}</b> | TP1 (1.30R): <b style="color:#10b981;">{_fmt_p(float(tr["tp1_price"]))}</b> | TP2 (2.40R): <b style="color:#10b981;">{_fmt_p(float(tr["tp2_price"]))}</b></div></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="pos-card" style="border-left-color:{b_clr};"><div style="display:flex;justify-content:space-between;align-items:center;"><b style="font-size:0.88rem;">{tr.get("symbol")} • {side} ({tr.get("setup_name")}){booked_tag}</b><span style="color:{u_clr};font-weight:800;font-size:0.92rem;">${upnl:+.2f} (₹{upnl*USD_INR:+,.0f})</span></div><div style="font-size:0.74rem;color:#94a3b8;margin-top:5px;">Entry: <b>{_fmt_p(float(tr["entry_price"]))}</b> | SL: <b style="color:#ef4444;">{_fmt_p(float(tr["stop_price"]))}</b> | TP1 (1.25R): <b style="color:#10b981;">{_fmt_p(float(tr["tp1_price"]))}</b> | TP2 (2.30R): <b style="color:#10b981;">{_fmt_p(float(tr["tp2_price"]))}</b></div></div>', unsafe_allow_html=True)
     else:
         st.caption(f"No open positions — Background Radar sweeping 120+ Delta assets ({len(markets)} deep-scanned) & auto-promoting top movers above.")
 
@@ -379,7 +379,7 @@ def _render_dashboard_body():
         else:
             st.caption("Equity curve will render automatically after the first closed trade.")
     with tab3:
-        st.markdown(f"- **Dynamic Spotlight Radar:** Sweeps 120+ Delta perpetuals in background, displays only the **Top 8 Active Movers & Open Trades**, and automatically rotates out closed trades for fresh movers\n- **Proportional Capital Scaling:** Base `₹5,000 ($58)` scales lot sizes & profit targets automatically whenever you add `₹5,000 (+$58)` (`{c_mult:.2f}x` active multiplier)\n- **Fast Realized Profit Lock:** `+0.80R` slashes risk in half | `TP1 (+1.30R)` books `35%` & locks `65%` risk-free at BE+fees | `TP2 (+2.40R)` books `35%` & trails SL to `+1.35R` | `TP3 (+3.80R)` rides `30%` mega-runner")
+        st.markdown(f"- **Dynamic Spotlight Radar:** Sweeps 120+ Delta perpetuals in background, displays only the **Top 8 Active Movers & Open Trades**, and automatically rotates out closed trades for fresh movers\n- **Proportional Capital Scaling:** Base `₹5,000 ($58)` scales lot sizes & profit targets automatically whenever you add `₹5,000 (+$58)` (`{c_mult:.2f}x` active multiplier)\n- **Fast Realized Profit Lock:** `+0.75R` slashes risk in half | `TP1 (+1.25R)` books `50%` & locks `50%` risk-free at BE+fees | `+1.75R` trails SL to `+0.90R` | `TP2 (+2.30R)` books `30%` & trails SL to `+1.45R` | `TP3 (+3.50R)` rides `20%` runner")
 
 def main() -> None:
     if hasattr(st, "fragment"):
