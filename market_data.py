@@ -12,6 +12,8 @@ MARKET_STORE: Dict[str, Dict[str, Any]] = {}
 _LAST_RADAR_TS = 0.0
 _PREV_TICKER_PRICES: Dict[str, float] = {}
 _DELTA_NATIVE_MAP: Dict[str, str] = {}
+_BINANCE_LIQUID_CACHE = {"ts": 0.0, "syms": set()}
+
 _CORE_ANCHORS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "PAXGUSDT", "XRPUSDT", "DOGEUSDT", "SUIUSDT", "LINKUSDT",
     "ADAUSDT", "AVAXUSDT", "NEARUSDT", "DOTUSDT", "LTCUSDT", "TRXUSDT", "APTUSDT", "ARBUSDT",
@@ -20,7 +22,34 @@ _CORE_ANCHORS = [
     "FILUSDT", "ATOMUSDT", "HBARUSDT", "ICPUSDT", "UNIUSDT", "AAVEUSDT", "PENDLEUSDT", "BCHUSDT",
 ]
 
-_BLOCKED_STOCK_TOKENS = {"AMDB", "TQQQB", "TSLAB", "NVDAB", "AAPLB", "MSFTB", "GOOGB", "METAB", "AMZNB", "COINB", "SPY", "QQQ"}
+_BLOCKED_TICKERS = {
+    "AMDB", "TQQQB", "TSLAB", "NVDAB", "AAPLB", "MSFTB", "GOOGB", "METAB", "AMZNB", "COINB",
+    "SPY", "QQQ", "OIL", "USOIL", "UKOIL", "WTI", "BRENT", "NGAS", "NATGAS", "XAG", "SILVER",
+    "RARE", "H", "SPX", "NDX", "DXY", "EUR", "GBP", "JPY",
+}
+
+def _get_binance_liquid_set() -> set:
+    now = time.time()
+    if _BINANCE_LIQUID_CACHE["syms"] and (now - _BINANCE_LIQUID_CACHE["ts"]) < 300.0:
+        return _BINANCE_LIQUID_CACHE["syms"]
+    min_b_vol = float(getattr(config, "MIN_BINANCE_VOL_USD", 25000000.0))
+    for b_url in ("https://data-api.binance.vision/api/v3/ticker/24hr", "https://api.binance.com/api/v3/ticker/24hr"):
+        try:
+            r = HTTP.get(b_url, timeout=5.0)
+            if r.status_code == 200:
+                valid = {
+                    str(it["symbol"]).upper()
+                    for it in r.json()
+                    if str(it.get("symbol", "")).upper().endswith("USDT")
+                    and float(it.get("quoteVolume") or 0.0) >= min_b_vol
+                }
+                if len(valid) >= 20:
+                    valid.add("PAXGUSDT")
+                    _BINANCE_LIQUID_CACHE.update(ts=now, syms=valid)
+                    return valid
+        except Exception:
+            continue
+    return set(_CORE_ANCHORS)
 
 def get_market(symbol: str = "BTCUSDT") -> Dict[str, Any]:
     sym = symbol.strip().upper()
@@ -239,19 +268,20 @@ def discover_top_delta_movers(active_trade_symbols: list = None) -> List[str]:
     now = time.time()
     if not getattr(config, "ENABLE_ALL_DELTA_RADAR", True):
         return config.SYMBOLS
-    if (now - _LAST_RADAR_TS) < 30.0 and len(config.SYMBOLS) >= 40:
+    if (now - _LAST_RADAR_TS) < 30.0 and len(config.SYMBOLS) >= 30:
         for s in (active_trade_symbols or []):
             if s and s not in config.SYMBOLS:
                 config.SYMBOLS.insert(0, s)
         return config.SYMBOLS
 
+    binance_liquid = _get_binance_liquid_set()
     selected = []
     for s in (active_trade_symbols or []) + _CORE_ANCHORS:
         if s and s not in selected:
             selected.append(s)
 
     instant_spikers, movers = [], []
-    min_turn = float(getattr(config, "MIN_RADAR_TURNOVER_USD", 250000.0))
+    min_turn = float(getattr(config, "MIN_RADAR_TURNOVER_USD", 1500000.0))
 
     for d_url in ("https://api.india.delta.exchange/v2/tickers", "https://api.delta.exchange/v2/tickers"):
         try:
@@ -265,11 +295,13 @@ def discover_top_delta_movers(active_trade_symbols: list = None) -> List[str]:
                         if (ctype and "perpetual" not in ctype) or (not sym_raw.endswith("USD") and not sym_raw.endswith("USDT")):
                             continue
                         base = sym_raw[:-4] if sym_raw.endswith("USDT") else sym_raw[:-3]
-                        if not base.isalnum() or len(base) > 12 or base in ("USDT", "USDC", "DAI"):
+                        if not base.isalnum() or len(base) < 2 or len(base) > 10 or base in ("USDT", "USDC", "DAI"):
                             continue
-                        if base in _BLOCKED_STOCK_TOKENS or (len(base) >= 4 and base.endswith("B") and base not in ("SHIB", "BNB", "ARB", "KAVA", "HBAR")):
+                        if base in _BLOCKED_TICKERS or (len(base) >= 4 and base.endswith("B") and base not in ("SHIB", "BNB", "ARB", "KAVA", "HBAR")):
                             continue
                         std_sym = f"{base}USDT"
+                        if std_sym not in binance_liquid and std_sym not in _CORE_ANCHORS:
+                            continue
                         _DELTA_NATIVE_MAP[std_sym] = sym_raw
                         mark_p = float(it.get("mark_price") or it.get("close") or 0.0)
                         open_p = float(it.get("open") or mark_p)
@@ -297,7 +329,7 @@ def discover_top_delta_movers(active_trade_symbols: list = None) -> List[str]:
         if sp_sym not in selected:
             selected.insert(0, sp_sym)
     movers.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    max_tot = int(getattr(config, "MAX_RADAR_SYMBOLS", 48))
+    max_tot = int(getattr(config, "MAX_RADAR_SYMBOLS", 45))
     for _, _, m_sym in movers:
         if len(selected) >= max_tot:
             break
