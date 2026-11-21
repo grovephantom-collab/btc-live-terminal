@@ -119,42 +119,65 @@ def get_15d_compounding_state(conn) -> dict:
 def get_equity(conn) -> float:
     return get_15d_compounding_state(conn)["active_trading_equity_usd"]
 
+def _get_today_realized_pnl(conn) -> float:
+    today_start = datetime.now(timezone.utc).strftime("%Y-%m-%d 00:00:00")
+    closed_p = float(conn.execute("SELECT COALESCE(SUM(realized_pnl_usd), 0.0) as s FROM trades WHERE closed_at_utc >= ?", (today_start,)).fetchone()["s"] or 0.0)
+    active_p = float(conn.execute("SELECT COALESCE(SUM(realized_pnl_usd), 0.0) as s FROM trades WHERE stage != 'CLOSED' AND opened_at_utc >= ?", (today_start,)).fetchone()["s"] or 0.0)
+    return round(closed_p + active_p, 2)
+
 def _check_cooldown_and_circuit_breakers(conn, symbol: str = None) -> tuple:
     now_dt = datetime.now(timezone.utc)
     today_start = now_dt.strftime("%Y-%m-%d 00:00:00")
     if conn.execute("SELECT COUNT(*) as c FROM trades WHERE opened_at_utc >= ?", (today_start,)).fetchone()["c"] >= config.MAX_DAILY_TRADES:
         return False, "Daily trade limit"
     cap_mult = max(1.0, get_base_capital(conn) / 58.0)
-    if float(conn.execute("SELECT COALESCE(SUM(realized_pnl_usd), 0.0) as s FROM trades WHERE closed_at_utc >= ?", (today_start,)).fetchone()["s"] or 0.0) <= -abs(config.MAX_DAILY_LOSS * cap_mult):
+    day_pnl = _get_today_realized_pnl(conn)
+    if day_pnl <= -abs(config.MAX_DAILY_LOSS * cap_mult):
         return False, "Daily loss circuit breaker"
+    last2 = conn.execute("SELECT close_reason, closed_at_utc FROM trades WHERE stage = 'CLOSED' AND closed_at_utc IS NOT NULL ORDER BY id DESC LIMIT 2").fetchall()
+    if len(last2) == 2 and all("STOP_LOSS" in (r["close_reason"] or "") for r in last2):
+        try:
+            since_last_sl = (now_dt - datetime.fromisoformat(last2[0]["closed_at_utc"])).total_seconds()
+            if since_last_sl < getattr(config, "CONSECUTIVE_SL_PAUSE_SEC", 7200):
+                return False, "2-SL chop guard pause"
+        except Exception:
+            pass
+    today_key = now_dt.strftime("%Y-%m-%d")
+    daily_target = float(getattr(config, "DAILY_PROFIT_TARGET", 10.0)) * cap_mult
+    if day_pnl >= daily_target:
+        database.set_setting("daily_target_hit_date", today_key)
+    if database.get_setting("daily_target_hit_date", "") == today_key and day_pnl < (daily_target * 0.80):
+        return False, "Daily profit floor locked"
     recent = conn.execute("SELECT close_reason, closed_at_utc FROM trades WHERE stage = 'CLOSED' AND symbol = ? AND closed_at_utc IS NOT NULL ORDER BY id DESC LIMIT 2", (symbol,)).fetchall() if symbol else []
     if recent and recent[0]["closed_at_utc"]:
         try:
             elapsed = (now_dt - datetime.fromisoformat(recent[0]["closed_at_utc"])).total_seconds()
             reason = recent[0]["close_reason"] or ""
-            if "STOP_LOSS" in reason and elapsed < getattr(config, "SL_COOLDOWN_SECONDS", 3600):
+            if "STOP_LOSS" in reason and elapsed < getattr(config, "SL_COOLDOWN_SECONDS", 5400):
                 return False, "SL cooldown"
-            if elapsed < getattr(config, "TRADE_COOLDOWN_SECONDS", 1800):
+            if elapsed < getattr(config, "TRADE_COOLDOWN_SECONDS", 1200):
                 return False, "Rotation cooldown"
         except Exception:
             pass
     return True, "OK"
 
-def calculate_small_cap_delta_size(equity_usd: float, entry: float, sl: float, symbol: str = "BTCUSDT", score: float = 95.0) -> tuple:
+def calculate_small_cap_delta_size(equity_usd: float, entry: float, sl: float, symbol: str = "BTCUSDT", score: float = 95.0, profit_lock_mode: bool = False) -> tuple:
     risk_per_unit = abs(entry - sl)
     if risk_per_unit <= 0 or entry <= 0:
         return 0.0, 0, 0.0
     params = config.get_asset_params(symbol, entry)
     lot_size = float(params["lot_size"])
     capital_mult = max(0.75, equity_usd / 58.0)
-    risk_pct = float(getattr(config, "A_PLUS_RISK_PCT", 0.040)) if score >= 97.0 else float(getattr(config, "RISK_PCT", 0.030))
-    min_r = float(config.MIN_RISK_USD) * capital_mult
-    max_r = float(config.MAX_RISK_USD) * capital_mult
+    risk_pct = float(getattr(config, "A_PLUS_RISK_PCT", 0.050)) if score >= 97.5 else float(getattr(config, "RISK_PCT", 0.040))
+    if profit_lock_mode:
+        risk_pct *= 0.50
+    min_r = float(config.MIN_RISK_USD) * capital_mult * (0.50 if profit_lock_mode else 1.0)
+    max_r = float(config.MAX_RISK_USD) * capital_mult * (0.50 if profit_lock_mode else 1.0)
     target_risk = max(min_r, min(max_r, equity_usd * risk_pct))
 
-    max_notional_usd = min(float(getattr(config, "MAX_NOTIONAL", 700.0)) * capital_mult, equity_usd * float(config.LEVERAGE) * 0.50)
+    max_notional_usd = min(float(getattr(config, "MAX_NOTIONAL", 850.0)) * capital_mult, equity_usd * float(config.LEVERAGE) * 0.58)
     max_lots_notional = max(1, int((max_notional_usd / entry) / lot_size))
-    dyn_max_lots = min(max(int(getattr(config, "MAX_LOTS_CAP", 500)), int(round(500 * capital_mult))), max_lots_notional)
+    dyn_max_lots = min(max(int(getattr(config, "MAX_LOTS_CAP", 600)), int(round(600 * capital_mult))), max_lots_notional)
 
     raw_lots = int(round((target_risk / risk_per_unit) / lot_size))
     lots = max(1, min(dyn_max_lots, raw_lots))
@@ -201,7 +224,13 @@ def open_paper_trade(signal: dict, fencing_token: int):
         if conn.execute("SELECT id FROM trades WHERE signal_key = ?", (sig_key,)).fetchone():
             return
         equity = get_equity(conn)
-        qty, lots, risk_usd = calculate_small_cap_delta_size(equity, entry, sl, sym, float(signal.get("score") or 95.0))
+        cap_mult = max(1.0, get_base_capital(conn) / 58.0)
+        daily_target = float(getattr(config, "DAILY_PROFIT_TARGET", 10.0)) * cap_mult
+        profit_lock_mode = _get_today_realized_pnl(conn) >= daily_target
+        if profit_lock_mode and float(signal.get("score") or 0.0) < 98.0:
+            return
+
+        qty, lots, risk_usd = calculate_small_cap_delta_size(equity, entry, sl, sym, float(signal.get("score") or 95.0), profit_lock_mode)
         if qty <= 0 or lots <= 0:
             return
         params = config.get_asset_params(sym, entry)
@@ -213,12 +242,13 @@ def open_paper_trade(signal: dict, fencing_token: int):
         )
         conn.commit()
         if hasattr(notifications, "enqueue_telegram"):
+            mode_tag = " [PROFIT-LOCK 50% RISK]" if profit_lock_mode else ""
             notifications.enqueue_telegram(
-                f"🚀 *HIGH-CONVICTION TRADE OPENED ({params['display_name']} {signal['direction']})*\n"
+                f"🚀 *HIGH-CONVICTION TRADE OPENED ({params['display_name']} {signal['direction']}){mode_tag}*\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"• Setup: {signal['setup_name']}\n"
                 f"• Entry: ${entry:,.{dec}f} | SL: ${sl:,.{dec}f} ({round(abs(entry-sl), dec)} pts)\n"
-                f"• TP1 (1.30R): ${signal['tp1']:,.{dec}f} | TP2 (2.40R): ${signal['tp2']:,.{dec}f} | Runner (3.80R): ${signal['tp3']:,.{dec}f}\n"
+                f"• TP1 (1.25R): ${signal['tp1']:,.{dec}f} | TP2 (2.30R): ${signal['tp2']:,.{dec}f} | Runner (3.50R): ${signal['tp3']:,.{dec}f}\n"
                 f"• Size: {lots} Lot ({qty})\n"
                 f"• Max Risk: ${risk_usd:.2f} (~₹{risk_usd*config.USD_INR_RATE:.0f})\n"
                 f"• Active Equity: ${equity:.2f} USD"
@@ -237,7 +267,7 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
     is_long = direction == "LONG"
     params = config.get_asset_params(sym, entry)
     dec = int(params.get("decimals", 2))
-    orig_sl_dist = max(abs(tp1 - entry) / 1.30, params["min_stop"])
+    orig_sl_dist = max(abs(tp1 - entry) / 1.25, params["min_stop"])
 
     if (is_long and current_price <= sl) or (not is_long and current_price >= sl):
         exec_exit = sl if config.MODE == "PAPER" else current_price
@@ -257,7 +287,10 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
         try:
             elapsed_sec = (datetime.fromisoformat(now_str) - datetime.fromisoformat(trade_dict["opened_at_utc"])).total_seconds()
             adverse_dist = (entry - current_price) if is_long else (current_price - entry)
-            if elapsed_sec >= 5400 and adverse_dist >= (orig_sl_dist * 0.55):
+            m_live = market_data.get_market(sym)
+            live_cvd = float(m_live.get("cvd_ratio") or 0.50)
+            cvd_flipped_against = (is_long and live_cvd <= 0.40) or ((not is_long) and live_cvd >= 0.60)
+            if (elapsed_sec >= 5400 and adverse_dist >= (orig_sl_dist * 0.55)) or (elapsed_sec >= 1800 and cvd_flipped_against and adverse_dist >= (orig_sl_dist * 0.55)):
                 fee_usd = round((entry + current_price) * rem_qty * float(config.FEE_RATE), 3)
                 leg_pnl = round((-adverse_dist * rem_qty) - fee_usd, 2)
                 tot_real = round(float(trade_dict["realized_pnl_usd"]) + leg_pnl, 2)
@@ -272,10 +305,10 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
     current_gain = (current_price - entry) if is_long else (entry - current_price)
     r_mult = current_gain / max(1e-9, orig_sl_dist)
 
-    tp1_reached = (is_long and current_price >= tp1) or (not is_long and current_price <= tp1) or (r_mult >= 1.30)
+    tp1_reached = (is_long and current_price >= tp1) or (not is_long and current_price <= tp1) or (r_mult >= 1.25)
     if not tp1_done and tp1_reached:
-        exec_tp1 = current_price if r_mult >= 1.30 else tp1
-        b_qty = round(init_qty * 0.35, 6)
+        exec_tp1 = current_price if r_mult >= 1.25 else tp1
+        b_qty = round(init_qty * 0.50, 6)
         n_rem = max(0.0, round(rem_qty - b_qty, 6))
         fee_usd = round((entry + exec_tp1) * b_qty * float(config.FEE_RATE), 3)
         gain_pts = (exec_tp1 - entry) if is_long else (entry - exec_tp1)
@@ -287,34 +320,41 @@ def _manage_single_position(conn, trade_dict: dict, current_price: float, fencin
         conn.execute("UPDATE trades SET tp1_done=1, remaining_qty=?, stop_price=?, realized_pnl_usd=realized_pnl_usd+?, unrealized_pnl_usd=?, total_fee_usd=total_fee_usd+?, updated_at_utc=? WHERE trade_id=?", (n_rem, n_sl, b_pnl, rem_unreal, fee_usd, now_str, tid))
         conn.commit()
         if hasattr(notifications, "enqueue_telegram"):
-            notifications.enqueue_telegram(f"🎯 *TARGET 1 BOOKED 35% ({params['display_name']})*\n━━━━━━━━━━━━━━━━━━━━\n• Booked 35% at: ${exec_tp1:,.{dec}f}\n• Realized Profit Added: ${b_pnl:+.2f} USD (~₹{b_pnl*config.USD_INR_RATE:+.0f})\n• Remaining 65% Risk-Free SL: ${n_sl:,.{dec}f}")
+            notifications.enqueue_telegram(f"🎯 *TARGET 1 BOOKED 50% ({params['display_name']})*\n━━━━━━━━━━━━━━━━━━━━\n• Booked 50% at: ${exec_tp1:,.{dec}f}\n• Realized Profit Added: ${b_pnl:+.2f} USD (~₹{b_pnl*config.USD_INR_RATE:+.0f})\n• Remaining 50% Risk-Free SL: ${n_sl:,.{dec}f}")
         return
 
-    if getattr(config, "ENABLE_DYNAMIC_PROFIT_LOCK", True) and not tp1_done and r_mult >= 0.80:
+    if getattr(config, "ENABLE_DYNAMIC_PROFIT_LOCK", True) and not tp1_done and r_mult >= 0.75:
         t_sl = round(entry - orig_sl_dist * 0.50 if is_long else entry + orig_sl_dist * 0.50, dec)
         if (is_long and t_sl > sl) or (not is_long and t_sl < sl):
             conn.execute("UPDATE trades SET stop_price=?, updated_at_utc=? WHERE trade_id=?", (t_sl, now_str, tid))
             conn.commit()
+            sl = t_sl
 
-    tp2_reached = (is_long and current_price >= tp2) or (not is_long and current_price <= tp2) or (r_mult >= 2.40)
+    if tp1_done and not tp2_done and r_mult >= 1.75:
+        mid_sl = round(entry + (orig_sl_dist * 0.90) if is_long else entry - (orig_sl_dist * 0.90), dec)
+        if (is_long and mid_sl > sl) or (not is_long and mid_sl < sl):
+            conn.execute("UPDATE trades SET stop_price=?, updated_at_utc=? WHERE trade_id=?", (mid_sl, now_str, tid))
+            conn.commit()
+            sl = mid_sl
+
+    tp2_reached = (is_long and current_price >= tp2) or (not is_long and current_price <= tp2) or (r_mult >= 2.30)
     if tp1_done and not tp2_done and tp2_reached:
-        exec_tp2 = current_price if r_mult >= 2.40 else tp2
-        b_qty = round(init_qty * 0.35, 6)
+        exec_tp2 = current_price if r_mult >= 2.30 else tp2
+        b_qty = round(init_qty * 0.30, 6)
         n_rem = max(0.0, round(rem_qty - b_qty, 6))
         fee_usd = round((entry + exec_tp2) * b_qty * float(config.FEE_RATE), 3)
         gain_pts = (exec_tp2 - entry) if is_long else (entry - exec_tp2)
         b_pnl = round((gain_pts * b_qty) - fee_usd, 2)
-        n_sl = round(entry + (orig_sl_dist * 1.35) if is_long else entry - (orig_sl_dist * 1.35), dec)
+        n_sl = round(entry + (orig_sl_dist * 1.45) if is_long else entry - (orig_sl_dist * 1.45), dec)
         rem_unreal = round(gain_pts * n_rem, 2)
         conn.execute("UPDATE trades SET tp2_done=1, remaining_qty=?, stop_price=?, realized_pnl_usd=realized_pnl_usd+?, unrealized_pnl_usd=?, total_fee_usd=total_fee_usd+?, updated_at_utc=? WHERE trade_id=?", (n_rem, n_sl, b_pnl, rem_unreal, fee_usd, now_str, tid))
         conn.commit()
         if hasattr(notifications, "enqueue_telegram"):
-            notifications.enqueue_telegram(f"🎯 *TARGET 2 BOOKED 35% ({params['display_name']})*\n━━━━━━━━━━━━━━━━━━━━\n• Booked 35% at: ${exec_tp2:,.{dec}f}\n• Realized Profit Added: ${b_pnl:+.2f} USD\n• Final 30% Runner SL Trailed to +1.35R: ${n_sl:,.{dec}f}")
+            notifications.enqueue_telegram(f"🎯 *TARGET 2 BOOKED 30% ({params['display_name']})*\n━━━━━━━━━━━━━━━━━━━━\n• Booked 30% at: ${exec_tp2:,.{dec}f}\n• Realized Profit Added: ${b_pnl:+.2f} USD\n• Final 20% Runner SL Trailed to +1.45R: ${n_sl:,.{dec}f}")
         return
 
-    if tp1_done and tp2_done and r_mult >= 2.85:
-        r_lock = 2.75 if r_mult >= 3.35 else 2.10
-        r_sl = round(entry + (orig_sl_dist * r_lock) if is_long else entry - (orig_sl_dist * r_lock), dec)
+    if tp1_done and tp2_done and r_mult >= 2.90:
+        r_sl = round(entry + (orig_sl_dist * 2.20) if is_long else entry - (orig_sl_dist * 2.20), dec)
         if (is_long and r_sl > sl) or (not is_long and r_sl < sl):
             conn.execute("UPDATE trades SET stop_price=?, updated_at_utc=? WHERE trade_id=?", (r_sl, now_str, tid))
             conn.commit()
