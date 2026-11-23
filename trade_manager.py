@@ -134,8 +134,8 @@ def _check_cooldown_and_circuit_breakers(conn, symbol: str = None) -> tuple:
     day_pnl = _get_today_realized_pnl(conn)
     if day_pnl <= -abs(config.MAX_DAILY_LOSS * cap_mult):
         return False, "Daily loss circuit breaker"
-    last2 = conn.execute("SELECT close_reason, closed_at_utc FROM trades WHERE stage = 'CLOSED' AND closed_at_utc IS NOT NULL ORDER BY id DESC LIMIT 2").fetchall()
-    if len(last2) == 2 and all("STOP_LOSS" in (r["close_reason"] or "") for r in last2):
+    last2 = conn.execute("SELECT close_reason, realized_pnl_usd, closed_at_utc FROM trades WHERE stage = 'CLOSED' AND closed_at_utc IS NOT NULL ORDER BY id DESC LIMIT 2").fetchall()
+    if len(last2) == 2 and all(float(r["realized_pnl_usd"] or 0.0) < 0 for r in last2):
         try:
             since_last_sl = (now_dt - datetime.fromisoformat(last2[0]["closed_at_utc"])).total_seconds()
             if since_last_sl < getattr(config, "CONSECUTIVE_SL_PAUSE_SEC", 7200):
@@ -153,7 +153,7 @@ def _check_cooldown_and_circuit_breakers(conn, symbol: str = None) -> tuple:
         try:
             elapsed = (now_dt - datetime.fromisoformat(recent[0]["closed_at_utc"])).total_seconds()
             reason = recent[0]["close_reason"] or ""
-            if "STOP_LOSS" in reason and elapsed < getattr(config, "SL_COOLDOWN_SECONDS", 5400):
+            if ("STOP_LOSS" in reason or "INVALIDATION" in reason) and elapsed < getattr(config, "SL_COOLDOWN_SECONDS", 5400):
                 return False, "SL cooldown"
             if elapsed < getattr(config, "TRADE_COOLDOWN_SECONDS", 1200):
                 return False, "Rotation cooldown"
@@ -210,7 +210,7 @@ def open_paper_trade(signal: dict, fencing_token: int):
                     r_locked = bool(r["tp1_done"]) or (r["direction"] == "LONG" and r_sl >= r_entry) or (r["direction"] == "SHORT" and r_sl <= r_entry)
                     if not r_locked:
                         unlocked_same_dir += 1
-            if unlocked_same_dir >= 2:
+            if unlocked_same_dir >= 1:
                 return
 
         allowed, _ = _check_cooldown_and_circuit_breakers(conn, sym)
