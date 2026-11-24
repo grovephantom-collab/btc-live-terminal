@@ -87,8 +87,8 @@ try:
 
     FEE_RATE = fenv("PAPER_FEE_RATE", 0.00059, 0)
     CYCLE_DAYS = ienv("CYCLE_DAYS", 15, 1)
-    WITHDRAWAL_RESERVE_PCT = fenv("WITHDRAWAL_RESERVE_PCT", 0.30, 0.0)
-    COMPOUND_REINVEST_PCT = fenv("COMPOUND_REINVEST_PCT", 0.70, 0.1)
+    WITHDRAWAL_RESERVE_PCT = fenv("WITHDRAWAL_RESERVE_PCT", 0.70, 0.0)
+    COMPOUND_REINVEST_PCT = fenv("COMPOUND_REINVEST_PCT", 0.30, 0.1)
     SLIPPAGE = fenv("PAPER_SLIPPAGE_RATE", 0.0002, 0)
     MIN_SCORE = fenv("MIN_SIGNAL_SCORE", 94, 0)
 
@@ -116,8 +116,8 @@ except Exception as e:
 
 CATALOG = {
     "BTC":  {"name": "Bitcoin (BTC)",   "dec": 2, "min_s": 400.0,  "max_s": 700.0,  "buf": 55.0,   "gap": 35.0,   "swp": 20.0,   "be": 85.0,   "lot": 0.001, "def_p": 65000.0, "atr": 220.0, "gold": False},
-    "PAXG": {"name": "Gold (PAXG/XAU)", "dec": 2, "min_s": 4.0,    "max_s": 7.5,    "buf": 0.6,    "gap": 0.8,    "swp": 0.4,    "be": 4.20,   "lot": 0.01,  "def_p": 3850.0,  "atr": 4.5,   "gold": True},
-    "XAU":  {"name": "Gold (PAXG/XAU)", "dec": 2, "min_s": 4.0,    "max_s": 7.5,    "buf": 0.6,    "gap": 0.8,    "swp": 0.4,    "be": 4.20,   "lot": 0.01,  "def_p": 3850.0,  "atr": 4.5,   "gold": True},
+    "PAXG": {"name": "Gold (PAXG/XAU)", "dec": 2, "min_s": 18.0,   "max_s": 42.0,   "buf": 3.0,    "gap": 2.5,    "swp": 1.5,    "be": 5.50,   "lot": 0.01,  "def_p": 3650.0,  "atr": 14.0,  "gold": True},
+    "XAU":  {"name": "Gold (PAXG/XAU)", "dec": 2, "min_s": 18.0,   "max_s": 42.0,   "buf": 3.0,    "gap": 2.5,    "swp": 1.5,    "be": 5.50,   "lot": 0.01,  "def_p": 3650.0,  "atr": 14.0,  "gold": True},
     "ETH":  {"name": "Ethereum (ETH)",  "dec": 2, "min_s": 15.0,   "max_s": 32.0,   "buf": 2.2,    "gap": 1.8,    "swp": 1.2,    "be": 2.60,   "lot": 0.01,  "def_p": 2000.0,  "atr": 12.0,  "gold": False},
     "SOL":  {"name": "Solana (SOL)",    "dec": 3, "min_s": 0.95,   "max_s": 2.40,   "buf": 0.16,   "gap": 0.12,   "swp": 0.08,   "be": 0.22,   "lot": 0.1,   "def_p": 75.0,    "atr": 0.85,  "gold": False},
     "XRP":  {"name": "Ripple (XRP)",    "dec": 4, "min_s": 0.012,  "max_s": 0.032,  "buf": 0.0020, "gap": 0.0015, "swp": 0.0010, "be": 0.0025, "lot": 10.0,  "def_p": 0.95,    "atr": 0.012, "gold": False},
