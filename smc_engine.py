@@ -107,7 +107,56 @@ def _detect_fvg_and_displacement(closed_15: list, atr: float, min_gap: float) ->
         bear_fvg = True
     return bull_fvg, bear_fvg
 
+def _detect_event_level_signal(structure: dict, closed_15: list, atr: float) -> tuple:
+    """
+    Gautam Jha Masterclass 1.0 — Event Level Trade / Major Reversal Signal:
+    - Marks established Big Timeframe (4H & 1H) Major Liquidity Highs/Lows.
+    - Detects when 15m price sweeps/hunts that 4H or 1H level and closes back inside
+      with strong institutional reversal protection (green close above swept low / red close below swept high).
+    - Counter-trend allowed ONLY at Event Levels (per Masterclass 1.0 rule).
+    Returns (direction, raw_sl, tf_label, swept_level) or (None, None, None, None).
+    """
+    if len(closed_15) < 6 or atr <= 0:
+        return None, None, None, None
+    c, prev = closed_15[-1], closed_15[-2]
+    o, h, l, cl = c[0], c[1], c[2], c[3]
+    prev_cl = prev[3]
+    rng = max(1e-6, h - l)
+    body_ratio = abs(cl - o) / rng
+    lower_wick_ratio = (min(o, cl) - l) / rng
+    upper_wick_ratio = (h - max(o, cl)) / rng
+
+    sweep_low = min(x[2] for x in closed_15[-4:])
+    sweep_high = max(x[1] for x in closed_15[-4:])
+
+    # Check 4H Event Level first (strongest), then 1H Event Level
+    levels = [
+        ("4H", structure.get("event_4h_high"), structure.get("event_4h_low")),
+        ("1H", structure.get("event_1h_high"), structure.get("event_1h_low")),
+    ]
+    for tf_label, lvl_high, lvl_low in levels:
+        # BULLISH EVENT REVERSAL: Swept 4H/1H Major Low -> Closed back above with green buyer protection
+        if lvl_low and lvl_low > 0:
+            if (sweep_low <= lvl_low + atr * 0.08) and (cl > lvl_low) and (cl > o) and (cl > prev_cl):
+                if (lower_wick_ratio >= 0.25 or body_ratio >= 0.45) and (upper_wick_ratio <= 0.30):
+                    return "LONG", sweep_low, tf_label, lvl_low
+        # BEARISH EVENT REVERSAL: Swept 4H/1H Major High -> Closed back below with red seller rejection
+        if lvl_high and lvl_high > 0:
+            if (sweep_high >= lvl_high - atr * 0.08) and (cl < lvl_high) and (cl < o) and (cl < prev_cl):
+                if (upper_wick_ratio >= 0.25 or body_ratio >= 0.45) and (lower_wick_ratio <= 0.30):
+                    return "SHORT", sweep_high, tf_label, lvl_high
+
+    return None, None, None, None
+
 def _detect_panic_point_setup(closed_15: list, atr: float) -> tuple:
+    """
+    Gautam Jha Masterclass 1.0 — 5-Rule Panic Point (PP) + Unswept Other-Party Liquidity Detector:
+    1. Strong prior impulse (>= 2.2x ATR) in last 36 bars
+    2. Clear retracement to Panic Point (35%–78% pullback)
+    3. CRITICAL: Opposite swing high/low NOT broken yet (Other Party's SL is STILL INTACT as target magnet!)
+    4. Recent bars test/sweep the Panic Point and close back with strong buyer/seller protection
+    Returns (direction, raw_sl, intact_target) or (None, None, None).
+    """
     if len(closed_15) < 28 or atr <= 0:
         return None, None, None
     win = closed_15[-36:]
@@ -116,31 +165,37 @@ def _detect_panic_point_setup(closed_15: list, atr: float) -> tuple:
     cur = win[-1]
     cl = cur[3]
 
+    # Check BULLISH Panic Point (Uptrend -> Retracement -> Unswept High -> Buyer Protection)
     hi_idx = max(range(4, len(win) - 4), key=lambda i: highs[i])
     imp_high = highs[hi_idx]
     base_low = min(lows[:hi_idx])
     imp_size = imp_high - base_low
     if imp_size >= atr * 2.2:
         after_hi = win[hi_idx + 1:]
+        # Rule 3: Sellers' SL above imp_high must NOT be hit yet!
         if max(x[1] for x in after_hi) <= imp_high + atr * 0.05:
             pp_low = min(x[2] for x in after_hi)
             retrace_pct = (imp_high - pp_low) / max(1e-9, imp_size)
             if 0.35 <= retrace_pct <= 0.80:
                 recent_low = min(x[2] for x in win[-4:])
+                # Rule 4: Price just tested PP and closed above it with headroom to intact high
                 if (recent_low <= pp_low + atr * 0.25) and (cl > pp_low + atr * 0.15) and ((imp_high - cl) >= atr * 1.40):
                     return "LONG", recent_low, imp_high
 
+    # Check BEARISH Panic Point (Downtrend -> Retracement -> Unswept Low -> Seller Protection)
     lo_idx = min(range(4, len(win) - 4), key=lambda i: lows[i])
     imp_low = lows[lo_idx]
     base_high = max(highs[:lo_idx])
     imp_size = base_high - imp_low
     if imp_size >= atr * 2.2:
         after_lo = win[lo_idx + 1:]
+        # Rule 3: Buyers' SL below imp_low must NOT be hit yet!
         if min(x[2] for x in after_lo) >= imp_low - atr * 0.05:
             pp_high = max(x[1] for x in after_lo)
             retrace_pct = (pp_high - imp_low) / max(1e-9, imp_size)
             if 0.35 <= retrace_pct <= 0.80:
                 recent_high = max(x[1] for x in win[-4:])
+                # Rule 4: Price just tested PP and closed below it with headroom to intact low
                 if (recent_high >= pp_high - atr * 0.25) and (cl < pp_high - atr * 0.15) and ((cl - imp_low) >= atr * 1.40):
                     return "SHORT", recent_high, imp_low
 
@@ -182,6 +237,7 @@ def get_structure(market_dict: dict, symbol: str = "BTCUSDT") -> dict:
     bull_score = 1 if cur_close > ema200 else 0
     bear_score = 0 if cur_close > ema200 else 1
     htf_1h_bias = "NEUTRAL"
+    event_1h_high, event_1h_low = None, None
     if len(k1h) >= 15:
         p1h = [_parse_candle(c) for c in k1h[:-1]]
         c1h = [p[3] for p in p1h]
@@ -196,10 +252,18 @@ def get_structure(market_dict: dict, symbol: str = "BTCUSDT") -> dict:
         elif c1h[-1] <= e20_1h and e50_1h <= e200_1h * 1.004:
             bear_score += 1
             htf_1h_bias = "BEARISH"
+        # Established 1H Major Event Liquidity High/Low (last 48h excluding most recent 3 bars)
+        if len(p1h) >= 12:
+            ev1_win = p1h[-51:-3] if len(p1h) >= 51 else p1h[:-3]
+            if ev1_win:
+                event_1h_high = max(p[1] for p in ev1_win)
+                event_1h_low = min(p[2] for p in ev1_win)
 
     htf_4h_bias = "NEUTRAL"
+    event_4h_high, event_4h_low = None, None
     if len(k4h) >= 10:
-        c4h = [_parse_candle(c)[3] for c in k4h[:-1]]
+        p4h = [_parse_candle(c) for c in k4h[:-1]]
+        c4h = [p[3] for p in p4h]
         e50_4h, e200_4h = _calc_ema(c4h, min(len(c4h), 50)), _calc_ema(c4h, min(len(c4h), 200))
         if c4h[-1] > e50_4h and e50_4h >= e200_4h * 0.995:
             bull_score += 2
@@ -207,6 +271,12 @@ def get_structure(market_dict: dict, symbol: str = "BTCUSDT") -> dict:
         elif c4h[-1] < e50_4h and e50_4h <= e200_4h * 1.005:
             bear_score += 2
             htf_4h_bias = "BEARISH"
+        # Established 4H Major Event Liquidity High/Low (last ~6.5 days excluding most recent 2 bars)
+        if len(p4h) >= 8:
+            ev4_win = p4h[-42:-2] if len(p4h) >= 42 else p4h[:-2]
+            if ev4_win:
+                event_4h_high = max(p[1] for p in ev4_win)
+                event_4h_low = min(p[2] for p in ev4_win)
 
     if daily_open and daily_open > 0:
         if cur_close > daily_open:
@@ -230,6 +300,8 @@ def get_structure(market_dict: dict, symbol: str = "BTCUSDT") -> dict:
         "symbol": symbol, "swing_high": swing_high, "swing_low": swing_low, "pdh": pdh, "pdl": pdl,
         "daily_open": daily_open, "day_high_24h": day_high_24h, "day_low_24h": day_low_24h,
         "asian_high": asian_high, "asian_low": asian_low, "current_close": cur_close,
+        "event_4h_high": event_4h_high, "event_4h_low": event_4h_low,
+        "event_1h_high": event_1h_high, "event_1h_low": event_1h_low,
         "ema9": ema9, "ema20": ema20, "ema50": ema50, "ema200": ema200, "rsi": rsi_15m,
         "adx": adx_15m, "bb_bandwidth": bb_bandwidth, "vol_sma20": vol_sma20, "atr": atr_15m,
         "choch_status": choch_status, "choch_level": choch_level, "macro_bias": macro_bias,
@@ -257,16 +329,17 @@ def _btc_leader_allows(symbol: str, direction: str) -> bool:
         pass
     return True
 
-def _build_trade_levels(direction: str, entry: float, raw_sl: float, atr: float, setup_name: str, score: float, candle_time: int, symbol: str = "BTCUSDT") -> dict:
+def _build_trade_levels(direction: str, entry: float, raw_sl: float, atr: float, setup_name: str, score: float, candle_time: int, symbol: str = "BTCUSDT", tp_mults: tuple = (1.25, 2.30, 3.50)) -> dict:
     params = config.get_asset_params(symbol, entry)
     dec = int(params.get("decimals", 2))
     wick_pad = max(params["sl_buffer"], atr * 0.40)
+    m1, m2, m3 = tp_mults
     if direction == "LONG":
         sl_dist = max(params["min_stop"], min(params["max_stop"], max((entry - raw_sl) + wick_pad, atr * 1.85)))
-        sl, tp1, tp2, tp3 = round(entry - sl_dist, dec), round(entry + sl_dist * 1.25, dec), round(entry + sl_dist * 2.30, dec), round(entry + sl_dist * 3.50, dec)
+        sl, tp1, tp2, tp3 = round(entry - sl_dist, dec), round(entry + sl_dist * m1, dec), round(entry + sl_dist * m2, dec), round(entry + sl_dist * m3, dec)
     else:
         sl_dist = max(params["min_stop"], min(params["max_stop"], max((raw_sl - entry) + wick_pad, atr * 1.85)))
-        sl, tp1, tp2, tp3 = round(entry + sl_dist, dec), round(entry - sl_dist * 1.25, dec), round(entry - sl_dist * 2.30, dec), round(entry - sl_dist * 3.50, dec)
+        sl, tp1, tp2, tp3 = round(entry + sl_dist, dec), round(entry - sl_dist * m1, dec), round(entry - sl_dist * m2, dec), round(entry - sl_dist * m3, dec)
     return {"symbol": symbol, "direction": direction, "setup_name": setup_name, "score": round(score, 1), "entry": round(entry, dec), "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3, "candle_time": candle_time}
 
 def evaluate_signal(structure: dict, candles_15m: list, current_price: float, session: str, poc: float, symbol: str = "BTCUSDT") -> dict:
@@ -318,9 +391,11 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
     rel_pos = (cl - range_floor) / max(atr * 2.0, range_ceil - range_floor)
     in_discount, in_premium = rel_pos < 0.50, rel_pos > 0.50
 
+    # GLOBAL TRAP FILTER (Masterclass 1.0 Rule 3): Never buy if price ALREADY swept PDH/swing high in last 6 bars and is falling back!
     already_swept_high_trap = bool(pdh and highest_recent >= pdh and cl < pdh - atr * 0.10)
     already_swept_low_trap = bool(pdl and lowest_recent <= pdl and cl > pdl + atr * 0.10)
 
+    # REAL INSTITUTIONAL BUYER/SELLER ORDERFLOW GATE (Binance Taker Buy/Sell Volume)
     c_buy_pct = (c[6] / max(1e-6, vol)) if vol > 0 else 0.50
     prev_buy_pct = (prev[6] / max(1e-6, prev[4])) if prev[4] > 0 else 0.50
     inst_vol_surge = vol >= (vol_sma20 * 1.20)
@@ -355,7 +430,17 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
     touched_bear_ob = bool(bear_ob and (h >= bear_ob[0] - atr * 0.15) and (cl <= bear_ob[1]))
     min_adx = 20.0
 
-    # STRATEGY 0 (TOP PRIORITY — SCORE 99.5): OPERATOR PANIC POINT + UNSWEPT OTHER-PARTY LIQUIDITY
+    # STRATEGY 00 (TOP PRIORITY — SCORE 99.8): GAUTAM JHA EVENT LEVEL REVERSAL (4H/1H LIQUIDITY SWEEP)
+    # Per Masterclass 1.0: Counter-trend reversals are allowed ONLY at major 4H/1H Event Levels with institutional taker volume!
+    ev_dir, ev_sl, ev_tf, _ = _detect_event_level_signal(structure, closed_15, atr)
+    ev_buyers_ok = (c_buy_pct >= 0.55) and (inst_vol_surge or prev_buy_pct >= 0.52 or cvd_ratio >= 0.50)
+    ev_sellers_ok = (c_buy_pct <= 0.45) and (inst_vol_surge or prev_buy_pct <= 0.48 or cvd_ratio <= 0.50)
+    if ev_dir == "LONG" and live_long_ok and ev_buyers_ok and (rsi <= 65.0) and funding <= max_long_f and not (cl > parsed[-4][0] and three_bar_run > atr * 2.5):
+        return _build_trade_levels("LONG", current_price or cl, ev_sl, atr, f"Event Level Reversal ({ev_tf} Liquidity)", 99.8, c_time, symbol, tp_mults=(1.50, 2.80, 4.50))
+    if ev_dir == "SHORT" and live_short_ok and ev_sellers_ok and (rsi >= 35.0) and funding >= min_short_f and not (cl < parsed[-4][0] and three_bar_run > atr * 2.5):
+        return _build_trade_levels("SHORT", current_price or cl, ev_sl, atr, f"Event Level Reversal ({ev_tf} Liquidity)", 99.8, c_time, symbol, tp_mults=(1.50, 2.80, 4.50))
+
+    # STRATEGY 0 (SCORE 99.5): GAUTAM JHA PANIC POINT + UNSWEPT OTHER-PARTY LIQUIDITY
     pp_dir, pp_sl, _ = _detect_panic_point_setup(closed_15, atr)
     if pp_dir == "LONG" and (not is_choppy) and (adx >= min_adx) and long_bias_ok and long_htf_ok and bull_confirm and allow_long_cvd and funding <= max_long_f:
         return _build_trade_levels("LONG", current_price or cl, pp_sl, atr, "Operator Panic Point (Unswept High)", 99.5, c_time, symbol)
