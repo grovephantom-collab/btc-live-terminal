@@ -25,6 +25,9 @@ _LOCAL_STRUCT: Dict[str, Dict[str, Any]] = {}
 _LAST_FETCH_TS = 0.0
 _CACHED_PAYLOAD: Dict[str, Any] = {}
 
+def _is_event_trade(tr: Dict[str, Any]) -> bool:
+    return "event level" in str(tr.get("setup_name") or "").lower()
+
 def _get_backend_candidates() -> list:
     candidates = []
     for raw in [os.getenv("BACKEND_URL", "").strip(), DEFAULT_RENDER_URL, f"http://127.0.0.1:{config.PORT}"]:
@@ -284,6 +287,12 @@ body, .stApp { background-color: #040711; color: #f8fafc; font-family: 'Inter', 
 .mkt-row { display: flex; justify-content: space-between; font-size: 0.68rem; color: #94a3b8; border-top: 1px solid #131c31; padding-top: 4px; margin-top: 4px; }
 .guard-box { background: #080d18; border: 1px solid #172238; border-radius: 8px; padding: 9px 11px; font-size: 0.70rem; color: #94a3b8; }
 .pos-card { background: #0d1527; border-left: 4px solid #38bdf8; border-radius: 8px; padding: 11px 13px; margin-bottom: 8px; border-top: 1px solid #1e293b; border-right: 1px solid #1e293b; border-bottom: 1px solid #1e293b; }
+.event-desk { background: linear-gradient(135deg, #1a132b 0%, #0d1224 100%); border: 1px solid rgba(245,158,11,0.45); border-radius: 12px; padding: 13px 15px; margin: 12px 0 14px 0; }
+.event-head { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.event-title { font-size: 0.84rem; font-weight: 800; letter-spacing: 0.06em; color: #fbbf24; text-transform: uppercase; font-family: 'JetBrains Mono', monospace; }
+.event-badge { background: rgba(245,158,11,0.18); color: #fbbf24; border: 1px solid rgba(245,158,11,0.5); padding: 2px 8px; border-radius: 6px; font-size: 0.66rem; font-weight: 700; }
+.event-card { background: rgba(15,23,42,0.88); border-left: 4px solid #fbbf24; border-top: 1px solid rgba(245,158,11,0.28); border-right: 1px solid rgba(245,158,11,0.28); border-bottom: 1px solid rgba(245,158,11,0.28); border-radius: 8px; padding: 11px 13px; margin-bottom: 8px; }
+.event-empty { font-size: 0.74rem; color: #cbd5e1; background: rgba(15,23,42,0.55); border: 1px dashed rgba(245,158,11,0.35); border-radius: 8px; padding: 10px 12px; }
 </style>""", unsafe_allow_html=True)
 
 def _render_dashboard_body():
@@ -297,6 +306,14 @@ def _render_dashboard_body():
     day_trades, day_pnl = int(payload.get("day_trades", 0)), float(payload.get("day_pnl_usd", 0.0))
     stats, comp = payload.get("stats", {}), payload.get("compounding", {})
     markets, active_list, vault_trades, eq_curve = payload.get("markets", {}), payload.get("active", []), payload.get("vault", []), payload.get("equity_curve", [])
+
+    event_active = [tr for tr in active_list if _is_event_trade(tr)]
+    regular_active = [tr for tr in active_list if not _is_event_trade(tr)]
+    event_history = [tr for tr in vault_trades if _is_event_trade(tr)]
+    ev_closed = [tr for tr in event_history if tr.get("stage") == "CLOSED"]
+    ev_wins = sum(1 for tr in ev_closed if float(tr.get("realized_pnl_usd") or 0.0) > 0)
+    ev_pnl = round(sum(float(tr.get("realized_pnl_usd") or 0.0) for tr in event_history), 2)
+    ev_wr = round((ev_wins / len(ev_closed)) * 100.0, 1) if ev_closed else 0.0
 
     s_bg = "rgba(16,185,129,0.14)" if auto_on else "rgba(239,68,68,0.14)"
     s_bd = "#10b981" if auto_on else "#ef4444"
@@ -321,6 +338,47 @@ def _render_dashboard_body():
     dead_ok = "BLOCKED" if payload.get("is_dead_hour") else "ACTIVE"
     news_ok = "BLACKOUT" if payload.get("news_blackout") else "CLEAR"
     st.markdown(f'<div class="guard-grid"><div class="guard-box"><b>DAILY TRADES:</b> <span style="color:#f8fafc;">{day_trades} / {config.MAX_DAILY_TRADES}</span></div><div class="guard-box"><b>DAILY LOSS LIMIT:</b> <span style="color:#f8fafc;">${day_pnl:+.2f} / -${config.MAX_DAILY_LOSS * max(1.0, c_mult):.2f}</span></div><div class="guard-box"><b>ACTIVE LOT RISK:</b> <span style="color:#38bdf8;">{config.RISK_PCT*100:.1f}% (~${c_act_eq*config.RISK_PCT:.2f})</span></div><div class="guard-box"><b>LIQUIDITY / NEWS:</b> <span style="color:#10b981;">{dead_ok} / {news_ok}</span></div></div>', unsafe_allow_html=True)
+
+    # DEDICATED EVENT LEVEL SIGNAL DASHBOARD PANEL (4H / 1H MAJOR LIQUIDITY REVERSALS)
+    ev_pnl_clr = "#10b981" if ev_pnl >= 0 else "#ef4444"
+    ev_status_txt = f"🔥 {len(event_active)} LIVE EVENT TRADE" if event_active else f"📡 WATCHING 4H/1H LEVELS • {len(event_history)} TOTAL"
+    ev_html = (
+        f'<div class="event-desk">'
+        f'<div class="event-head">'
+        f'<span class="event-title">⚡ EVENT LEVEL SIGNAL DESK (4H / 1H MAJOR REVERSAL)</span>'
+        f'<span class="event-badge">{ev_status_txt} | WR: {ev_wr:.0f}% | Net: <span style="color:{ev_pnl_clr};">${ev_pnl:+.2f}</span></span>'
+        f'</div>'
+    )
+    if event_active:
+        for tr in event_active:
+            upnl = float(tr.get("unrealized_pnl_usd") or 0.0)
+            rpnl = float(tr.get("realized_pnl_usd") or 0.0)
+            u_clr = "#10b981" if upnl >= 0 else "#ef4444"
+            side = tr.get("direction", "LONG")
+            side_clr = "#10b981" if side == "LONG" else "#ef4444"
+            booked_tag = f" • Booked TP1: ${rpnl:+.2f}" if rpnl != 0 else ""
+            ev_html += (
+                f'<div class="event-card" style="border-left-color:{side_clr};">'
+                f'<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;">'
+                f'<b style="font-size:0.90rem;color:#fef08a;">⚡ {tr.get("symbol")} • <span style="color:{side_clr};">{side}</span> ({tr.get("setup_name")}){booked_tag}</b>'
+                f'<span style="color:{u_clr};font-weight:800;font-size:0.95rem;">${upnl:+.2f} (₹{upnl*USD_INR:+,.0f})</span>'
+                f'</div>'
+                f'<div style="font-size:0.74rem;color:#cbd5e1;margin-top:6px;">'
+                f'Entry: <b>{_fmt_p(float(tr["entry_price"]))}</b> | '
+                f'SL: <b style="color:#ef4444;">{_fmt_p(float(tr["stop_price"]))}</b> | '
+                f'TP1 (1.50R): <b style="color:#10b981;">{_fmt_p(float(tr["tp1_price"]))}</b> | '
+                f'TP2 (2.80R): <b style="color:#10b981;">{_fmt_p(float(tr["tp2_price"]))}</b> | '
+                f'Runner (4.50R): <b style="color:#fbbf24;">{_fmt_p(float(tr["tp3_price"]))}</b>'
+                f'</div></div>'
+            )
+    else:
+        ev_html += (
+            f'<div class="event-empty">'
+            f'Abhi koi <b>Event Level Signal</b> active nahi hai — Engine <b>{len(markets)} institutional coins</b> par <b>4H &amp; 1H Major Liquidity Sweep Reversals</b> (Score 99.8 • 1.50R / 2.80R / 4.50R) scan kar raha hai. Jab bhi Event Signal trigger hoga, yahan live card dikhega.'
+            f'</div>'
+        )
+    ev_html += '</div>'
+    st.markdown(ev_html, unsafe_allow_html=True)
 
     disp_n = int(getattr(config, "DISPLAY_SCANNER_CARDS", 8))
     st.markdown(f'<div class="sec-title">🔥 Live Spotlight Radar (Top {disp_n} Active Movers & Open Trades — Auto-Rotating from {len(markets)}+ Scanned Assets)</div>', unsafe_allow_html=True)
@@ -348,9 +406,9 @@ def _render_dashboard_body():
         cards_html += '</div>'
         st.markdown(cards_html, unsafe_allow_html=True)
 
-    st.markdown(f'<div class="sec-title">⚡ Open Positions ({len(active_list)}/{config.MAX_OPEN_TRADES})</div>', unsafe_allow_html=True)
-    if active_list:
-        for tr in active_list:
+    st.markdown(f'<div class="sec-title">⚡ Regular Open Positions ({len(regular_active)} • Total Active: {len(active_list)}/{config.MAX_OPEN_TRADES})</div>', unsafe_allow_html=True)
+    if regular_active:
+        for tr in regular_active:
             upnl = float(tr.get("unrealized_pnl_usd") or 0.0)
             rpnl = float(tr.get("realized_pnl_usd") or 0.0)
             u_clr, side = ("#10b981" if upnl >= 0 else "#ef4444"), tr.get("direction", "LONG")
@@ -358,10 +416,22 @@ def _render_dashboard_body():
             booked_tag = f" • Booked TP1: ${rpnl:+.2f}" if rpnl != 0 else ""
             st.markdown(f'<div class="pos-card" style="border-left-color:{b_clr};"><div style="display:flex;justify-content:space-between;align-items:center;"><b style="font-size:0.88rem;">{tr.get("symbol")} • {side} ({tr.get("setup_name")}){booked_tag}</b><span style="color:{u_clr};font-weight:800;font-size:0.92rem;">${upnl:+.2f} (₹{upnl*USD_INR:+,.0f})</span></div><div style="font-size:0.74rem;color:#94a3b8;margin-top:5px;">Entry: <b>{_fmt_p(float(tr["entry_price"]))}</b> | SL: <b style="color:#ef4444;">{_fmt_p(float(tr["stop_price"]))}</b> | TP1 (1.25R): <b style="color:#10b981;">{_fmt_p(float(tr["tp1_price"]))}</b> | TP2 (2.30R): <b style="color:#10b981;">{_fmt_p(float(tr["tp2_price"]))}</b></div></div>', unsafe_allow_html=True)
     else:
-        st.caption(f"No open positions — Background Radar sweeping 120+ Delta assets ({len(markets)} deep-scanned) & auto-promoting top movers above.")
+        st.caption(f"No regular open positions — Background Radar sweeping 120+ Delta assets ({len(markets)} deep-scanned) & auto-promoting top movers above.")
 
-    tab1, tab2, tab3 = st.tabs(["📜 Execution Log (With Brokerage)", "📈 Equity Curve", "📊 Strategy & Risk Specs"])
+    tab1, tab2, tab3, tab4 = st.tabs(["⚡ Event Signal Log", "📜 All Execution Log", "📈 Equity Curve", "📊 Strategy & Risk Specs"])
     with tab1:
+        if event_history:
+            df_ev = pd.DataFrame([{
+                "Time (UTC)": str(t.get("opened_at_utc", ""))[11:19], "Asset": str(t.get("symbol", "")).replace("USDT", ""),
+                "Side": t.get("direction"), "Event Setup": t.get("setup_name"), "Entry": _fmt_p(float(t.get("entry_price") or 0)),
+                "SL": _fmt_p(float(t.get("stop_price") or 0)), "TP1 (1.5R)": _fmt_p(float(t.get("tp1_price") or 0)),
+                "Status": t.get("close_reason") or ("TP1_BOOKED_RUNNING" if t.get("tp1_done") else "ACTIVE"),
+                "Fee ($)": f"-${float(t.get('total_fee_usd') or 0.0):.2f}", "Net PnL ($)": f"${float(t.get('realized_pnl_usd') or 0.0):+.2f}",
+            } for t in event_history])
+            st.dataframe(df_ev, use_container_width=True, hide_index=True)
+        else:
+            st.caption("Abhi tak koi Event Level Signal trade record nahi hua hai. Jaise hi 4H/1H Event Signal aayega, uska pura history log yahan dikhega.")
+    with tab2:
         if vault_trades:
             df_log = pd.DataFrame([{
                 "Time (UTC)": str(t.get("opened_at_utc", ""))[11:19], "Asset": str(t.get("symbol", "")).replace("USDT", ""),
@@ -373,13 +443,13 @@ def _render_dashboard_body():
             st.dataframe(df_log, use_container_width=True, hide_index=True)
         else:
             st.caption("No historical trades recorded yet.")
-    with tab2:
+    with tab3:
         if len(eq_curve) > 1:
             st.line_chart(pd.DataFrame(eq_curve).set_index("trade")[["equity"]], height=210)
         else:
             st.caption("Equity curve will render automatically after the first closed trade.")
-    with tab3:
-        st.markdown(f"- **Dynamic Spotlight Radar:** Sweeps 120+ Delta perpetuals in background, displays only the **Top 8 Active Movers & Open Trades**, and automatically rotates out closed trades for fresh movers\n- **Proportional Capital Scaling:** Base `₹5,000 ($58)` scales lot sizes & profit targets automatically whenever you add `₹5,000 (+$58)` (`{c_mult:.2f}x` active multiplier)\n- **Fast Realized Profit Lock:** `+0.75R` slashes risk in half | `TP1 (+1.25R)` books `50%` & locks `50%` risk-free at BE+fees | `+1.75R` trails SL to `+0.90R` | `TP2 (+2.30R)` books `30%` & trails SL to `+1.45R` | `TP3 (+3.50R)` rides `20%` runner")
+    with tab4:
+        st.markdown(f"- **Event Level Reversal (Score 99.8):** Detects major `4H / 1H` liquidity sweeps with real institutional taker volume reversal (`TP1 +1.50R`, `TP2 +2.80R`, `Runner +4.50R`) — displayed in the dedicated Event Signal Desk above\n- **Operator Panic Point (Score 99.5):** Enters only when opposite party SL is still intact (unswept) with institutional taker orderflow\n- **Proportional Capital Scaling:** Base `₹5,000 ($58)` scales lot sizes & profit targets automatically whenever you add `₹5,000 (+$58)` (`{c_mult:.2f}x` active multiplier) with **70% Profit Withdrawal Wall**\n- **Fast Realized Profit Lock (Regular):** `+0.75R` slashes risk in half | `TP1 (+1.25R)` books `50%` & locks `50%` risk-free at BE+fees | `TP2 (+2.30R)` books `30%` & trails SL to `+1.45R` | `TP3 (+3.50R)` rides `20%` runner")
 
 def main() -> None:
     if hasattr(st, "fragment"):
