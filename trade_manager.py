@@ -163,9 +163,9 @@ def _check_cooldown_and_circuit_breakers(conn, symbol: str = None) -> tuple:
             pass
     return True, "OK"
 
-def calculate_small_cap_delta_size(equity_usd: float, entry: float, sl: float, symbol: str = "BTCUSDT", score: float = 95.0, profit_lock_mode: bool = False) -> tuple:
+def calculate_small_cap_delta_size(equity_usd: float, entry: float, sl: float, symbol: str = "BTCUSDT", score: float = 95.0, profit_lock_mode: bool = False, is_event: bool = False) -> tuple:
     """
-    Stronger Uniform USD Risk Sizing ($2.30-$2.90 on $58) for $10/day target:
+    Uniform USD Risk Sizing ($2.30-$2.90 on $58 for trend setups, $1.75 controlled risk for Event Reversals):
     - Scales proportionally with equity & added capital
     - Automatically halves risk in Profit-Lock Mode once Daily +$10 target is achieved!
     """
@@ -175,11 +175,14 @@ def calculate_small_cap_delta_size(equity_usd: float, entry: float, sl: float, s
     params = config.get_asset_params(symbol, entry)
     lot_size = float(params["lot_size"])
     capital_mult = max(0.75, equity_usd / 58.0)
-    risk_pct = float(getattr(config, "A_PLUS_RISK_PCT", 0.050)) if score >= 97.5 else float(getattr(config, "RISK_PCT", 0.040))
+    if is_event:
+        risk_pct = 0.030
+    else:
+        risk_pct = float(getattr(config, "A_PLUS_RISK_PCT", 0.050)) if score >= 97.5 else float(getattr(config, "RISK_PCT", 0.040))
     if profit_lock_mode:
         risk_pct *= 0.50
-    min_r = float(config.MIN_RISK_USD) * capital_mult * (0.50 if profit_lock_mode else 1.0)
-    max_r = float(config.MAX_RISK_USD) * capital_mult * (0.50 if profit_lock_mode else 1.0)
+    min_r = float(config.MIN_RISK_USD) * capital_mult * (0.50 if profit_lock_mode else (0.75 if is_event else 1.0))
+    max_r = float(config.MAX_RISK_USD) * capital_mult * (0.50 if profit_lock_mode else (0.65 if is_event else 1.0))
     target_risk = max(min_r, min(max_r, equity_usd * risk_pct))
 
     # BROKERAGE FEE-GUARD: Never allow round-trip Delta fee+GST to exceed 15% of trade risk!
@@ -240,7 +243,8 @@ def open_paper_trade(signal: dict, fencing_token: int):
         if profit_lock_mode and float(signal.get("score") or 0.0) < 98.0:
             return
 
-        qty, lots, risk_usd = calculate_small_cap_delta_size(equity, entry, sl, sym, float(signal.get("score") or 95.0), profit_lock_mode)
+        is_ev = "Event Level" in str(signal.get("setup_name") or "")
+        qty, lots, risk_usd = calculate_small_cap_delta_size(equity, entry, sl, sym, float(signal.get("score") or 95.0), profit_lock_mode, is_event=is_ev)
         if qty <= 0 or lots <= 0:
             return
         params = config.get_asset_params(sym, entry)
@@ -252,7 +256,6 @@ def open_paper_trade(signal: dict, fencing_token: int):
         )
         conn.commit()
         if hasattr(notifications, "enqueue_telegram"):
-            is_ev = "Event Level" in str(signal.get("setup_name") or "")
             tp_lbl = ("1.50R", "2.80R", "4.50R") if is_ev else ("1.25R", "2.30R", "3.50R")
             mode_tag = " [PROFIT-LOCK 50% RISK]" if profit_lock_mode else ""
             ev_icon = "⚡" if is_ev else "🚀"
