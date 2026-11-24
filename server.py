@@ -111,8 +111,8 @@ def _enrich_remote_payload(data: Dict[str, Any]) -> Dict[str, Any]:
     if "compounding" not in data:
         net_pnl = float(data.get("realized_pnl_usd") or 0.0)
         tot_fee = round(sum(float(t.get("total_fee_usd") or 0.0) for t in vault), 2)
-        w_usd = round(max(0.0, net_pnl * 0.30), 2)
-        r_usd = round(net_pnl * 0.70 if net_pnl > 0 else net_pnl, 2)
+        w_usd = round(max(0.0, net_pnl * 0.70), 2)
+        r_usd = round(net_pnl * 0.30 if net_pnl > 0 else net_pnl, 2)
         act_eq = round(max(6.0, float(config.START_EQUITY) + r_usd), 2)
         data["compounding"] = {
             "base_capital_usd": float(config.START_EQUITY),
@@ -309,14 +309,14 @@ def _render_dashboard_body():
     c_15d = float(comp.get("cycle_15d_net_pnl_usd", realized_pnl))
     c_gross = float(comp.get("total_gross_pnl_usd", realized_pnl))
     c_fees = float(comp.get("total_brokerage_usd", 0.0))
-    c_with = float(comp.get("withdrawable_usd", max(0.0, realized_pnl * 0.30)))
+    c_with = float(comp.get("withdrawable_usd", max(0.0, realized_pnl * 0.70)))
     c_act_eq = float(comp.get("active_trading_equity_usd", bal_usd))
     c_mult = float(comp.get("lot_multiplier", 1.0))
     c_stat = comp.get("scaling_status", "BASE LOT SIZE")
     c_clr = "#10b981" if c_15d >= 0 else "#ef4444"
 
     st.markdown('<div class="sec-title">🏛️ 15-Day Compounding, Lot Scaling & Withdrawal Vault</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="kpi-grid"><div class="kpi-box"><div class="kpi-title">15-DAY NET PNL (AFTER FEES)</div><div class="kpi-val" style="color:{c_clr};">${c_15d:+.2f}</div><div class="kpi-sub">₹{c_15d*USD_INR:+,.0f} • Gross: ${c_gross:+.2f}</div></div><div class="kpi-box"><div class="kpi-title">FREE FOR WITHDRAWAL (30%)</div><div class="kpi-val" style="color:#10b981;">${c_with:.2f}</div><div class="kpi-sub">₹{c_with*USD_INR:,.0f} Safe to Withdraw</div></div><div class="kpi-box"><div class="kpi-title">COMPOUNDED TRADING CAP (70%)</div><div class="kpi-val">${c_act_eq:.2f}</div><div class="kpi-sub">Lot Scale: {c_mult:.2f}x ({c_stat})</div></div><div class="kpi-box"><div class="kpi-title">TOTAL BROKERAGE DEDUCTED</div><div class="kpi-val" style="color:#f59e0b;">-${c_fees:.2f}</div><div class="kpi-sub">-₹{c_fees*USD_INR:,.0f} (Delta Fee + GST Deducted)</div></div></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="kpi-grid"><div class="kpi-box"><div class="kpi-title">15-DAY NET PNL (AFTER FEES)</div><div class="kpi-val" style="color:{c_clr};">${c_15d:+.2f}</div><div class="kpi-sub">₹{c_15d*USD_INR:+,.0f} • Gross: ${c_gross:+.2f}</div></div><div class="kpi-box"><div class="kpi-title">FREE FOR WITHDRAWAL (70%)</div><div class="kpi-val" style="color:#10b981;">${c_with:.2f}</div><div class="kpi-sub">₹{c_with*USD_INR:,.0f} Safe to Withdraw</div></div><div class="kpi-box"><div class="kpi-title">COMPOUNDED TRADING CAP (30%)</div><div class="kpi-val">${c_act_eq:.2f}</div><div class="kpi-sub">Lot Scale: {c_mult:.2f}x ({c_stat})</div></div><div class="kpi-box"><div class="kpi-title">TOTAL BROKERAGE DEDUCTED</div><div class="kpi-val" style="color:#f59e0b;">-${c_fees:.2f}</div><div class="kpi-sub">-₹{c_fees*USD_INR:,.0f} (Delta Fee + GST Deducted)</div></div></div>', unsafe_allow_html=True)
 
     dead_ok = "BLOCKED" if payload.get("is_dead_hour") else "ACTIVE"
     news_ok = "BLACKOUT" if payload.get("news_blackout") else "CLEAR"
