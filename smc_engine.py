@@ -5,8 +5,15 @@ log = logging.getLogger("SMCEngine")
 
 def _parse_candle(c):
     if isinstance(c, dict):
-        return float(c.get("open", 0.0)), float(c.get("high", 0.0)), float(c.get("low", 0.0)), float(c.get("close", 0.0)), float(c.get("vol", 1.0)), int(c.get("time", 0))
-    return float(c[1]), float(c[2]), float(c[3]), float(c[4]), (float(c[5]) if len(c) > 5 else 1.0), (int(c[0]) if len(c) > 0 else 0)
+        v = float(c.get("vol", 1.0))
+        bv = c.get("buy_vol")
+        if bv is None:
+            rng = max(1e-6, float(c.get("high", 0.0)) - float(c.get("low", 0.0)))
+            bv = v * ((float(c.get("close", 0.0)) - float(c.get("low", 0.0))) / rng)
+        return float(c.get("open", 0.0)), float(c.get("high", 0.0)), float(c.get("low", 0.0)), float(c.get("close", 0.0)), v, int(c.get("time", 0)), float(bv)
+    v = float(c[5]) if len(c) > 5 else 1.0
+    bv = float(c[9]) if len(c) > 9 else (v * 0.5)
+    return float(c[1]), float(c[2]), float(c[3]), float(c[4]), v, (int(c[0]) if len(c) > 0 else 0), bv
 
 def _calc_ema(values: list, period: int) -> float:
     if not values:
@@ -99,6 +106,45 @@ def _detect_fvg_and_displacement(closed_15: list, atr: float, min_gap: float) ->
     if lb[3] < lb[0] and abs(lb[3] - lb[0]) >= (atr * 0.55):
         bear_fvg = True
     return bull_fvg, bear_fvg
+
+def _detect_panic_point_setup(closed_15: list, atr: float) -> tuple:
+    if len(closed_15) < 28 or atr <= 0:
+        return None, None, None
+    win = closed_15[-36:]
+    highs = [x[1] for x in win]
+    lows = [x[2] for x in win]
+    cur = win[-1]
+    cl = cur[3]
+
+    hi_idx = max(range(4, len(win) - 4), key=lambda i: highs[i])
+    imp_high = highs[hi_idx]
+    base_low = min(lows[:hi_idx])
+    imp_size = imp_high - base_low
+    if imp_size >= atr * 2.2:
+        after_hi = win[hi_idx + 1:]
+        if max(x[1] for x in after_hi) <= imp_high + atr * 0.05:
+            pp_low = min(x[2] for x in after_hi)
+            retrace_pct = (imp_high - pp_low) / max(1e-9, imp_size)
+            if 0.35 <= retrace_pct <= 0.80:
+                recent_low = min(x[2] for x in win[-4:])
+                if (recent_low <= pp_low + atr * 0.25) and (cl > pp_low + atr * 0.15) and ((imp_high - cl) >= atr * 1.40):
+                    return "LONG", recent_low, imp_high
+
+    lo_idx = min(range(4, len(win) - 4), key=lambda i: lows[i])
+    imp_low = lows[lo_idx]
+    base_high = max(highs[:lo_idx])
+    imp_size = base_high - imp_low
+    if imp_size >= atr * 2.2:
+        after_lo = win[lo_idx + 1:]
+        if min(x[2] for x in after_lo) >= imp_low - atr * 0.05:
+            pp_high = max(x[1] for x in after_lo)
+            retrace_pct = (pp_high - imp_low) / max(1e-9, imp_size)
+            if 0.35 <= retrace_pct <= 0.80:
+                recent_high = max(x[1] for x in win[-4:])
+                if (recent_high >= pp_high - atr * 0.25) and (cl < pp_high - atr * 0.15) and ((cl - imp_low) >= atr * 1.40):
+                    return "SHORT", recent_high, imp_low
+
+    return None, None, None
 
 def get_structure(market_dict: dict, symbol: str = "BTCUSDT") -> dict:
     klines = market_dict.get("klines", {})
@@ -244,6 +290,7 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
     cvd_ratio = structure.get("cvd_ratio", 0.50)
 
     parsed = [_parse_candle(c) for c in candles_15m]
+    closed_15 = parsed[:-1]
     c, prev = parsed[-2], parsed[-3]
     o, h, l, cl, vol, c_time = c[0], c[1], c[2], c[3], c[4], c[5]
     prev_o, prev_h, prev_l, prev_cl = prev[0], prev[1], prev[2], prev[3]
@@ -271,8 +318,16 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
     rel_pos = (cl - range_floor) / max(atr * 2.0, range_ceil - range_floor)
     in_discount, in_premium = rel_pos < 0.50, rel_pos > 0.50
 
-    allow_long_cvd = (cvd_ratio >= 0.53) if getattr(config, "ENABLE_CVD_FILTER", True) else True
-    allow_short_cvd = (cvd_ratio <= 0.47) if getattr(config, "ENABLE_CVD_FILTER", True) else True
+    already_swept_high_trap = bool(pdh and highest_recent >= pdh and cl < pdh - atr * 0.10)
+    already_swept_low_trap = bool(pdl and lowest_recent <= pdl and cl > pdl + atr * 0.10)
+
+    c_buy_pct = (c[6] / max(1e-6, vol)) if vol > 0 else 0.50
+    prev_buy_pct = (prev[6] / max(1e-6, prev[4])) if prev[4] > 0 else 0.50
+    inst_vol_surge = vol >= (vol_sma20 * 1.20)
+    inst_buyers_active = (c_buy_pct >= 0.56) and (cvd_ratio >= 0.54) and (inst_vol_surge or prev_buy_pct >= 0.54)
+    inst_sellers_active = (c_buy_pct <= 0.44) and (cvd_ratio <= 0.46) and (inst_vol_surge or prev_buy_pct <= 0.46)
+    allow_long_cvd = inst_buyers_active if getattr(config, "ENABLE_CVD_FILTER", True) else True
+    allow_short_cvd = inst_sellers_active if getattr(config, "ENABLE_CVD_FILTER", True) else True
 
     not_chased_long = (cl - ema20) <= (atr * 1.65)
     not_chased_short = (ema20 - cl) <= (atr * 1.65)
@@ -286,8 +341,8 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
     short_bias_ok = (macro_bias == "BEARISH") or (macro_bias == "NEUTRAL" and short_shift_ok)
 
     three_bar_run = abs(cl - parsed[-4][0]) if len(parsed) >= 5 else 0.0
-    long_htf_ok = live_long_ok and ((htf_4h_bias != "BEARISH") or long_shift_ok) and (htf_1h_bias != "BEARISH") and _btc_leader_allows(symbol, "LONG") and (38.0 <= rsi <= 70.0) and not_chased_long and not (cl > parsed[-4][0] and three_bar_run > atr * 2.1)
-    short_htf_ok = live_short_ok and ((htf_4h_bias != "BULLISH") or short_shift_ok) and (htf_1h_bias != "BULLISH") and _btc_leader_allows(symbol, "SHORT") and (30.0 <= rsi <= 62.0) and not_chased_short and not (cl < parsed[-4][0] and three_bar_run > atr * 2.1)
+    long_htf_ok = live_long_ok and (not already_swept_high_trap) and ((htf_4h_bias != "BEARISH") or long_shift_ok) and (htf_1h_bias != "BEARISH") and _btc_leader_allows(symbol, "LONG") and (38.0 <= rsi <= 70.0) and not_chased_long and not (cl > parsed[-4][0] and three_bar_run > atr * 2.1)
+    short_htf_ok = live_short_ok and (not already_swept_low_trap) and ((htf_4h_bias != "BULLISH") or short_shift_ok) and (htf_1h_bias != "BULLISH") and _btc_leader_allows(symbol, "SHORT") and (30.0 <= rsi <= 62.0) and not_chased_short and not (cl < parsed[-4][0] and three_bar_run > atr * 2.1)
 
     long_room_ok = (range_ceil - cl) >= (atr * 1.45)
     short_room_ok = (cl - range_floor) >= (atr * 1.45)
@@ -299,6 +354,13 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
     touched_bull_ob = bool(bull_ob and (l <= bull_ob[1] + atr * 0.15) and (cl >= bull_ob[0]))
     touched_bear_ob = bool(bear_ob and (h >= bear_ob[0] - atr * 0.15) and (cl <= bear_ob[1]))
     min_adx = 20.0
+
+    # STRATEGY 0 (TOP PRIORITY — SCORE 99.5): OPERATOR PANIC POINT + UNSWEPT OTHER-PARTY LIQUIDITY
+    pp_dir, pp_sl, _ = _detect_panic_point_setup(closed_15, atr)
+    if pp_dir == "LONG" and (not is_choppy) and (adx >= min_adx) and long_bias_ok and long_htf_ok and bull_confirm and allow_long_cvd and funding <= max_long_f:
+        return _build_trade_levels("LONG", current_price or cl, pp_sl, atr, "Operator Panic Point (Unswept High)", 99.5, c_time, symbol)
+    if pp_dir == "SHORT" and (not is_choppy) and (adx >= min_adx) and short_bias_ok and short_htf_ok and bear_confirm and allow_short_cvd and funding >= min_short_f:
+        return _build_trade_levels("SHORT", current_price or cl, pp_sl, atr, "Operator Panic Point (Unswept Low)", 99.5, c_time, symbol)
 
     # STRATEGY 1: PDH/PDL & ASIAN LIQUIDITY SWEEP REVERSAL
     d_low = pdl or day_low_24h or structure.get("asian_low")
