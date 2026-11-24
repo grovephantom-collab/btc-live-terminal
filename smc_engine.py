@@ -109,18 +109,19 @@ def _detect_fvg_and_displacement(closed_15: list, atr: float, min_gap: float) ->
 
 def _detect_event_level_signal(structure: dict, closed_15: list, atr: float) -> tuple:
     """
-    Gautam Jha Masterclass 1.0 — Event Level Trade / Major Reversal Signal:
-    - Marks established Big Timeframe (4H & 1H) Major Liquidity Highs/Lows.
-    - Detects when 15m price sweeps/hunts that 4H or 1H level and closes back inside
-      with strong institutional reversal protection (green close above swept low / red close below swept high).
-    - Counter-trend allowed ONLY at Event Levels (per Masterclass 1.0 rule).
+    Gautam Jha Masterclass 1.0 — Strict 4H Event Level Reversal Signal (Zero Falling-Knife):
+    1. ONLY major established 4H Liquidity High/Low (no noisy 1H levels that break during selloffs).
+    2. Price sweeps/hunts that 4H level in the last 4 bars and closes back inside.
+    3. STRICT Buyer/Seller Takeover (Candle High/Low Break):
+       - LONG: Strong green candle closing ABOVE previous candle's HIGH (cl > prev_h) & above 4H low.
+       - SHORT: Strong red candle closing BELOW previous candle's LOW (cl < prev_l) & below 4H high.
     Returns (direction, raw_sl, tf_label, swept_level) or (None, None, None, None).
     """
     if len(closed_15) < 6 or atr <= 0:
         return None, None, None, None
     c, prev = closed_15[-1], closed_15[-2]
     o, h, l, cl = c[0], c[1], c[2], c[3]
-    prev_cl = prev[3]
+    prev_h, prev_l = prev[1], prev[2]
     rng = max(1e-6, h - l)
     body_ratio = abs(cl - o) / rng
     lower_wick_ratio = (min(o, cl) - l) / rng
@@ -129,22 +130,20 @@ def _detect_event_level_signal(structure: dict, closed_15: list, atr: float) -> 
     sweep_low = min(x[2] for x in closed_15[-4:])
     sweep_high = max(x[1] for x in closed_15[-4:])
 
-    # Check 4H Event Level first (strongest), then 1H Event Level
-    levels = [
-        ("4H", structure.get("event_4h_high"), structure.get("event_4h_low")),
-        ("1H", structure.get("event_1h_high"), structure.get("event_1h_low")),
-    ]
-    for tf_label, lvl_high, lvl_low in levels:
-        # BULLISH EVENT REVERSAL: Swept 4H/1H Major Low -> Closed back above with green buyer protection
-        if lvl_low and lvl_low > 0:
-            if (sweep_low <= lvl_low + atr * 0.08) and (cl > lvl_low) and (cl > o) and (cl > prev_cl):
-                if (lower_wick_ratio >= 0.25 or body_ratio >= 0.45) and (upper_wick_ratio <= 0.30):
-                    return "LONG", sweep_low, tf_label, lvl_low
-        # BEARISH EVENT REVERSAL: Swept 4H/1H Major High -> Closed back below with red seller rejection
-        if lvl_high and lvl_high > 0:
-            if (sweep_high >= lvl_high - atr * 0.08) and (cl < lvl_high) and (cl < o) and (cl < prev_cl):
-                if (upper_wick_ratio >= 0.25 or body_ratio >= 0.45) and (lower_wick_ratio <= 0.30):
-                    return "SHORT", sweep_high, tf_label, lvl_high
+    lvl_high = structure.get("event_4h_high")
+    lvl_low = structure.get("event_4h_low")
+
+    # BULLISH 4H EVENT REVERSAL: Swept 4H Major Low -> Real Buyer Takeover (cl > prev_h & strong green close above 4H low)
+    if lvl_low and lvl_low > 0:
+        if (sweep_low <= lvl_low + atr * 0.05) and (cl > lvl_low) and (cl > o) and (cl > prev_h):
+            if (body_ratio >= 0.45) and (upper_wick_ratio <= 0.25):
+                return "LONG", sweep_low, "4H", lvl_low
+
+    # BEARISH 4H EVENT REVERSAL: Swept 4H Major High -> Real Seller Takeover (cl < prev_l & strong red close below 4H high)
+    if lvl_high and lvl_high > 0:
+        if (sweep_high >= lvl_high - atr * 0.05) and (cl < lvl_high) and (cl < o) and (cl < prev_l):
+            if (body_ratio >= 0.45) and (lower_wick_ratio <= 0.25):
+                return "SHORT", sweep_high, "4H", lvl_high
 
     return None, None, None, None
 
@@ -172,13 +171,11 @@ def _detect_panic_point_setup(closed_15: list, atr: float) -> tuple:
     imp_size = imp_high - base_low
     if imp_size >= atr * 2.2:
         after_hi = win[hi_idx + 1:]
-        # Rule 3: Sellers' SL above imp_high must NOT be hit yet!
         if max(x[1] for x in after_hi) <= imp_high + atr * 0.05:
             pp_low = min(x[2] for x in after_hi)
             retrace_pct = (imp_high - pp_low) / max(1e-9, imp_size)
             if 0.35 <= retrace_pct <= 0.80:
                 recent_low = min(x[2] for x in win[-4:])
-                # Rule 4: Price just tested PP and closed above it with headroom to intact high
                 if (recent_low <= pp_low + atr * 0.25) and (cl > pp_low + atr * 0.15) and ((imp_high - cl) >= atr * 1.40):
                     return "LONG", recent_low, imp_high
 
@@ -189,13 +186,11 @@ def _detect_panic_point_setup(closed_15: list, atr: float) -> tuple:
     imp_size = base_high - imp_low
     if imp_size >= atr * 2.2:
         after_lo = win[lo_idx + 1:]
-        # Rule 3: Buyers' SL below imp_low must NOT be hit yet!
         if min(x[2] for x in after_lo) >= imp_low - atr * 0.05:
             pp_high = max(x[1] for x in after_lo)
             retrace_pct = (pp_high - imp_low) / max(1e-9, imp_size)
             if 0.35 <= retrace_pct <= 0.80:
                 recent_high = max(x[1] for x in win[-4:])
-                # Rule 4: Price just tested PP and closed below it with headroom to intact low
                 if (recent_high >= pp_high - atr * 0.25) and (cl < pp_high - atr * 0.15) and ((cl - imp_low) >= atr * 1.40):
                     return "SHORT", recent_high, imp_low
 
@@ -252,7 +247,6 @@ def get_structure(market_dict: dict, symbol: str = "BTCUSDT") -> dict:
         elif c1h[-1] <= e20_1h and e50_1h <= e200_1h * 1.004:
             bear_score += 1
             htf_1h_bias = "BEARISH"
-        # Established 1H Major Event Liquidity High/Low (last 48h excluding most recent 3 bars)
         if len(p1h) >= 12:
             ev1_win = p1h[-51:-3] if len(p1h) >= 51 else p1h[:-3]
             if ev1_win:
@@ -321,9 +315,9 @@ def _btc_leader_allows(symbol: str, direction: str) -> bool:
         if not btc_m or not btc_m.get("klines"):
             return True
         btc_cvd, btc_p, btc_open = float(btc_m.get("cvd_ratio") or 0.50), float(btc_m.get("price") or 0.0), float(btc_m.get("daily_open") or 0.0)
-        if direction == "LONG" and btc_cvd < 0.44 and btc_open > 0 and btc_p < btc_open:
+        if direction == "LONG" and btc_cvd < 0.46 and btc_open > 0 and btc_p < btc_open:
             return False
-        if direction == "SHORT" and btc_cvd > 0.56 and btc_open > 0 and btc_p > btc_open:
+        if direction == "SHORT" and btc_cvd > 0.54 and btc_open > 0 and btc_p > btc_open:
             return False
     except Exception:
         pass
@@ -430,14 +424,16 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
     touched_bear_ob = bool(bear_ob and (h >= bear_ob[0] - atr * 0.15) and (cl <= bear_ob[1]))
     min_adx = 20.0
 
-    # STRATEGY 00 (TOP PRIORITY — SCORE 99.8): GAUTAM JHA EVENT LEVEL REVERSAL (4H/1H LIQUIDITY SWEEP)
-    # Per Masterclass 1.0: Counter-trend reversals are allowed ONLY at major 4H/1H Event Levels with institutional taker volume!
+    # STRATEGY 00 (TOP PRIORITY — SCORE 99.8): GAUTAM JHA 4H EVENT LEVEL REVERSAL (STRICT INSTITUTIONAL TAKEOVER)
+    # Anti-Falling-Knife Guards: 4H level ONLY + Real Candle High/Low Break + Strict Taker CVD (>=53% / <=47%) + BTC Leader OK + No Crash Knife-Catching!
     ev_dir, ev_sl, ev_tf, _ = _detect_event_level_signal(structure, closed_15, atr)
-    ev_buyers_ok = (c_buy_pct >= 0.55) and (inst_vol_surge or prev_buy_pct >= 0.52 or cvd_ratio >= 0.50)
-    ev_sellers_ok = (c_buy_pct <= 0.45) and (inst_vol_surge or prev_buy_pct <= 0.48 or cvd_ratio <= 0.50)
-    if ev_dir == "LONG" and live_long_ok and ev_buyers_ok and (rsi <= 65.0) and funding <= max_long_f and not (cl > parsed[-4][0] and three_bar_run > atr * 2.5):
+    strong_bear_crash = (htf_4h_bias == "BEARISH" and htf_1h_bias == "BEARISH" and adx >= 26.0)
+    strong_bull_pump = (htf_4h_bias == "BULLISH" and htf_1h_bias == "BULLISH" and adx >= 26.0)
+    ev_buyers_ok = (c_buy_pct >= 0.58) and (cvd_ratio >= 0.53) and vol_spike_ok
+    ev_sellers_ok = (c_buy_pct <= 0.42) and (cvd_ratio <= 0.47) and vol_spike_ok
+    if ev_dir == "LONG" and live_long_ok and (not strong_bear_crash) and _btc_leader_allows(symbol, "LONG") and ev_buyers_ok and (rsi <= 62.0) and funding <= max_long_f and not (cl > parsed[-4][0] and three_bar_run > atr * 2.5):
         return _build_trade_levels("LONG", current_price or cl, ev_sl, atr, f"Event Level Reversal ({ev_tf} Liquidity)", 99.8, c_time, symbol, tp_mults=(1.50, 2.80, 4.50))
-    if ev_dir == "SHORT" and live_short_ok and ev_sellers_ok and (rsi >= 35.0) and funding >= min_short_f and not (cl < parsed[-4][0] and three_bar_run > atr * 2.5):
+    if ev_dir == "SHORT" and live_short_ok and (not strong_bull_pump) and _btc_leader_allows(symbol, "SHORT") and ev_sellers_ok and (rsi >= 38.0) and funding >= min_short_f and not (cl < parsed[-4][0] and three_bar_run > atr * 2.5):
         return _build_trade_levels("SHORT", current_price or cl, ev_sl, atr, f"Event Level Reversal ({ev_tf} Liquidity)", 99.8, c_time, symbol, tp_mults=(1.50, 2.80, 4.50))
 
     # STRATEGY 0 (SCORE 99.5): GAUTAM JHA PANIC POINT + UNSWEPT OTHER-PARTY LIQUIDITY
@@ -498,9 +494,9 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
     # STRATEGY 6: STRONG MOMENTUM VWAP + CVD TREND CONTINUATION
     if not is_choppy and adx >= 24.0:
         ec = current_price or cl
-        if long_bias_ok and long_htf_ok and long_room_ok and vwap_long_ok and (ema9 > ema20 > ema50) and bull_confirm and (body_ratio >= 0.54) and (bull_fvg or vol_spike_ok) and (cvd_ratio >= 0.57) and funding <= max_long_f and (not in_premium):
+        if long_bias_ok and long_htf_ok and long_room_ok and vwap_long_ok and (ema9 > ema20 > ema50) and bull_confirm and allow_long_cvd and (body_ratio >= 0.54) and (bull_fvg or vol_spike_ok) and (cvd_ratio >= 0.57) and funding <= max_long_f and (not in_premium):
             return _build_trade_levels("LONG", ec, min(l, prev_l, ema20), atr, "Momentum VWAP + CVD Continuation", 95.5, c_time, symbol)
-        if short_bias_ok and short_htf_ok and short_room_ok and vwap_short_ok and (ema9 < ema20 < ema50) and bear_confirm and (body_ratio >= 0.54) and (bear_fvg or vol_spike_ok) and (cvd_ratio <= 0.43) and funding >= min_short_f and (not in_discount):
+        if short_bias_ok and short_htf_ok and short_room_ok and vwap_short_ok and (ema9 < ema20 < ema50) and bear_confirm and allow_short_cvd and (body_ratio >= 0.54) and (bear_fvg or vol_spike_ok) and (cvd_ratio <= 0.43) and funding >= min_short_f and (not in_discount):
             return _build_trade_levels("SHORT", ec, max(h, prev_h, ema20), atr, "Momentum VWAP + CVD Continuation", 95.5, c_time, symbol)
 
     return None
