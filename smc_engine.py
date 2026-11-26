@@ -108,15 +108,6 @@ def _detect_fvg_and_displacement(closed_15: list, atr: float, min_gap: float) ->
     return bull_fvg, bear_fvg
 
 def _detect_event_level_signal(structure: dict, closed_15: list, atr: float) -> tuple:
-    """
-    Gautam Jha Masterclass 1.0 — Strict 4H Event Level Reversal Signal (Zero Falling-Knife):
-    1. ONLY major established 4H Liquidity High/Low (no noisy 1H levels that break during selloffs).
-    2. Price sweeps/hunts that 4H level in the last 4 bars and closes back inside.
-    3. STRICT Buyer/Seller Takeover (Candle High/Low Break):
-       - LONG: Strong green candle closing ABOVE previous candle's HIGH (cl > prev_h) & above 4H low.
-       - SHORT: Strong red candle closing BELOW previous candle's LOW (cl < prev_l) & below 4H high.
-    Returns (direction, raw_sl, tf_label, swept_level) or (None, None, None, None).
-    """
     if len(closed_15) < 6 or atr <= 0:
         return None, None, None, None
     c, prev = closed_15[-1], closed_15[-2]
@@ -133,13 +124,11 @@ def _detect_event_level_signal(structure: dict, closed_15: list, atr: float) -> 
     lvl_high = structure.get("event_4h_high")
     lvl_low = structure.get("event_4h_low")
 
-    # BULLISH 4H EVENT REVERSAL: Swept 4H Major Low -> Real Buyer Takeover (cl > prev_h & strong green close above 4H low)
     if lvl_low and lvl_low > 0:
         if (sweep_low <= lvl_low + atr * 0.05) and (cl > lvl_low) and (cl > o) and (cl > prev_h):
             if (body_ratio >= 0.45) and (upper_wick_ratio <= 0.25):
                 return "LONG", sweep_low, "4H", lvl_low
 
-    # BEARISH 4H EVENT REVERSAL: Swept 4H Major High -> Real Seller Takeover (cl < prev_l & strong red close below 4H high)
     if lvl_high and lvl_high > 0:
         if (sweep_high >= lvl_high - atr * 0.05) and (cl < lvl_high) and (cl < o) and (cl < prev_l):
             if (body_ratio >= 0.45) and (lower_wick_ratio <= 0.25):
@@ -148,14 +137,6 @@ def _detect_event_level_signal(structure: dict, closed_15: list, atr: float) -> 
     return None, None, None, None
 
 def _detect_panic_point_setup(closed_15: list, atr: float) -> tuple:
-    """
-    Gautam Jha Masterclass 1.0 — 5-Rule Panic Point (PP) + Unswept Other-Party Liquidity Detector:
-    1. Strong prior impulse (>= 2.2x ATR) in last 36 bars
-    2. Clear retracement to Panic Point (35%–78% pullback)
-    3. CRITICAL: Opposite swing high/low NOT broken yet (Other Party's SL is STILL INTACT as target magnet!)
-    4. Recent bars test/sweep the Panic Point and close back with strong buyer/seller protection
-    Returns (direction, raw_sl, intact_target) or (None, None, None).
-    """
     if len(closed_15) < 28 or atr <= 0:
         return None, None, None
     win = closed_15[-36:]
@@ -164,7 +145,6 @@ def _detect_panic_point_setup(closed_15: list, atr: float) -> tuple:
     cur = win[-1]
     cl = cur[3]
 
-    # Check BULLISH Panic Point (Uptrend -> Retracement -> Unswept High -> Buyer Protection)
     hi_idx = max(range(4, len(win) - 4), key=lambda i: highs[i])
     imp_high = highs[hi_idx]
     base_low = min(lows[:hi_idx])
@@ -179,7 +159,6 @@ def _detect_panic_point_setup(closed_15: list, atr: float) -> tuple:
                 if (recent_low <= pp_low + atr * 0.25) and (cl > pp_low + atr * 0.15) and ((imp_high - cl) >= atr * 1.40):
                     return "LONG", recent_low, imp_high
 
-    # Check BEARISH Panic Point (Downtrend -> Retracement -> Unswept Low -> Seller Protection)
     lo_idx = min(range(4, len(win) - 4), key=lambda i: lows[i])
     imp_low = lows[lo_idx]
     base_high = max(highs[:lo_idx])
@@ -265,7 +244,6 @@ def get_structure(market_dict: dict, symbol: str = "BTCUSDT") -> dict:
         elif c4h[-1] < e50_4h and e50_4h <= e200_4h * 1.005:
             bear_score += 2
             htf_4h_bias = "BEARISH"
-        # Established 4H Major Event Liquidity High/Low (last ~6.5 days excluding most recent 2 bars)
         if len(p4h) >= 8:
             ev4_win = p4h[-42:-2] if len(p4h) >= 42 else p4h[:-2]
             if ev4_win:
@@ -323,16 +301,16 @@ def _btc_leader_allows(symbol: str, direction: str) -> bool:
         pass
     return True
 
-def _build_trade_levels(direction: str, entry: float, raw_sl: float, atr: float, setup_name: str, score: float, candle_time: int, symbol: str = "BTCUSDT", tp_mults: tuple = (1.25, 2.30, 3.50)) -> dict:
+def _build_trade_levels(direction: str, entry: float, raw_sl: float, atr: float, setup_name: str, score: float, candle_time: int, symbol: str = "BTCUSDT", tp_mults: tuple = (1.25, 2.30, 3.50), sl_atr_floor: float = 2.15) -> dict:
     params = config.get_asset_params(symbol, entry)
     dec = int(params.get("decimals", 2))
-    wick_pad = max(params["sl_buffer"], atr * 0.40)
+    wick_pad = max(params["sl_buffer"], atr * (0.35 if sl_atr_floor < 1.8 else 0.40))
     m1, m2, m3 = tp_mults
     if direction == "LONG":
-        sl_dist = max(params["min_stop"], min(params["max_stop"], max((entry - raw_sl) + wick_pad, atr * 1.85)))
+        sl_dist = max(params["min_stop"], min(params["max_stop"], max((entry - raw_sl) + wick_pad, atr * sl_atr_floor)))
         sl, tp1, tp2, tp3 = round(entry - sl_dist, dec), round(entry + sl_dist * m1, dec), round(entry + sl_dist * m2, dec), round(entry + sl_dist * m3, dec)
     else:
-        sl_dist = max(params["min_stop"], min(params["max_stop"], max((raw_sl - entry) + wick_pad, atr * 1.85)))
+        sl_dist = max(params["min_stop"], min(params["max_stop"], max((raw_sl - entry) + wick_pad, atr * sl_atr_floor)))
         sl, tp1, tp2, tp3 = round(entry + sl_dist, dec), round(entry - sl_dist * m1, dec), round(entry - sl_dist * m2, dec), round(entry - sl_dist * m3, dec)
     return {"symbol": symbol, "direction": direction, "setup_name": setup_name, "score": round(score, 1), "entry": round(entry, dec), "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3, "candle_time": candle_time}
 
@@ -342,6 +320,8 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
     if getattr(config, "FILTER_DEAD_HOURS", True) and structure.get("is_dead_hour", False):
         return None
     if getattr(config, "STRICT_KILLZONE_ONLY", False) and not structure.get("in_killzone", False):
+        return None
+    if any(g in symbol.upper() for g in ("PAXG", "XAU", "GOLD")) and not structure.get("in_killzone", False):
         return None
 
     params = config.get_asset_params(symbol, current_price or structure.get("current_close"))
@@ -385,11 +365,9 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
     rel_pos = (cl - range_floor) / max(atr * 2.0, range_ceil - range_floor)
     in_discount, in_premium = rel_pos < 0.50, rel_pos > 0.50
 
-    # GLOBAL TRAP FILTER (Masterclass 1.0 Rule 3): Never buy if price ALREADY swept PDH/swing high in last 6 bars and is falling back!
     already_swept_high_trap = bool(pdh and highest_recent >= pdh and cl < pdh - atr * 0.10)
     already_swept_low_trap = bool(pdl and lowest_recent <= pdl and cl > pdl + atr * 0.10)
 
-    # REAL INSTITUTIONAL BUYER/SELLER ORDERFLOW GATE (Binance Taker Buy/Sell Volume)
     c_buy_pct = (c[6] / max(1e-6, vol)) if vol > 0 else 0.50
     prev_buy_pct = (prev[6] / max(1e-6, prev[4])) if prev[4] > 0 else 0.50
     inst_vol_surge = vol >= (vol_sma20 * 1.20)
@@ -424,17 +402,16 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
     touched_bear_ob = bool(bear_ob and (h >= bear_ob[0] - atr * 0.15) and (cl <= bear_ob[1]))
     min_adx = 20.0
 
-    # STRATEGY 00 (TOP PRIORITY — SCORE 99.8): GAUTAM JHA 4H EVENT LEVEL REVERSAL (STRICT INSTITUTIONAL TAKEOVER)
-    # Anti-Falling-Knife Guards: 4H level ONLY + Real Candle High/Low Break + Strict Taker CVD (>=53% / <=47%) + BTC Leader OK + No Crash Knife-Catching!
+    # STRATEGY 00 (TOP PRIORITY — SCORE 99.8): GAUTAM JHA 4H EVENT LEVEL REVERSAL
     ev_dir, ev_sl, ev_tf, _ = _detect_event_level_signal(structure, closed_15, atr)
     strong_bear_crash = (htf_4h_bias == "BEARISH" and htf_1h_bias == "BEARISH" and adx >= 26.0)
     strong_bull_pump = (htf_4h_bias == "BULLISH" and htf_1h_bias == "BULLISH" and adx >= 26.0)
     ev_buyers_ok = (c_buy_pct >= 0.58) and (cvd_ratio >= 0.53) and vol_spike_ok
     ev_sellers_ok = (c_buy_pct <= 0.42) and (cvd_ratio <= 0.47) and vol_spike_ok
     if ev_dir == "LONG" and live_long_ok and (not strong_bear_crash) and _btc_leader_allows(symbol, "LONG") and ev_buyers_ok and (rsi <= 62.0) and funding <= max_long_f and not (cl > parsed[-4][0] and three_bar_run > atr * 2.5):
-        return _build_trade_levels("LONG", current_price or cl, ev_sl, atr, f"Event Level Reversal ({ev_tf} Liquidity)", 99.8, c_time, symbol, tp_mults=(1.50, 2.80, 4.50))
+        return _build_trade_levels("LONG", current_price or cl, ev_sl, atr, f"Event Level Reversal ({ev_tf} Liquidity)", 99.8, c_time, symbol, tp_mults=(2.00, 3.50, 5.50), sl_atr_floor=1.25)
     if ev_dir == "SHORT" and live_short_ok and (not strong_bull_pump) and _btc_leader_allows(symbol, "SHORT") and ev_sellers_ok and (rsi >= 38.0) and funding >= min_short_f and not (cl < parsed[-4][0] and three_bar_run > atr * 2.5):
-        return _build_trade_levels("SHORT", current_price or cl, ev_sl, atr, f"Event Level Reversal ({ev_tf} Liquidity)", 99.8, c_time, symbol, tp_mults=(1.50, 2.80, 4.50))
+        return _build_trade_levels("SHORT", current_price or cl, ev_sl, atr, f"Event Level Reversal ({ev_tf} Liquidity)", 99.8, c_time, symbol, tp_mults=(2.00, 3.50, 5.50), sl_atr_floor=1.25)
 
     # STRATEGY 0 (SCORE 99.5): GAUTAM JHA PANIC POINT + UNSWEPT OTHER-PARTY LIQUIDITY
     pp_dir, pp_sl, _ = _detect_panic_point_setup(closed_15, atr)
@@ -453,14 +430,15 @@ def evaluate_signal(structure: dict, candles_15m: list, current_price: float, se
         if (highest_recent >= d_high - atr * 0.08) and (cl < d_high) and bear_confirm and (upper_wick_ratio >= 0.30 or body_ratio >= 0.46):
             return _build_trade_levels("SHORT", current_price or cl, highest_recent, atr, "Sniper PDH/PDL Liquidity Sweep", 98.5, c_time, symbol)
 
-    # STRATEGY 2: CHoCH + FVG + VOLUME DISPLACEMENT BREAK
-    if getattr(config, "ENABLE_CHOCH_STRATEGY", True) and (not is_choppy) and (adx >= min_adx) and choch_status != "NONE" and choch_level:
-        if choch_status == "BEARISH_CHOCH" and short_bias_ok and short_htf_ok and short_room_ok and (not in_discount) and allow_short_cvd and funding >= min_short_f:
-            if bear_confirm and (cl < choch_level) and (vol_spike_ok or bear_fvg):
-                return _build_trade_levels("SHORT", current_price or cl, max(highest_recent, choch_level + atr * 0.25), atr, "Sniper CHoCH + FVG Breakdown", 99.0, c_time, symbol)
-        if choch_status == "BULLISH_CHOCH" and long_bias_ok and long_htf_ok and long_room_ok and (not in_premium) and allow_long_cvd and funding <= max_long_f:
-            if bull_confirm and (cl > choch_level) and (vol_spike_ok or bull_fvg):
-                return _build_trade_levels("LONG", current_price or cl, min(lowest_recent, choch_level - atr * 0.25), atr, "Sniper CHoCH + FVG Breakout", 99.0, c_time, symbol)
+    # STRATEGY 2: CHoCH + FVG + VOLUME DISPLACEMENT BREAK (Anti-Fakeout)
+    if getattr(config, "ENABLE_CHOCH_STRATEGY", True) and (not is_choppy) and (adx >= 24.0) and choch_status != "NONE" and choch_level:
+        strong_disp_vol = vol >= (vol_sma20 * 1.35)
+        if choch_status == "BEARISH_CHOCH" and short_bias_ok and short_htf_ok and short_room_ok and vwap_short_ok and (not in_discount) and allow_short_cvd and funding >= min_short_f:
+            if bear_confirm and (cl < choch_level) and ((choch_level - cl) <= atr * 0.55) and (body_ratio >= 0.52) and strong_disp_vol and bear_fvg:
+                return _build_trade_levels("SHORT", current_price or cl, max(highest_recent, choch_level + atr * 0.35), atr, "Sniper CHoCH + FVG Breakdown", 99.0, c_time, symbol)
+        if choch_status == "BULLISH_CHOCH" and long_bias_ok and long_htf_ok and long_room_ok and vwap_long_ok and (not in_premium) and allow_long_cvd and funding <= max_long_f:
+            if bull_confirm and (cl > choch_level) and ((cl - choch_level) <= atr * 0.55) and (body_ratio >= 0.52) and strong_disp_vol and bull_fvg:
+                return _build_trade_levels("LONG", current_price or cl, min(lowest_recent, choch_level - atr * 0.35), atr, "Sniper CHoCH + FVG Breakout", 99.0, c_time, symbol)
 
     # STRATEGY 3: DAILY EXPANSION BREAKOUT
     if getattr(config, "ENABLE_DAILY_BREAKOUT", True) and (not is_choppy) and (adx >= 21.0):
