@@ -339,13 +339,12 @@ def _render_dashboard_body():
     news_ok = "BLACKOUT" if payload.get("news_blackout") else "CLEAR"
     st.markdown(f'<div class="guard-grid"><div class="guard-box"><b>DAILY TRADES:</b> <span style="color:#f8fafc;">{day_trades} / {config.MAX_DAILY_TRADES}</span></div><div class="guard-box"><b>DAILY LOSS LIMIT:</b> <span style="color:#f8fafc;">${day_pnl:+.2f} / -${config.MAX_DAILY_LOSS * max(1.0, c_mult):.2f}</span></div><div class="guard-box"><b>ACTIVE LOT RISK:</b> <span style="color:#38bdf8;">{config.RISK_PCT*100:.1f}% (~${c_act_eq*config.RISK_PCT:.2f})</span></div><div class="guard-box"><b>LIQUIDITY / NEWS:</b> <span style="color:#10b981;">{dead_ok} / {news_ok}</span></div></div>', unsafe_allow_html=True)
 
-    # DEDICATED EVENT LEVEL SIGNAL DASHBOARD PANEL (4H / 1H MAJOR LIQUIDITY REVERSALS)
     ev_pnl_clr = "#10b981" if ev_pnl >= 0 else "#ef4444"
-    ev_status_txt = f"🔥 {len(event_active)} LIVE EVENT TRADE" if event_active else f"📡 WATCHING 4H/1H LEVELS • {len(event_history)} TOTAL"
+    ev_status_txt = f"🔥 {len(event_active)} LIVE EVENT TRADE" if event_active else f"📡 WATCHING 4H LEVELS • {len(event_history)} TOTAL"
     ev_html = (
         f'<div class="event-desk">'
         f'<div class="event-head">'
-        f'<span class="event-title">⚡ EVENT LEVEL SIGNAL DESK (4H / 1H MAJOR REVERSAL)</span>'
+        f'<span class="event-title">⚡ EVENT LEVEL SIGNAL DESK (4H MAJOR REVERSAL)</span>'
         f'<span class="event-badge">{ev_status_txt} | WR: {ev_wr:.0f}% | Net: <span style="color:{ev_pnl_clr};">${ev_pnl:+.2f}</span></span>'
         f'</div>'
     )
@@ -366,15 +365,15 @@ def _render_dashboard_body():
                 f'<div style="font-size:0.74rem;color:#cbd5e1;margin-top:6px;">'
                 f'Entry: <b>{_fmt_p(float(tr["entry_price"]))}</b> | '
                 f'SL: <b style="color:#ef4444;">{_fmt_p(float(tr["stop_price"]))}</b> | '
-                f'TP1 (1.50R): <b style="color:#10b981;">{_fmt_p(float(tr["tp1_price"]))}</b> | '
-                f'TP2 (2.80R): <b style="color:#10b981;">{_fmt_p(float(tr["tp2_price"]))}</b> | '
-                f'Runner (4.50R): <b style="color:#fbbf24;">{_fmt_p(float(tr["tp3_price"]))}</b>'
+                f'TP1 (2.00R): <b style="color:#10b981;">{_fmt_p(float(tr["tp1_price"]))}</b> | '
+                f'TP2 (3.50R): <b style="color:#10b981;">{_fmt_p(float(tr["tp2_price"]))}</b> | '
+                f'Runner (5.50R): <b style="color:#fbbf24;">{_fmt_p(float(tr["tp3_price"]))}</b>'
                 f'</div></div>'
             )
     else:
         ev_html += (
             f'<div class="event-empty">'
-            f'Abhi koi <b>Event Level Signal</b> active nahi hai — Engine <b>{len(markets)} institutional coins</b> par <b>4H &amp; 1H Major Liquidity Sweep Reversals</b> (Score 99.8 • 1.50R / 2.80R / 4.50R) scan kar raha hai. Jab bhi Event Signal trigger hoga, yahan live card dikhega.'
+            f'Abhi koi <b>Event Level Signal</b> active nahi hai — Engine <b>{len(markets)} institutional coins</b> par <b>4H Major Liquidity Sweep Reversals</b> (Score 99.8 • 2.00R / 3.50R / 5.50R) scan kar raha hai. Jab bhi Event Signal trigger hoga, yahan live card dikhega.'
             f'</div>'
         )
     ev_html += '</div>'
@@ -424,13 +423,13 @@ def _render_dashboard_body():
             df_ev = pd.DataFrame([{
                 "Time (UTC)": str(t.get("opened_at_utc", ""))[11:19], "Asset": str(t.get("symbol", "")).replace("USDT", ""),
                 "Side": t.get("direction"), "Event Setup": t.get("setup_name"), "Entry": _fmt_p(float(t.get("entry_price") or 0)),
-                "SL": _fmt_p(float(t.get("stop_price") or 0)), "TP1 (1.5R)": _fmt_p(float(t.get("tp1_price") or 0)),
+                "SL": _fmt_p(float(t.get("stop_price") or 0)), "TP1 (2.0R)": _fmt_p(float(t.get("tp1_price") or 0)),
                 "Status": t.get("close_reason") or ("TP1_BOOKED_RUNNING" if t.get("tp1_done") else "ACTIVE"),
                 "Fee ($)": f"-${float(t.get('total_fee_usd') or 0.0):.2f}", "Net PnL ($)": f"${float(t.get('realized_pnl_usd') or 0.0):+.2f}",
             } for t in event_history])
             st.dataframe(df_ev, use_container_width=True, hide_index=True)
         else:
-            st.caption("Abhi tak koi Event Level Signal trade record nahi hua hai. Jaise hi 4H/1H Event Signal aayega, uska pura history log yahan dikhega.")
+            st.caption("Abhi tak koi Event Level Signal trade record nahi hua hai. Jaise hi 4H Event Signal aayega, uska pura history log yahan dikhega.")
     with tab2:
         if vault_trades:
             df_log = pd.DataFrame([{
@@ -449,7 +448,7 @@ def _render_dashboard_body():
         else:
             st.caption("Equity curve will render automatically after the first closed trade.")
     with tab4:
-        st.markdown(f"- **Event Level Reversal (Score 99.8):** Detects major `4H / 1H` liquidity sweeps with real institutional taker volume reversal (`TP1 +1.50R`, `TP2 +2.80R`, `Runner +4.50R`) — displayed in the dedicated Event Signal Desk above\n- **Operator Panic Point (Score 99.5):** Enters only when opposite party SL is still intact (unswept) with institutional taker orderflow\n- **Proportional Capital Scaling:** Base `₹5,000 ($58)` scales lot sizes & profit targets automatically whenever you add `₹5,000 (+$58)` (`{c_mult:.2f}x` active multiplier) with **70% Profit Withdrawal Wall**\n- **Fast Realized Profit Lock (Regular):** `+0.75R` slashes risk in half | `TP1 (+1.25R)` books `50%` & locks `50%` risk-free at BE+fees | `TP2 (+2.30R)` books `30%` & trails SL to `+1.45R` | `TP3 (+3.50R)` rides `20%` runner")
+        st.markdown(f"- **Event Level Reversal (Score 99.8):** Detects major `4H` liquidity sweeps with real institutional taker volume reversal (`TP1 +2.00R (35%)`, `TP2 +3.50R (30%)`, `Runner +5.50R (35%)`) — displayed in the dedicated Event Signal Desk above\n- **Operator Panic Point (Score 99.5):** Enters only when opposite party SL is still intact (unswept) with institutional taker orderflow\n- **Proportional Capital Scaling:** Base `₹5,000 ($58)` scales lot sizes & profit targets automatically whenever you add `₹5,000 (+$58)` (`{c_mult:.2f}x` active multiplier) with **70% Profit Withdrawal Wall**\n- **Fast Realized Profit Lock (Regular):** `+0.60R` slashes risk in half | `+0.90R` locks Break-Even | `TP1 (+1.25R)` books `50%` | `TP2 (+2.30R)` books `30%` & trails SL to `+1.45R` | `TP3 (+3.50R)` rides `20%` runner")
 
 def main() -> None:
     if hasattr(st, "fragment"):
