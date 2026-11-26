@@ -22,13 +22,15 @@ _CORE_ANCHORS = [
     "FILUSDT", "ATOMUSDT", "HBARUSDT", "ICPUSDT", "UNIUSDT", "AAVEUSDT", "PENDLEUSDT", "BCHUSDT",
 ]
 
+# Permanently blocked non-crypto commodities, thin micro-caps, duplicate gold, and tokenized US stock/ETF tickers
 _BLOCKED_TICKERS = {
     "AMDB", "TQQQB", "TSLAB", "NVDAB", "AAPLB", "MSFTB", "GOOGB", "METAB", "AMZNB", "COINB",
     "SPY", "QQQ", "OIL", "USOIL", "UKOIL", "WTI", "BRENT", "NGAS", "NATGAS", "XAG", "SILVER",
-    "RARE", "H", "SPX", "NDX", "DXY", "EUR", "GBP", "JPY",
+    "RARE", "H", "SPX", "NDX", "DXY", "EUR", "GBP", "JPY", "XAUT", "XAU", "GOLD",
 }
 
 def _get_binance_liquid_set() -> set:
+    """Returns Binance USDT pairs with >= $25M 24h quote volume (cached 5 min) so micro-caps/junk never enter."""
     now = time.time()
     if _BINANCE_LIQUID_CACHE["syms"] and (now - _BINANCE_LIQUID_CACHE["ts"]) < 300.0:
         return _BINANCE_LIQUID_CACHE["syms"]
@@ -93,14 +95,22 @@ def check_economic_news_blackout() -> bool:
     return False
 
 def calc_volume_delta(candles_15m: list) -> float:
+    """Computes REAL Institutional Taker Buy vs Taker Sell Ratio (using Binance k[9] buy_vol when available)."""
     if len(candles_15m) < 3:
         return 0.50
     total_b, total_s = 0.0, 0.0
-    for c in candles_15m[-10:]:
-        h, l, cl, v = float(c.get("high", 0.0)), float(c.get("low", 0.0)), float(c.get("close", 0.0)), float(c.get("vol", 1.0))
-        rng = max(1e-6, h - l)
-        total_b += v * ((cl - l) / rng)
-        total_s += v * ((h - cl) / rng)
+    for c in candles_15m[-8:]:
+        v = float(c.get("vol", 1.0))
+        bv = c.get("buy_vol")
+        if bv is not None and v > 0:
+            b_part = max(0.0, min(v, float(bv)))
+            total_b += b_part
+            total_s += (v - b_part)
+        else:
+            h, l, cl = float(c.get("high", 0.0)), float(c.get("low", 0.0)), float(c.get("close", 0.0))
+            rng = max(1e-6, h - l)
+            total_b += v * ((cl - l) / rng)
+            total_s += v * ((h - cl) / rng)
     return round(total_b / (total_b + total_s + 1e-9), 3)
 
 def fetch_funding_rate(symbol: str) -> float:
@@ -164,7 +174,7 @@ def fetch_klines(symbol: str, interval: str, limit: int = 120) -> List[Dict[str,
             if r.status_code == 200:
                 raw = r.json()
                 if isinstance(raw, list) and len(raw) >= 15:
-                    out = [{"time": int(k[0]) // 1000, "close_time": (int(k[0]) // 1000) + gran, "open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4]), "vol": float(k[5])} for k in raw]
+                    out = [{"time": int(k[0]) // 1000, "close_time": (int(k[0]) // 1000) + gran, "open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4]), "vol": float(k[5]), "buy_vol": float(k[9]) if len(k) > 9 else None} for k in raw]
                     out.sort(key=lambda z: z["time"])
                     return out[-limit:]
         except Exception:
