@@ -222,7 +222,7 @@ def _build_local_payload() -> Dict[str, Any]:
 def fetch_vault_payload() -> Dict[str, Any]:
     global _LAST_FETCH_TS, _CACHED_PAYLOAD
     now = time.time()
-    if _CACHED_PAYLOAD and (now - _LAST_FETCH_TS) < 4.0:
+    if _CACHED_PAYLOAD and (now - _LAST_FETCH_TS) < 20.0:
         return _CACHED_PAYLOAD
     for base_url in _get_backend_candidates():
         try:
@@ -452,7 +452,7 @@ def _render_dashboard_body():
 
 def main() -> None:
     if hasattr(st, "fragment"):
-        @st.fragment(run_every="15s")
+        @st.fragment(run_every="30s")
         def _live_fragment():
             _render_dashboard_body()
             c1, c2, c3 = st.columns(3)
