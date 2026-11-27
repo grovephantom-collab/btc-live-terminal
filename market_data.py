@@ -22,7 +22,6 @@ _CORE_ANCHORS = [
     "FILUSDT", "ATOMUSDT", "HBARUSDT", "ICPUSDT", "UNIUSDT", "AAVEUSDT", "PENDLEUSDT", "BCHUSDT",
 ]
 
-# Permanently blocked non-crypto commodities, thin micro-caps, duplicate gold, and tokenized US stock/ETF tickers
 _BLOCKED_TICKERS = {
     "AMDB", "TQQQB", "TSLAB", "NVDAB", "AAPLB", "MSFTB", "GOOGB", "METAB", "AMZNB", "COINB",
     "SPY", "QQQ", "OIL", "USOIL", "UKOIL", "WTI", "BRENT", "NGAS", "NATGAS", "XAG", "SILVER",
@@ -30,7 +29,6 @@ _BLOCKED_TICKERS = {
 }
 
 def _get_binance_liquid_set() -> set:
-    """Returns Binance USDT pairs with >= $25M 24h quote volume (cached 5 min) so micro-caps/junk never enter."""
     now = time.time()
     if _BINANCE_LIQUID_CACHE["syms"] and (now - _BINANCE_LIQUID_CACHE["ts"]) < 300.0:
         return _BINANCE_LIQUID_CACHE["syms"]
@@ -95,7 +93,6 @@ def check_economic_news_blackout() -> bool:
     return False
 
 def calc_volume_delta(candles_15m: list) -> float:
-    """Computes REAL Institutional Taker Buy vs Taker Sell Ratio (using Binance k[9] buy_vol when available)."""
     if len(candles_15m) < 3:
         return 0.50
     total_b, total_s = 0.0, 0.0
@@ -242,24 +239,37 @@ def approx_poc(cs: List[Dict[str, float]], bins: int = 30) -> Optional[float]:
         vol[idx] += c["vol"]
     return lo + (max(range(bins), key=lambda n: vol[n]) + 0.5) * width
 
+_HTF_CACHE_TS: Dict[str, float] = {}
+
 def refresh_symbol_market_data(symbol: str, lock) -> bool:
     try:
         p = fetch_price(symbol)
         if not p or p <= 0:
             return False
+        now = time.time()
         sess, in_kz, kz_name, is_dead = session_and_killzone()
         news_block = check_economic_news_blackout()
-        funding = fetch_funding_rate(symbol)
+        need_htf = (now - _HTF_CACHE_TS.get(symbol, 0.0)) >= 600.0
         with lock:
             m = get_market(symbol)
-            m.update(price=p, price_ts=time.time(), session=sess, in_killzone=in_kz, killzone_name=kz_name, is_dead_hour=is_dead, news_blackout=news_block, funding_rate=funding)
+            old_ks = dict(m.get("klines") or {})
+            old_funding = float(m.get("funding_rate") or 0.0001)
+        funding = fetch_funding_rate(symbol) if need_htf else old_funding
+        with lock:
+            get_market(symbol).update(price=p, price_ts=now, session=sess, in_killzone=in_kz, killzone_name=kz_name, is_dead_hour=is_dead, news_blackout=news_block, funding_rate=funding)
         ks = {}
-        for k in ("15m", "1h", "4h", "1d"):
-            bars = fetch_klines(symbol, k, 120)
-            if not bars and k == "15m":
-                return False
-            ks[k] = bars
-            time.sleep(0.01)
+        bars_15m = fetch_klines(symbol, "15m", 105)
+        if not bars_15m:
+            return False
+        ks["15m"] = bars_15m
+        for k in ("1h", "4h", "1d"):
+            if need_htf or not old_ks.get(k):
+                ks[k] = fetch_klines(symbol, k, 65 if k != "1d" else 10)
+                time.sleep(0.01)
+            else:
+                ks[k] = old_ks[k]
+        if need_htf and ks.get("1h") and ks.get("4h"):
+            _HTF_CACHE_TS[symbol] = now
         pdh, pdl, d_open = extract_pdh_pdl(ks.get("1d", []))
         h24, l24, _, open24 = extract_24h_levels(ks.get("15m", []))
         arh, arl = extract_asian_range(ks.get("15m", []))
@@ -278,7 +288,7 @@ def discover_top_delta_movers(active_trade_symbols: list = None) -> List[str]:
     now = time.time()
     if not getattr(config, "ENABLE_ALL_DELTA_RADAR", True):
         return config.SYMBOLS
-    if (now - _LAST_RADAR_TS) < 30.0 and len(config.SYMBOLS) >= 30:
+    if (now - _LAST_RADAR_TS) < 300.0 and len(config.SYMBOLS) >= 30:
         for s in (active_trade_symbols or []):
             if s and s not in config.SYMBOLS:
                 config.SYMBOLS.insert(0, s)
