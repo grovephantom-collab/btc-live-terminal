@@ -59,9 +59,9 @@ try:
     PORT = ienv("PORT", 10000, 1)
     DB_FILE = os.getenv("DB_FILE", resolve_db_path("institutional_vault.db")).strip()
     HTTP_TIMEOUT = fenv("REQUEST_TIMEOUT_SEC", 7, 1)
-    SCAN_SECONDS = fenv("SCAN_INTERVAL_SEC", 15, 5)
+    SCAN_SECONDS = fenv("SCAN_INTERVAL_SEC", 45, 5)
     LEASE_TTL = fenv("LEADER_TTL_SEC", 20, 5)
-    MAX_DATA_AGE = fenv("MAX_DATA_AGE_SEC", 90, 10)
+    MAX_DATA_AGE = fenv("MAX_DATA_AGE_SEC", 180, 10)
 
     USD_INR_RATE = fenv("USD_INR_RATE", 86.0, 50.0)
     START_EQUITY = fenv("PAPER_EQUITY_USD", 58.0, 5.0)
